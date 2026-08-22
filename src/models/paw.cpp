@@ -25,29 +25,47 @@
 // hparams come verbatim from llama_model_qwen35moe::load_arch_hparams (the
 // exporter re-prefixes qwen35moe.* KVs to paw.*).
 
+// packed sidecar with shape taken from the GGUF metadata (kept/demoted
+// expert counts vary per layer, so shapes cannot be derived from hparams)
+ggml_tensor * llama_model_paw::m1_create(llama_model_loader & ml, const LLM_TN_IMPL & tnv, bool required) {
+    const std::string name = tnv.str();
+    ggml_tensor * meta = ml.get_tensor_meta(name.c_str());
+    if (meta == nullptr) {
+        if (!required) {
+            return nullptr;
+        }
+        throw std::runtime_error("paw: missing required tensor '" + name + "'");
+    }
+    switch (ggml_n_dims(meta)) {
+        case 1: return create_tensor(tnv, { meta->ne[0] }, 0);
+        case 2: return create_tensor(tnv, { meta->ne[0], meta->ne[1] }, 0);
+        case 3: return create_tensor(tnv, { meta->ne[0], meta->ne[1], meta->ne[2] }, 0);
+        default:
+            throw std::runtime_error("paw: unexpected rank for tensor '" + name + "'");
+    }
+}
+
+llama_model_paw::m1_ne llama_model_paw::m1_create_ne(llama_model_loader & ml, llm_tensor base, int il) {
+    m1_ne w;
+    if (m1_version >= 3) {
+        w.rt_trellis = m1_create(ml, tn(base, "m1_rt_trellis", il), true);
+        w.rt_su      = m1_create(ml, tn(base, "m1_rt_su",      il), true);
+        w.rt_sv      = m1_create(ml, tn(base, "m1_rt_sv",      il), true);
+        return w;
+    }
+    w.packed = m1_create(ml, tn(base, "m1_packed", il), true);
+    w.gscale = m1_create(ml, tn(base, "m1_gscale", il), true);
+    w.lut    = m1_create(ml, tn(base, "m1_lut",    il), true);
+    return w;
+}
+
 void llama_model_paw::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     GGML_ASSERT(hparams.n_layer_nextn == 0 && "paw checkpoints do not ship the MTP head");
 
-    // packed sidecar with shape taken from the GGUF metadata (kept/demoted
-    // expert counts vary per layer, so shapes cannot be derived from hparams)
-    auto create_m1 = [&](const LLM_TN_IMPL & tnv, bool required) -> ggml_tensor * {
-        const std::string name = tnv.str();
-        ggml_tensor * meta = ml.get_tensor_meta(name.c_str());
-        if (meta == nullptr) {
-            if (!required) {
-                return nullptr;
-            }
-            throw std::runtime_error("paw: missing required tensor '" + name + "'");
-        }
-        switch (ggml_n_dims(meta)) {
-            case 1: return create_tensor(tnv, { meta->ne[0] }, 0);
-            case 2: return create_tensor(tnv, { meta->ne[0], meta->ne[1] }, 0);
-            case 3: return create_tensor(tnv, { meta->ne[0], meta->ne[1], meta->ne[2] }, 0);
-            default:
-                throw std::runtime_error("paw: unexpected rank for tensor '" + name + "'");
-        }
+    auto create_m1 = [&](const LLM_TN_IMPL & tnv, bool required) {
+        return m1_create(ml, tnv, required);
     };
     // payload version: 2 = QTIP V2 tiers, 3 = additive (V8 experts, rotated
     // NE spine, int5-g64 head, nibble-LUT embed)
@@ -55,19 +73,11 @@ void llama_model_paw::load_arch_tensors(llama_model_loader & ml) {
     if (!ml.get_key("paw.format_version", m1_version, false)) {
         ml.get_key("mach1.format_version", m1_version, false);
     }
+    // absent on every pre-dense checkpoint, which is exactly the 0 default
+    ml.get_key(LLM_KV_PAW_RHT_BLOCK, m1_rht_blk, false);
 
-    auto create_m1_ne = [&](llm_tensor base, int il) -> m1_ne {
-        m1_ne w;
-        if (m1_version >= 3) {
-            w.rt_trellis = create_m1(tn(base, "m1_rt_trellis", il), true);
-            w.rt_su      = create_m1(tn(base, "m1_rt_su",      il), true);
-            w.rt_sv      = create_m1(tn(base, "m1_rt_sv",      il), true);
-            return w;
-        }
-        w.packed = create_m1(tn(base, "m1_packed", il), true);
-        w.gscale = create_m1(tn(base, "m1_gscale", il), true);
-        w.lut    = create_m1(tn(base, "m1_lut",    il), true);
-        return w;
+    auto create_m1_ne = [&](llm_tensor base, int il) {
+        return m1_create_ne(ml, base, il);
     };
 
     m1_layers.resize(n_layer);
@@ -102,7 +112,6 @@ void llama_model_paw::load_arch_tensors(llama_model_loader & ml) {
         auto & layer = layers[il];
         auto & m1l   = m1_layers[il];
 
-        const int64_t n_ff_exp   = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
         const int64_t n_v_heads  = hparams.ssm_dt_rank;
         const int64_t head_v_dim = hparams.ssm_d_state;
         const int64_t key_dim    = hparams.ssm_d_state * hparams.ssm_n_group;
@@ -134,35 +143,44 @@ void llama_model_paw::load_arch_tensors(llama_model_loader & ml) {
             m1l.ssm_out   = create_m1_ne(LLM_TENSOR_SSM_OUT,   il);
         }
 
-        // router (dense)
-        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", il), { n_embd, n_expert }, 0);
-
-        if (m1_stock_experts) {
-            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
-            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
-            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
-        } else {
-            m1l.remap = create_m1(tn(LLM_TENSOR_FFN_GATE_INP, "m1_remap", il), true);
-            const llm_tensor exps[3] = { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_UP_EXPS, LLM_TENSOR_FFN_DOWN_EXPS };
-            for (int p = 0; p < 3; ++p) {
-                auto & e = m1l.exps[p];
-                e.kept_trellis = create_m1(tn(exps[p], "m1_kept_trellis", il), true);
-                e.dem_trellis  = create_m1(tn(exps[p], "m1_dem_trellis",  il), m1_version < 3);
-                e.su           = create_m1(tn(exps[p], "m1_su", il), true);
-                e.sv           = create_m1(tn(exps[p], "m1_sv", il), true);
-                e.basis_a      = create_m1(tn(exps[p], "m1_basis_a", il), false);
-                e.basis_b      = create_m1(tn(exps[p], "m1_basis_b", il), false);
-                e.basis_c      = create_m1(tn(exps[p], "m1_basis_c", il), false);
-                e.wave_gamma   = create_m1(tn(exps[p], "m1_wave_gamma", il), m1_version >= 3);
-            }
-        }
-
-        // shared expert (dense gate + packed projections)
-        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
-        m1l.gate_shexp = create_m1_ne(LLM_TENSOR_FFN_GATE_SHEXP, il);
-        m1l.up_shexp   = create_m1_ne(LLM_TENSOR_FFN_UP_SHEXP,   il);
-        m1l.down_shexp = create_m1_ne(LLM_TENSOR_FFN_DOWN_SHEXP, il);
+        load_arch_ffn_tensors(ml, il);
     }
+}
+
+void llama_model_paw::load_arch_ffn_tensors(llama_model_loader & ml, int il) {
+    LLAMA_LOAD_LOCALS;
+    auto & layer = layers[il];
+    auto & m1l   = m1_layers[il];
+    const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
+
+    // router (dense)
+    layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", il), { n_embd, n_expert }, 0);
+
+    if (m1_stock_experts) {
+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
+    } else {
+        m1l.remap = m1_create(ml, tn(LLM_TENSOR_FFN_GATE_INP, "m1_remap", il), true);
+        const llm_tensor exps[3] = { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_UP_EXPS, LLM_TENSOR_FFN_DOWN_EXPS };
+        for (int p = 0; p < 3; ++p) {
+            auto & e = m1l.exps[p];
+            e.kept_trellis = m1_create(ml, tn(exps[p], "m1_kept_trellis", il), true);
+            e.dem_trellis  = m1_create(ml, tn(exps[p], "m1_dem_trellis",  il), m1_version < 3);
+            e.su           = m1_create(ml, tn(exps[p], "m1_su", il), true);
+            e.sv           = m1_create(ml, tn(exps[p], "m1_sv", il), true);
+            e.basis_a      = m1_create(ml, tn(exps[p], "m1_basis_a", il), false);
+            e.basis_b      = m1_create(ml, tn(exps[p], "m1_basis_b", il), false);
+            e.basis_c      = m1_create(ml, tn(exps[p], "m1_basis_c", il), false);
+            e.wave_gamma   = m1_create(ml, tn(exps[p], "m1_wave_gamma", il), m1_version >= 3);
+        }
+    }
+
+    // shared expert (dense gate + packed projections)
+    layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
+    m1l.gate_shexp = m1_create_ne(ml, LLM_TENSOR_FFN_GATE_SHEXP, il);
+    m1l.up_shexp   = m1_create_ne(ml, LLM_TENSOR_FFN_UP_SHEXP,   il);
+    m1l.down_shexp = m1_create_ne(ml, LLM_TENSOR_FFN_DOWN_SHEXP, il);
 }
 
 std::unique_ptr<llm_graph_context> llama_model_paw::build_arch_graph(const llm_graph_params & params) const {
@@ -183,7 +201,8 @@ ggml_tensor * llama_model_paw::graph::ne_mm(const m1_ne & w, ggml_tensor * x) {
         x = ggml_cont(ctx0, x);
     }
     if (w.rt_trellis) {   // payload v3: rotated int-lattice spine
-        return ggml_paw_rt_mm(ctx0, w.rt_trellis, w.rt_su, w.rt_sv, model.m1_ne_tlut, x);
+        return ggml_paw_rt_mm(ctx0, w.rt_trellis, w.rt_su, w.rt_sv, model.m1_ne_tlut, x,
+                              (int) model.m1_rht_blk);
     }
     return ggml_paw_ne_mm(ctx0, w.packed, w.gscale, w.lut, x);
 }
@@ -253,6 +272,10 @@ static bool paw_moe_reduce_on() {
     return v != nullptr && atoi(v) != 0;
 }
 
+bool llama_model_paw::graph::rt_batch_site(int bit) {
+    return paw_rt_batch_site(bit);
+}
+
 ggml_tensor * llama_model_paw::graph::ne_mm_batch(
         const m1_ne * ws, int n_matrices, ggml_tensor * x) {
     if (!ggml_is_contiguous(x)) {
@@ -265,7 +288,8 @@ ggml_tensor * llama_model_paw::graph::ne_mm_batch(
         su[i]      = ws[i].rt_su;
         sv[i]      = ws[i].rt_sv;
     }
-    return ggml_paw_rt_mm_batch(ctx0, n_matrices, trellis, su, sv, model.m1_ne_tlut, x);
+    return ggml_paw_rt_mm_batch(ctx0, n_matrices, trellis, su, sv, model.m1_ne_tlut, x,
+                                (int) model.m1_rht_blk);
 }
 
 // grouped -> tiled V-head row reorder on an activation vector segment
@@ -317,8 +341,17 @@ ggml_tensor * llama_model_paw::graph::build_inp_embd_paw() {
     return cur;
 }
 
-llama_model_paw::graph::graph(const llama_model_paw & model, const llm_graph_params & params) :
+llama_model_paw::graph::graph(const llama_model_paw & model, const llm_graph_params & params,
+                              defer_build_t) :
     llm_build_delta_net_base(params), model(model) {
+}
+
+llama_model_paw::graph::graph(const llama_model_paw & model, const llm_graph_params & params) :
+    graph(model, params, defer_build_t{}) {
+    build();
+}
+
+void llama_model_paw::graph::build() {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -883,12 +916,14 @@ ggml_tensor * llama_model_paw::graph::build_layer_ffn(ggml_tensor * cur, const i
         if (paw_shared_gate_dot_on()) {
             cur = ggml_paw_rt_mm_epilogue_dot(ctx0, w.rt_trellis, w.rt_su, w.rt_sv,
                     model.m1_ne_tlut, shared_inp,
-                    model.layers[il].ffn_gate_inp_shexp, cur, moe_out);
+                    model.layers[il].ffn_gate_inp_shexp, cur, moe_out,
+                    (int) model.m1_rht_blk);
         } else {
             ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
             cb(shared_gate, "shared_expert_gate", il);
             cur = ggml_paw_rt_mm_epilogue(ctx0, w.rt_trellis, w.rt_su, w.rt_sv,
-                                            model.m1_ne_tlut, shared_inp, shared_gate, moe_out);
+                                            model.m1_ne_tlut, shared_inp, shared_gate, moe_out,
+                                            (int) model.m1_rht_blk);
         }
     } else {
         ggml_tensor * ffn_shexp = ne_mm(model.m1_layers[il].down_shexp, shared_inp);

@@ -42,6 +42,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN35MOE,        "qwen35moe"        },
     { LLM_ARCH_PAW,            "paw"            },
     { LLM_ARCH_MACH1,          "mach1"          },
+    { LLM_ARCH_PAW_DENSE,      "paw-dense"      },
     { LLM_ARCH_PHI2,             "phi2"             },
     { LLM_ARCH_PHI3,             "phi3"             },
     { LLM_ARCH_PHIMOE,           "phimoe"           },
@@ -204,6 +205,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_MOE_EVERY_N_LAYERS,                "%s.moe_every_n_layers"                },
     { LLM_KV_MOE_LATENT_SIZE,                   "%s.moe_latent_size"                   },
     { LLM_KV_NEXTN_PREDICT_LAYERS,              "%s.nextn_predict_layers"              },
+    { LLM_KV_PAW_RHT_BLOCK,                     "%s.rht_block"                         },
     { LLM_KV_NUM_DEEPSTACK_LAYERS,              "%s.n_deepstack_layers"                },
     { LLM_KV_DEEPSTACK_MAPPING,                 "%s.deepstack_mapping"                 },
     { LLM_KV_HIDDEN_ACT,                        "%s.hidden_activation"                 },
@@ -965,6 +967,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_PAW:
         case LLM_ARCH_MACH1:
+        case LLM_ARCH_PAW_DENSE:
             return true;
         default:
             return false;
@@ -989,6 +992,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_PAW:
         case LLM_ARCH_MACH1:
+        case LLM_ARCH_PAW_DENSE:
             return true;
         default:
             return false;

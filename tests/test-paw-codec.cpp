@@ -86,7 +86,7 @@ int main(int argc, char ** argv) {
         // rotated NE (shexp gate [512, 2048])
         ggml_tensor * ne_tl = get("ne3.tlut");
         ggml_tensor * y_rt = ggml_paw_rt_mm(ctx, get("ne3.trellis"), get("ne3.su"),
-                                              get("ne3.sv"), ne_tl, make_eye(get("ne3.su")->ne[0]));
+                                              get("ne3.sv"), ne_tl, make_eye(get("ne3.su")->ne[0]), 0);
 
         // int5-g64 head slice
         ggml_tensor * y_head = ggml_paw_head_mm(ctx, get("head3.qp"), get("head3.gscale"),

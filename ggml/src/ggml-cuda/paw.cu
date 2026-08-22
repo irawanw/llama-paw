@@ -324,7 +324,7 @@ static __global__ void paw_embed_gather_kernel(
         const uint16_t * GGML_CUDA_RESTRICT lut,    // bf16 bit patterns
         const int32_t  * GGML_CUDA_RESTRICT ids,
         float          * GGML_CUDA_RESTRICT dst,
-        const int n_embd, const int64_t total) {
+        const int n_embd, const int gsh, const int64_t total) {
     const int64_t gid = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (gid >= total) {
         return;
@@ -333,11 +333,11 @@ static __global__ void paw_embed_gather_kernel(
     const int64_t tok = gid / n_embd;
     const int     j   = (int)(gid % n_embd);
     const int64_t r   = ids[tok];
-    const int     ng  = n_embd / 64;
+    const int     ng  = n_embd >> gsh;
 
     const uint32_t by = codes[r*(n_embd/2) + (j >> 1)];
     const uint32_t q  = (j & 1) ? (by >> 4) : (by & 0x0Fu);
-    const uint32_t bits = (uint32_t) lut[(r*ng + (j >> 6))*16 + q] << 16;
+    const uint32_t bits = (uint32_t) lut[(r*ng + (j >> gsh))*16 + q] << 16;
     dst[gid] = __uint_as_float(bits);
 }
 
@@ -359,6 +359,16 @@ void ggml_cuda_op_paw_embed_gather(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int64_t nt     = ids->ne[0];
     const int64_t total  = nt*n_embd;
 
+    // group size comes from the LUT shape (64 on every shipped 35B payload,
+    // 256 on paw-dense); it is a power of two, so index by shift
+    const int64_t ng = lut->ne[1] / codes->ne[1];
+    const int64_t group = n_embd / ng;
+    GGML_ASSERT(group*ng == n_embd && (group & (group - 1)) == 0);
+    int gsh = 0;
+    while ((1 << gsh) < group) {
+        ++gsh;
+    }
+
     const dim3 grid((unsigned)((total + 255)/256), 1, 1);
     paw_launch(paw_embed_gather_kernel,
         ggml_cuda_kernel_launch_params(grid, dim3(256, 1, 1), 0, ctx.stream()),
@@ -366,7 +376,7 @@ void ggml_cuda_op_paw_embed_gather(ggml_backend_cuda_context & ctx, ggml_tensor 
         (const uint16_t *) lut->data,
         (const int32_t  *) ids->data,
         (float          *) dst->data,
-        n_embd, total);
+        n_embd, gsh, total);
 }
 
 //
@@ -1272,33 +1282,48 @@ static __global__ void paw_rt_u_kernel(
         const float * GGML_CUDA_RESTRICT su,
         const float * GGML_CUDA_RESTRICT x,
         float       * GGML_CUDA_RESTRICT scr_u,
-        const int n) {
+        const int n,
+        const int blk) {
+    // blk == n is the legacy single-Hadamard path: the loop runs once with
+    // off == 0 and the arithmetic is identical to before blocking existed.
     __shared__ float sh[4096];
 
     const int t   = blockIdx.x;
     const int tid = threadIdx.x;
 
     ggml_cuda_pdl_sync();
-    for (int i = tid; i < n; i += WG) {
-        sh[i] = su[i] * x[(int64_t) t*n + i];
-    }
-    __syncthreads();
-    if (WG == n/16 && paw_fwht_v2_ok(n)) {
-        paw_fwht_block_v2(sh, n, tid, WG);
-    } else {
-        paw_fwht_block(sh, n, tid, WG);
-    }
-    const float sc     = __fsqrt_rn((float) n);
+    const float sc     = __fsqrt_rn((float) blk);
     const float inv_sc = __frcp_rn(sc);
-    for (int i = tid; i < n; i += WG) {
-        scr_u[(int64_t) t*n + i] = sh[i] * inv_sc;
+    for (int off = 0; off < n; off += blk) {
+        for (int i = tid; i < blk; i += WG) {
+            sh[i] = su[off + i] * x[(int64_t) t*n + off + i];
+        }
+        __syncthreads();
+        if (WG == blk/16 && paw_fwht_v2_ok(blk)) {
+            paw_fwht_block_v2(sh, blk, tid, WG);
+        } else {
+            paw_fwht_block(sh, blk, tid, WG);
+        }
+        for (int i = tid; i < blk; i += WG) {
+            scr_u[(int64_t) t*n + off + i] = sh[i] * inv_sc;
+        }
+        __syncthreads();
     }
 }
 
 // WG covers one thread per column tile (tid < tiles_y walk); WG=128 avoids
 // launching idle warps when tiles_y <= 128 (n <= 2048). The dropped warps
 // only ever contributed exact zeros to the cross-warp reduction.
-template <int WG>
+// WORDS is the trellis rate in int16 words per 16x16 tile: bits-per-tile is
+// WORDS*16 over 128 states, so step = WORDS/8 fresh bits per state and the rate
+// is K = step/V = WORDS/16 at V=2. 64 -> K=4 (the shipped 35B payload),
+// 48 -> K=3, 32 -> K=2, 24 -> K=1.5, 16 -> K=1.
+//
+// Only WORDS=64 gives byte-aligned state windows, and only 16/32/64 give
+// word-aligned tile rows, so the window is extracted by global bit offset
+// rather than from a per-row register cache. At WORDS=64 that folds back to
+// exactly the hand-unrolled arithmetic this replaced.
+template <int WG, int WORDS>
 static __global__ void paw_rt_walk_kernel(
         const uint16_t * GGML_CUDA_RESTRICT trellis,
         const half     * GGML_CUDA_RESTRICT tlut,     // pre-rounded fp16
@@ -1314,9 +1339,10 @@ static __global__ void paw_rt_walk_kernel(
     const int tr  = blockIdx.x;
     const int tid = threadIdx.x;
 
-    constexpr int words = 64;      // K = 4: 64 int16 words per 16x16 tile
+    static_assert(WORDS % 8 == 0 && WORDS >= 16 && WORDS <= 64, "unsupported trellis rate");
+    constexpr int step  = WORDS/8;   // K*V fresh bits per state, V = 2
+    constexpr int words = WORDS;     // int16 words per 16x16 tile
     const int tiles_y = n / 16;
-    const bool have   = tid < tiles_y;
 
     ggml_cuda_pdl_sync();
 
@@ -1333,9 +1359,14 @@ static __global__ void paw_rt_walk_kernel(
         partial[i] = 0.0f;
     }
 
-    if (have) {
-        const int64_t tw = ((int64_t) tr*tiles_y + tid)*words;
-        const float * ub = scr_u + (int64_t) t*n + tid*16;
+    // One thread per tile column, strided so n is not capped at WG*16. This
+    // used to be a bare `if (tid < tiles_y)`, which silently dropped every
+    // column past 4096 -- invisible until now because K=4 takes the bank path
+    // and the walk only ran on the narrow GDN projections. For tiles_y <= WG
+    // the loop runs exactly once at c == tid, so the arithmetic is unchanged.
+    for (int c = tid; c < tiles_y; c += WG) {
+        const int64_t tw = ((int64_t) tr*tiles_y + c)*words;
+        const float * ub = scr_u + (int64_t) t*n + c*16;
 
         // the tile column's 16 u values are shared by all 16 tile rows
         float uu[16];
@@ -1345,19 +1376,18 @@ static __global__ void paw_rt_walk_kernel(
         }
 
         for (int ri = 0; ri < 16; ++ri) {
-            // row ri covers stream bytes [8*ri, 8*ri+8] -> words [4*ri, 4*ri+4]
-            uint32_t w[5];
-#pragma unroll
-            for (int q = 0; q < 5; ++q) {
-                w[q] = trellis[tw + ((4*ri + q) & 63)];   // only q=4,ri=15 wraps
-            }
-            // 8 independent byte-aligned direct-window states
+            // 8 states per tile row, each a 16-bit window starting at bit
+            // step*(8*ri + j) of the tile's MSB-first stream, wrapping at the end
             uint32_t ph[8];
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                const uint32_t hi = w[j >> 1];
-                const uint32_t st = (j & 1) == 0 ? hi
-                    : (((hi << 8) | (w[(j >> 1) + 1] >> 8)) & 0xFFFFu);
+                const int b   = step*(8*ri + j);
+                const int wi  = (b >> 4) % words;
+                const int off = b & 15;
+                const uint32_t w0 = trellis[tw + wi];
+                const uint32_t st = off == 0 ? w0
+                    : (((w0 << off) | (trellis[tw + (wi + 1) % words] >> (16 - off)))
+                       & 0xFFFFu);
                 ph[j] = st*(st + 1u);
             }
             // same accumulation order as the serial walk: per state, w0 then w1
@@ -1372,7 +1402,7 @@ static __global__ void paw_rt_walk_kernel(
                 }
                 acc += a0*uu[2*j] + a1*uu[2*j + 1];
             }
-            partial[ri] = acc;
+            partial[ri] += acc;
         }
     }
 
@@ -1776,103 +1806,118 @@ static __global__ void paw_rt_apply_kernel(
     }
 }
 
-// --- experimental: tensor-core apply, opt-in via GGML_PAW_RT_APPLY_MMA=1 ---
-//
-// paw_rt_apply_kernel above is a plain scalar/warp-reduce dot product over
-// an already-dense fp16 bank -- by the time it runs, the trellis decode is
-// done and this is an ordinary GEMM (scr_v[nt,m] = scr_u[nt,n] @ bank[m,n]^T).
-// Its own tile shape (16 output rows/block) already matches the m16n8k16
-// tensor-core MMA instruction shape, so this feeds the same computation
-// through wmma instead of scalar FMA + warp_reduce_sum. Activations are cast
-// fp32->fp16 before the multiply (standard practice for tensor-core GEMM,
-// same precision class every other fp16 llama.cpp kernel already uses) --
-// this is the one deliberate numeric difference from the scalar path, and is
-// exactly what the correctness gate below needs to check is within noise.
-//
-// v2: grid.x = m/16, matching the scalar kernel's block count exactly (v1
-// grouped 4 tr's per block instead, cutting block count to a quarter of the
-// scalar kernel's -- occupancy-starved on this GPU, measured slower than
-// scalar: 14.24 vs 21.27 tok/s under np=8. Fixed here by keeping one block
-// per tr and instead splitting the K-loop across the block's 4 warps (each
-// warp accumulates a partial 16x16 tile over its own K-subset), then doing
-// a small cross-warp reduction of the 4 partial tiles at the end -- same
-// occupancy as the scalar path, same MMA benefit per K-step.
-//
-// 16x16x16 is the wmma C++ API's valid fp16 tile shape (the m16n8k16
-// raw-PTX shape QTIP uses isn't exposed by wmma::fragment -- confirmed by a
-// failed build attempt at m16n8k16 first). TC (token tile) is therefore 16
-// here, not 8/4 like the scalar path's RT_TC knob -- when nt < 16 (the
-// common case, nt <= np <= 8 in our serving config) half the N-tile is
-// zero-padded, wasting some MMA throughput but still expected to beat
-// scalar FMA by a wide margin. Activations are cast fp32->fp16 before the
-// multiply (standard practice for tensor-core GEMM, same precision class
-// every other fp16 llama.cpp kernel already uses) -- this is the one
-// deliberate numeric difference from the scalar path, and is exactly what
-// the correctness gate needs to check is within noise.
+
+
+
+
+
+
+
+
+
+// MODE 5: weight-stationary across tokens AND rows. The first WS cut kept
+// one 16-row strip per block, so every row-strip block still re-read the
+// whole nt x n activation slab (~8 GB per call on the shared-expert shape).
+// Staging BM=64 rows per block cuts that by 4x; activations are cast once
+// per K-chunk and reused by all four A tiles held live in registers.
 static __global__ void paw_rt_apply_kernel_mma(
-        const half  * GGML_CUDA_RESTRICT bank,     // [m, n] row-major
-        const float * GGML_CUDA_RESTRICT scr_u,    // [nt, n] row-major
-        float       * GGML_CUDA_RESTRICT scr_v,    // [nt, m] row-major
+        const half  * GGML_CUDA_RESTRICT bank,
+        const float * GGML_CUDA_RESTRICT scr_u,
+        float       * GGML_CUDA_RESTRICT scr_v,
         const int m, const int n, const int nt) {
     using namespace nvcuda;
 
-    const int warp_id = threadIdx.x / 32;
-    const int lane     = threadIdx.x % 32;
-    const int tr  = blockIdx.x;    // row-tile (16 rows) -- whole block, matches scalar kernel
-    const int n16 = blockIdx.z;    // token tile (16 tokens) this block owns
+    constexpr int n_warps = 4;
+    constexpr int bm_t    = 4;                  // 16-row tiles -> BM = 64
+    constexpr int tpb     = 2;                  // token subtiles -> BN = 128
+    constexpr int bn      = n_warps * tpb * 16;
+    constexpr int bk      = 16;                 // == the wmma K tile
 
-    // per-warp staging for the B fragment: col-major [K=16][N=16], so within
-    // a fixed token (column) the K index is contiguous -- matches what
-    // load_matrix_sync(..., col_major) expects with ld=16.
-    __shared__ half  u_half[4][16][16];
-    __shared__ float out_sh[4][16*16];
+    const int warp_id = threadIdx.x / 32;
+    const int lane    = threadIdx.x % 32;
+    const int row0 = blockIdx.x * (bm_t * 16);  // first output row
+    const int tok0 = blockIdx.z * bn;
+
+    __shared__ half Xsh[n_warps][tpb][16][bk];         // 4 KB, warp-private
+    __shared__ float out_sh[n_warps][16*16];           // 4 KB
 
     ggml_cuda_pdl_sync();
 
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
-    wmma::fill_fragment(acc_frag, 0.0f);
-
-    const half * W = bank + (int64_t) tr * 16 * n;
-
-    // this warp handles K-chunks {warp_id*16, warp_id*16 + 4*16, ...}
-    for (int k0 = warp_id*16; k0 < n; k0 += 4*16) {
-        // stage this K-chunk's activations for all 16 tokens into shared
-        // mem, fp32 -> fp16, zero-padding past nt or past n (tail chunk,
-        // same clamp-and-guard spirit as the scalar kernel above).
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[bm_t][tpb];
 #pragma unroll
-        for (int idx = lane; idx < 16*16; idx += 32) {
-            const int tt = idx / 16;
-            const int kk = idx % 16;
-            const int tok = n16*16 + tt;
-            float v = 0.0f;
-            if (tok < nt && (k0 + kk) < n) {
-                v = scr_u[(int64_t) tok*n + (k0 + kk)];
-            }
-            u_half[warp_id][tt][kk] = __float2half(v);
+    for (int r = 0; r < bm_t; ++r) {
+#pragma unroll
+        for (int t = 0; t < tpb; ++t) {
+            wmma::fill_fragment(acc[r][t], 0.0f);
         }
-        __syncwarp();
-
-        wmma::load_matrix_sync(a_frag, W + k0, n);
-        wmma::load_matrix_sync(b_frag, &u_half[warp_id][0][0], 16);
-        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
     }
 
-    wmma::store_matrix_sync(&out_sh[warp_id][0], acc_frag, 16, wmma::mem_row_major);
-    __syncthreads();
-
-    // cross-warp reduction of the 4 partial 16x16 tiles, then scatter to
-    // scr_v (same output layout/bounds-guard as the scalar kernel).
+    for (int k0 = 0; k0 < n; k0 += bk) {
 #pragma unroll
-    for (int idx = threadIdx.x; idx < 16*16; idx += 128) {
-        const int row = idx / 16;
-        const int tt  = idx % 16;
-        const int tok = n16*16 + tt;
-        if (tok < nt) {
-            const float sum = out_sh[0][idx] + out_sh[1][idx] + out_sh[2][idx] + out_sh[3][idx];
-            scr_v[(int64_t) tok*m + tr*16 + row] = sum;
+        for (int t = 0; t < tpb; ++t) {
+            const int tt0 = tok0 + (warp_id*tpb + t)*16;
+            for (int idx = lane; idx < 16*bk; idx += 32) {
+                const int tt = idx / bk;
+                const int kk = idx % bk;
+                const int tok = tt0 + tt;
+                const int kg = k0 + kk;
+                Xsh[warp_id][t][tt][kk] =
+                    (tok < nt && kg < n) ? __float2half(scr_u[(int64_t) tok*n + kg])
+                                         : __float2half(0.0f);
+            }
         }
+        __syncwarp();
+#pragma unroll
+        for (int r = 0; r < bm_t; ++r) {
+            wmma::load_matrix_sync(a_frag,
+                bank + (int64_t)(row0 + r*16)*n + k0, n);
+#pragma unroll
+            for (int t = 0; t < tpb; ++t) {
+                wmma::load_matrix_sync(b_frag, &Xsh[warp_id][t][0][0], bk);
+                wmma::mma_sync(acc[r][t], a_frag, b_frag, acc[r][t]);
+            }
+        }
+        __syncwarp();
+    }
+
+#pragma unroll
+    for (int r = 0; r < bm_t; ++r) {
+#pragma unroll
+        for (int t = 0; t < tpb; ++t) {
+            wmma::store_matrix_sync(&out_sh[warp_id][0], acc[r][t], 16, wmma::mem_row_major);
+            __syncwarp();
+            const int tt0 = tok0 + (warp_id*tpb + t)*16;
+            for (int idx = lane; idx < 16*16; idx += 32) {
+                const int row = idx / 16;
+                const int tt  = idx % 16;
+                const int tok = tt0 + tt;
+                if (tok < nt) {
+                    scr_v[(int64_t) tok*m + row0 + r*16 + row] = out_sh[warp_id][idx];
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+// host-side mode dispatch shared by every rt_apply mma call site so the
+// bisect modes stay consistent across the cached-bank, fresh-bank and
+// batched paths.
+// host dispatch shared by every rt_apply call site. The weight-stationary
+// tensor-core kernel needs m tiled by 64; anything else falls back to the
+// scalar dense apply.
+static void paw_launch_rt_apply_mma(cudaStream_t stream, const half * bank,
+        const float * scr_u, float * scr_v, const int m, const int n, const int nt) {
+    if (m % 64 == 0) {
+        paw_launch(paw_rt_apply_kernel_mma,
+            ggml_cuda_kernel_launch_params(dim3(m/64, 1, (nt + 127)/128), dim3(128, 1, 1), 0, stream),
+            bank, scr_u, scr_v, m, n, nt);
+    } else {
+        paw_launch(paw_rt_apply_kernel<8>,
+            ggml_cuda_kernel_launch_params(dim3(m/16, 1, (nt + 7)/8), dim3(128, 1, 1), 0, stream),
+            bank, (const float *) scr_u, scr_v, m, n, nt);
     }
 }
 
@@ -1994,11 +2039,32 @@ static __global__ void paw_rt_walk_kernel_mma(
 // is identical across steps; the dense path has been re-decoding it every
 // step. Caching it here turns the per-step walk/decode into a plain
 // bandwidth-bound fp16 GEMV/GEMM over the cached bank. Keyed by the trellis
-// data pointer; entries are intentionally leaked (one per matrix, matching the
-// weight allocation's lifetime). GGML_PAW_BANK_CACHE=0 falls back to the
-// original per-step walk/decode.
+// data pointer *and shape*; entries are intentionally leaked (one per matrix,
+// matching the weight allocation's lifetime). GGML_PAW_BANK_CACHE=0 falls back
+// to the original per-step walk/decode.
+//
+// The shape belongs in the key because a pointer alone is only unique for the
+// lifetime of the allocation behind it. Model weights live forever, so the old
+// pointer-only key was safe in a server; test-backend-ops recycles buffers
+// between cases, so a later case with a different shape used to be handed the
+// previous case's bank -- wrong numbers, and an out-of-bounds read as soon as
+// the new shape was larger.
+struct paw_bank_key {
+    const void * trellis;
+    int m;
+    int n;
+    bool operator==(const paw_bank_key & o) const {
+        return trellis == o.trellis && m == o.m && n == o.n;
+    }
+};
+struct paw_bank_key_hash {
+    size_t operator()(const paw_bank_key & k) const {
+        return std::hash<const void *>()(k.trellis) ^ (std::hash<int>()(k.m) << 1)
+                                                    ^ (std::hash<int>()(k.n) << 2);
+    }
+};
 static std::mutex paw_rt_bank_mutex;
-static std::unordered_map<const void *, const void *> paw_rt_banks;
+static std::unordered_map<paw_bank_key, const void *, paw_bank_key_hash> paw_rt_banks;
 
 static bool paw_bank_cache_on() {
     static const bool on = paw_env_int("GGML_PAW_BANK_CACHE", 1) != 0;
@@ -2016,9 +2082,10 @@ static const void * paw_rt_bank_get(
         const void * trellis, const void * tlut, const int m, const int n, cudaStream_t stream) {
     const bool idx = paw_rt_bank_idx_on();
     const bool fp8 = !idx && paw_rt_bank_fp8_on();
+    const paw_bank_key key{trellis, m, n};
     {
         std::lock_guard<std::mutex> lock(paw_rt_bank_mutex);
-        auto it = paw_rt_banks.find(trellis);
+        auto it = paw_rt_banks.find(key);
         if (it != paw_rt_banks.end()) {
             return it->second;
         }
@@ -2046,12 +2113,12 @@ static const void * paw_rt_bank_get(
     CUDA_CHECK(cudaStreamSynchronize(stream));
     {
         std::lock_guard<std::mutex> lock(paw_rt_bank_mutex);
-        auto it = paw_rt_banks.find(trellis);
+        auto it = paw_rt_banks.find(key);
         if (it != paw_rt_banks.end()) {
             cudaFree(bank);
             return it->second;
         }
-        paw_rt_banks.emplace(trellis, bank);
+        paw_rt_banks.emplace(key, bank);
     }
     return bank;
 }
@@ -2347,36 +2414,41 @@ static __global__ void paw_rt_out_kernel(
         float       * GGML_CUDA_RESTRICT dst,
         const float * GGML_CUDA_RESTRICT gate,
         const float * GGML_CUDA_RESTRICT acc,
-        const int m) {
+        const int m,
+        const int blk) {
+    // blk == m reproduces the pre-blocking kernel exactly (one iteration).
     __shared__ float sh[8192];
 
     const int t   = blockIdx.x;
     const int tid = threadIdx.x;
 
     ggml_cuda_pdl_sync();
-    for (int i = tid; i < m; i += WG) {
-        __pipeline_memcpy_async(&sh[i], &scr_v[(int64_t) t*m + i], sizeof(float));
-    }
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
-    __syncthreads();
-    if (WG == m/16 && paw_fwht_v2_ok(m)) {
-        paw_fwht_block_v2(sh, m, tid, WG);
-    } else {
-        paw_fwht_block(sh, m, tid, WG);
-    }
-    const float sc     = __fsqrt_rn((float) m);
+    const float sc     = __fsqrt_rn((float) blk);
     const float inv_sc = __frcp_rn(sc);
-    for (int i = tid; i < m; i += WG) {
-        const int64_t oi = (int64_t) t*m + i;
-        const float y = sh[i] * inv_sc * sv[i];
-        if constexpr (EPILOGUE) {
-            const float sigmoid = 1.0f / (1.0f + expf(-gate[t]));
-            const float gated = __fmul_rn(y, sigmoid);
-            dst[oi] = __fadd_rn(acc[oi], gated);
-        } else {
-            dst[oi] = y;
+    for (int off = 0; off < m; off += blk) {
+        for (int i = tid; i < blk; i += WG) {
+            __pipeline_memcpy_async(&sh[i], &scr_v[(int64_t) t*m + off + i], sizeof(float));
         }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        if (WG == blk/16 && paw_fwht_v2_ok(blk)) {
+            paw_fwht_block_v2(sh, blk, tid, WG);
+        } else {
+            paw_fwht_block(sh, blk, tid, WG);
+        }
+        for (int i = tid; i < blk; i += WG) {
+            const int64_t oi = (int64_t) t*m + off + i;
+            const float y = sh[i] * inv_sc * sv[off + i];
+            if constexpr (EPILOGUE) {
+                const float sigmoid = 1.0f / (1.0f + expf(-gate[t]));
+                const float gated = __fmul_rn(y, sigmoid);
+                dst[oi] = __fadd_rn(acc[oi], gated);
+            } else {
+                dst[oi] = y;
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -2388,7 +2460,7 @@ static __global__ void paw_rt_out_epilogue_dot_kernel(
         const float * GGML_CUDA_RESTRICT gate_w,
         const float * GGML_CUDA_RESTRICT gate_x,
         const float * GGML_CUDA_RESTRICT acc,
-        const int m, const int gate_n) {
+        const int m, const int gate_n, const int blk) {
     __shared__ float sh[8192];
     const int t   = blockIdx.x;
     const int tid = threadIdx.x;
@@ -2406,23 +2478,27 @@ static __global__ void paw_rt_out_epilogue_dot_kernel(
         __syncthreads();
     }
     const float sigmoid = 1.0f / (1.0f + expf(-sh[0]));
+    __syncthreads();   // sh is about to be reused as the FWHT staging buffer
 
-    for (int i = tid; i < m; i += WG) {
-        __pipeline_memcpy_async(&sh[i], &scr_v[(int64_t) t*m + i], sizeof(float));
-    }
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
-    __syncthreads();
-    if (WG == m/16 && paw_fwht_v2_ok(m)) {
-        paw_fwht_block_v2(sh, m, tid, WG);
-    } else {
-        paw_fwht_block(sh, m, tid, WG);
-    }
-    const float inv_sc = __frcp_rn(__fsqrt_rn((float) m));
-    for (int i = tid; i < m; i += WG) {
-        const int64_t oi = (int64_t) t*m + i;
-        const float y = sh[i] * inv_sc * sv[i];
-        dst[oi] = __fadd_rn(acc[oi], __fmul_rn(y, sigmoid));
+    const float inv_sc = __frcp_rn(__fsqrt_rn((float) blk));
+    for (int off = 0; off < m; off += blk) {
+        for (int i = tid; i < blk; i += WG) {
+            __pipeline_memcpy_async(&sh[i], &scr_v[(int64_t) t*m + off + i], sizeof(float));
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        if (WG == blk/16 && paw_fwht_v2_ok(blk)) {
+            paw_fwht_block_v2(sh, blk, tid, WG);
+        } else {
+            paw_fwht_block(sh, blk, tid, WG);
+        }
+        for (int i = tid; i < blk; i += WG) {
+            const int64_t oi = (int64_t) t*m + off + i;
+            const float y = sh[i] * inv_sc * sv[off + i];
+            dst[oi] = __fadd_rn(acc[oi], __fmul_rn(y, sigmoid));
+        }
+        __syncthreads();
     }
 }
 
@@ -2453,13 +2529,30 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(ggml_is_contiguous(tlut));
     GGML_ASSERT(ggml_is_contiguous(x));
     GGML_ASSERT(ggml_is_contiguous(dst));
-    GGML_ASSERT(trellis->ne[0] == 64);   // K = 4 (the walk kernel hardcodes the rate)
+    // Trellis rate from the payload: words-per-tile = 16*K at V = 2.
+    // 64 -> K=4 (the shipped 35B NE spine), 32 -> K=2, 16 -> K=1.
+    const int rt_words = (int) trellis->ne[0];
+    const int rt_K     = rt_words / 16;   // == 4 only for the shipped payload
+    GGML_ASSERT(rt_words % 8 == 0 && rt_words >= 16 && rt_words <= 64);
 
     const int n  = (int) su->ne[0];
     const int m  = (int) sv->ne[0];
     const int nt = (int)(x->ne[1]*x->ne[2]*x->ne[3]);
-    GGML_ASSERT(n <= 4096);   // rt_u shared bound
-    GGML_ASSERT(m <= 8192);   // rt_out shared bound
+    // Rotation block size. 0 means one Hadamard over the whole dimension --
+    // the shipped power-of-two payloads. A blocked payload rotates within
+    // blk-wide groups, which is what lets non-power-of-two dense shapes
+    // (5120, 17408, ...) run at all: only one block is ever staged in shared.
+    const int rht_blk = dst->op_params[GGML_PAW_RHT_BLK_SLOT];
+    const int bn = rht_blk ? rht_blk : n;
+    const int bm = rht_blk ? rht_blk : m;
+    const bool blocked = (bn != n) || (bm != m);
+    // The bank decode, the fused cooperative kernel, the gemv variants and the
+    // qtip walk all bake in the K=4 stream layout. Only the generic walk below
+    // is rate-aware, so every other rate is routed through it.
+    const bool k4 = rt_words == 64;
+    GGML_ASSERT(bn <= 4096);          // rt_u shared bound, now per block
+    GGML_ASSERT(bm <= 8192);          // rt_out shared bound, now per block
+    GGML_ASSERT(n % bn == 0 && m % bm == 0);
 
     ggml_cuda_pool_alloc<float> scr(ctx.pool(), (size_t) nt*n + (size_t) nt*m);
     float * scr_u = scr.get();
@@ -2474,7 +2567,7 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     static const bool rt_fused = paw_env_int("GGML_PAW_RT_FUSED", 0) != 0;
     static const int  dense_min_tok = paw_env_int("GGML_PAW_DENSE_MIN_TOK", 4);
-    if (rt_fused && !paw_rt_bank_fp8_on() && !paw_rt_bank_idx_on() && nt < dense_min_tok && paw_bank_cache_on()) {
+    if (k4 && !blocked && rt_fused && !paw_rt_bank_fp8_on() && !paw_rt_bank_idx_on() && nt < dense_min_tok && paw_bank_cache_on()) {
         // cooperative single-launch RT_MM (rt_u + bank GEMV + rt_out)
         const int id = ggml_cuda_get_device();
         const bool coop = ggml_cuda_info().devices[id].supports_cooperative_launch;
@@ -2506,42 +2599,42 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // computes u internally. Valid when the gemv geometry matches the kernel's
     // assumptions (n >= 256, n % 2 == 0, m % 8 == 0).
     static const bool rt_gemvu = paw_env_int("GGML_PAW_RT_GEMVU", 0) != 0;
-    const bool gemvu = rt_gemvu && bank_cache && nt < dense_min_tok &&
+    const bool gemvu = k4 && !blocked && rt_gemvu && bank_cache && nt < dense_min_tok &&
                        n >= 256 && n % 2 == 0 && m % 8 == 0;
 
     if (!gemvu) {
     paw_timed(stream, std::string("rt_u") + shp, [&]() {
-    if (paw_fwht_v2_on() && paw_fwht_v2_ok(n)) {
+    if (!blocked && paw_fwht_v2_on() && paw_fwht_v2_ok(n)) {
         paw_fwht_for_wg(n/16, [&](auto WG) {
             constexpr int wg = decltype(WG)::value;
             paw_launch(paw_rt_u_kernel<wg>,
                 ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(wg, 1, 1), 0, stream),
-                (const float *) su->data, (const float *) x->data, scr_u, n);
+                (const float *) su->data, (const float *) x->data, scr_u, n, bn);
         });
-    } else if (paw_fwht_wg512()) {
+    } else if (!blocked && paw_fwht_wg512()) {
         paw_launch(paw_rt_u_kernel<512>,
             ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), 0, stream),
-            (const float *) su->data, (const float *) x->data, scr_u, n);
+            (const float *) su->data, (const float *) x->data, scr_u, n, bn);
     } else {
         paw_launch(paw_rt_u_kernel<256>,
             ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), 0, stream),
-            (const float *) su->data, (const float *) x->data, scr_u, n);
+            (const float *) su->data, (const float *) x->data, scr_u, n, bn);
     }
     });
     }
 
-    if (rt_walk_qtip && nt == 1) {
+    if (k4 && rt_walk_qtip && nt == 1) {
         static int debug_calls = 0;
         static const bool debug_diff = paw_env_int("GGML_PAW_RT_WALK_QTIP_DEBUG", 0) != 0;
         if (debug_diff && debug_calls < 6) {
             ggml_cuda_pool_alloc<float> ref_v_alloc(ctx.pool(), (size_t) m);
             float * ref_v = ref_v_alloc.get();
             if (n/16 <= 128) {
-                paw_launch(paw_rt_walk_kernel<128>,
+                paw_launch((paw_rt_walk_kernel<128, 64>),
                     ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(128, 1, 1), 0, stream),
                     (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n);
             } else {
-                paw_launch(paw_rt_walk_kernel<256>,
+                paw_launch((paw_rt_walk_kernel<256, 64>),
                     ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
                     (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n);
             }
@@ -2567,11 +2660,11 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         } else if (debug_diff) {
             // past the debug window: use the known-good reference path
             if (n/16 <= 128) {
-                paw_launch(paw_rt_walk_kernel<128>,
+                paw_launch((paw_rt_walk_kernel<128, 64>),
                     ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(128, 1, 1), 0, stream),
                     (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, scr_v, m, n);
             } else {
-                paw_launch(paw_rt_walk_kernel<256>,
+                paw_launch((paw_rt_walk_kernel<256, 64>),
                     ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
                     (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, scr_v, m, n);
             }
@@ -2588,7 +2681,7 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (const float *) scr_u, scr_v, m, n);
         });
         }
-    } else if (bank_cache) {
+    } else if (k4 && bank_cache) {
         // Marlin-style: the bank is decoded once and cached; the per-step
         // decode is skipped and both paths run a plain GEMM/GEMV over it.
         const void * bank = paw_rt_bank_get(trellis->data, tlut->data, m, n, stream);
@@ -2596,7 +2689,7 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         const bool fp8 = !idx && paw_rt_bank_fp8_on();
         const half * dense_bank = idx ? paw_rt_idx_fp16_bank(bank, m, n) : (const half *) bank;
         static const bool rt_tc4     = paw_env_int("GGML_PAW_RT_TC", 8) == 4;
-        static const bool rt_apply_mma = paw_env_int("GGML_PAW_RT_APPLY_MMA", 0) != 0;
+        static const bool rt_apply_mma = paw_env_int("GGML_PAW_RT_APPLY_MMA", 1) != 0;
         if (idx && nt < dense_min_tok) {
             paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
             paw_launch(paw_rt_bank_gemv_idx80,
@@ -2638,10 +2731,7 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         } else {
             paw_timed(stream, std::string("rt_apply") + shp, [&]() {
             if (rt_apply_mma) {
-                paw_launch(paw_rt_apply_kernel_mma,
-                    ggml_cuda_kernel_launch_params(
-                        dim3(m/16, 1, (nt + 15)/16), dim3(128, 1, 1), 0, stream),
-                    dense_bank, (const float *) scr_u, scr_v, m, n, nt);
+                paw_launch_rt_apply_mma(stream, dense_bank, (const float *) scr_u, scr_v, m, n, nt);
             } else if (rt_tc4) {
                 paw_launch(paw_rt_apply_kernel<4>,
                     ggml_cuda_kernel_launch_params(
@@ -2665,17 +2755,14 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (const uint16_t *) trellis->data, (const half *) tlut->data, bank, m, n);
         });
         static const bool rt_tc4     = paw_env_int("GGML_PAW_RT_TC", 8) == 4;
-        static const bool rt_apply_mma = paw_env_int("GGML_PAW_RT_APPLY_MMA", 0) != 0;
+        static const bool rt_apply_mma = paw_env_int("GGML_PAW_RT_APPLY_MMA", 1) != 0;
         paw_timed(stream, std::string("rt_apply") + shp, [&]() {
         if (rt_apply_mma) {
             // experimental tensor-core path -- see paw_rt_apply_kernel_mma
             // comment above. TC fixed at 16 (wmma's fp16 tile shape). m must
             // be a multiple of 16 (same assumption the scalar path already
             // makes via m/16 grid dims).
-            paw_launch(paw_rt_apply_kernel_mma,
-                ggml_cuda_kernel_launch_params(
-                    dim3(m/16, 1, (nt + 15)/16), dim3(128, 1, 1), 0, stream),
-                (const half *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            paw_launch_rt_apply_mma(stream, (const half *) bank, (const float *) scr_u, scr_v, m, n, nt);
         } else if (rt_tc4) {
             paw_launch(paw_rt_apply_kernel<4>,
                 ggml_cuda_kernel_launch_params(
@@ -2697,14 +2784,35 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                     dim3(m/16, 1, (nt + 15)/16), dim3(128, 1, 1), 0, stream),
                 (const uint16_t *) trellis->data, (const half *) tlut->data,
                 scr_u, scr_v, m, n, nt);
-        } else if (n/16 <= 128) {
-            paw_launch(paw_rt_walk_kernel<128>,
-                ggml_cuda_kernel_launch_params(dim3(m/16, 1, nt), dim3(128, 1, 1), 0, stream),
-                (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, scr_v, m, n);
         } else {
-            paw_launch(paw_rt_walk_kernel<256>,
-                ggml_cuda_kernel_launch_params(dim3(m/16, 1, nt), dim3(256, 1, 1), 0, stream),
-                (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, scr_v, m, n);
+            const int wg = n/16 <= 128 ? 128 : 256;
+            auto go = [&](auto WGC, auto KC) {
+                paw_launch((paw_rt_walk_kernel<decltype(WGC)::value, decltype(KC)::value>),
+                    ggml_cuda_kernel_launch_params(dim3(m/16, 1, nt), dim3(wg, 1, 1), 0, stream),
+                    (const uint16_t *) trellis->data, (const half *) tlut->data,
+                    scr_u, scr_v, m, n);
+            };
+            #define PAW_WALK_DISPATCH(WGV)                                        \
+                switch (rt_words) {                                               \
+                    case 16: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 16>{}); break;        \
+                    case 24: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 24>{}); break;        \
+                    case 32: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 32>{}); break;        \
+                    case 40: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 40>{}); break;        \
+                    case 48: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 48>{}); break;        \
+                    case 56: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 56>{}); break;        \
+                    case 64: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 64>{}); break;        \
+                    default: GGML_ABORT("paw: unsupported trellis rate, "          \
+                                        "%d words per tile", rt_words);           \
+                }
+            if (wg == 128) { PAW_WALK_DISPATCH(128) } else { PAW_WALK_DISPATCH(256) }
+            #undef PAW_WALK_DISPATCH
         }
         });
     }
@@ -2712,48 +2820,48 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     paw_timed(stream, std::string("rt_out") + shp, [&]() {
     if (epilogue_dot) {
-        GGML_ASSERT(m == 2048 && paw_fwht_v2_on() && paw_fwht_v2_ok(m));
+        GGML_ASSERT(!blocked && m == 2048 && paw_fwht_v2_on() && paw_fwht_v2_ok(m));
         paw_launch((paw_rt_out_epilogue_dot_kernel<128>),
             ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(128, 1, 1), 0, stream),
             (const float *) sv->data, scr_v, (float *) dst->data,
             (const float *) gate->data, (const float *) gate_x->data,
-            (const float *) acc->data, m, (int) gate->ne[0]);
+            (const float *) acc->data, m, (int) gate->ne[0], bm);
     } else
-    if (paw_fwht_v2_on() && paw_fwht_v2_ok(m)) {
+    if (!blocked && paw_fwht_v2_on() && paw_fwht_v2_ok(m)) {
         paw_fwht_for_wg(m/16, [&](auto WG) {
             constexpr int wg = decltype(WG)::value;
             if (epilogue) {
                 paw_launch((paw_rt_out_kernel<wg, true>),
                     ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(wg, 1, 1), 0, stream),
                     (const float *) sv->data, scr_v, (float *) dst->data,
-                    (const float *) gate->data, (const float *) acc->data, m);
+                    (const float *) gate->data, (const float *) acc->data, m, bm);
             } else {
                 paw_launch((paw_rt_out_kernel<wg, false>),
                     ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(wg, 1, 1), 0, stream),
-                    (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m);
+                    (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m, bm);
             }
         });
-    } else if (paw_fwht_wg512()) {
+    } else if (!blocked && paw_fwht_wg512()) {
         if (epilogue) {
             paw_launch((paw_rt_out_kernel<512, true>),
                 ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), 0, stream),
                 (const float *) sv->data, scr_v, (float *) dst->data,
-                (const float *) gate->data, (const float *) acc->data, m);
+                (const float *) gate->data, (const float *) acc->data, m, bm);
         } else {
             paw_launch((paw_rt_out_kernel<512, false>),
                 ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), 0, stream),
-                (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m);
+                (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m, bm);
         }
     } else {
         if (epilogue) {
             paw_launch((paw_rt_out_kernel<256, true>),
                 ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), 0, stream),
                 (const float *) sv->data, scr_v, (float *) dst->data,
-                (const float *) gate->data, (const float *) acc->data, m);
+                (const float *) gate->data, (const float *) acc->data, m, bm);
         } else {
             paw_launch((paw_rt_out_kernel<256, false>),
                 ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), 0, stream),
-                (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m);
+                (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m, bm);
         }
     }
     });
@@ -3058,6 +3166,10 @@ void ggml_cuda_op_paw_rt_mm_batch(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int n_matrices = dst->op_params[0];
     GGML_ASSERT(n_matrices >= 2 && n_matrices <= 4);
     GGML_ASSERT(dst->op == GGML_OP_PAW_RT_MM_BATCH);
+    // supports_op already refuses these, so reaching here means a caller built
+    // the op directly; fail loudly rather than rotate with the wrong basis.
+    GGML_ASSERT(dst->op_params[GGML_PAW_RHT_BLK_SLOT] == 0 &&
+                "paw: the batched RT path has no blocked-rotation kernel yet");
 
     // tlut is src[3K], x is src[3K+1]
     const ggml_tensor * tlut = dst->src[3*n_matrices];
@@ -3155,7 +3267,7 @@ void ggml_cuda_op_paw_rt_mm_batch(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     static const int  dense_min_tok = paw_env_int("GGML_PAW_DENSE_MIN_TOK", 4);
     static const bool rt_tc4        = paw_env_int("GGML_PAW_RT_TC", 8) == 4;
-    static const bool rt_apply_mma  = paw_env_int("GGML_PAW_RT_APPLY_MMA", 0) != 0;
+    static const bool rt_apply_mma  = paw_env_int("GGML_PAW_RT_APPLY_MMA", 1) != 0;
     const bool idx = paw_rt_bank_idx_on();
     const bool fp8 = !idx && paw_rt_bank_fp8_on();
     if (idx && nt < dense_min_tok) {
@@ -3185,10 +3297,7 @@ void ggml_cuda_op_paw_rt_mm_batch(ggml_backend_cuda_context & ctx, ggml_tensor *
             float * v_i       = scr_v + hdesc[i].v_off;
             paw_timed(stream, std::string("rt_apply") + shp, [&]() {
             if (rt_apply_mma) {
-                paw_launch(paw_rt_apply_kernel_mma,
-                    ggml_cuda_kernel_launch_params(
-                        dim3(mi/16, 1, (nt + 15)/16), dim3(128, 1, 1), 0, stream),
-                    hdesc[i].dense_bank, u_i, v_i, mi, ni, nt);
+                paw_launch_rt_apply_mma(stream, hdesc[i].dense_bank, u_i, v_i, mi, ni, nt);
             } else if (rt_tc4) {
                 paw_launch(paw_rt_apply_kernel<4>,
                     ggml_cuda_kernel_launch_params(
@@ -4270,6 +4379,148 @@ static __global__ void paw_exp_apply_kernel(
     }
 }
 
+
+// Weight-stationary tensor-core twin of paw_exp_apply_kernel for the dense
+// prefill path (V8 and legacy payloads). One persistent block per (group,
+// 64-row tile) sweeps that group's routed pairs in chunks of bn pairs; a
+// full-K accumulation finishes each chunk before the next starts, so a
+// group with cnt <= bn reads its bank strip exactly once instead of
+// ceil(cnt/PC) times. The V8 wave gamma is row-strip dependent, so instead
+// of folding it into the shared activation slab the B tile is rescaled per
+// A-tile into a small scratch buffer -- the association is contractible in
+// the same sense the fused walk documents. Requires m % 64 == 0.
+template <bool V8, int BMT>
+static __global__ void paw_exp_apply_kernel_ws(
+        const half    * GGML_CUDA_RESTRICT bank,     // [n_groups, m, n]
+        const int32_t * GGML_CUDA_RESTRICT scr_i,
+        const float   * GGML_CUDA_RESTRICT scr_u,    // [P, n]
+        float         * GGML_CUDA_RESTRICT scr_v,    // [P, m]
+        const half    * GGML_CUDA_RESTRICT gamma,    // V8 only, else nullptr
+        const int m, const int n, const int n_groups) {
+    using namespace nvcuda;
+
+    constexpr int n_warps = 4;
+    constexpr int bm_t    = BMT;                  // narrow tiles for small m
+    constexpr int tpb     = 2;                    // BN = 128 pairs per chunk
+    constexpr int bn      = n_warps * tpb * 16;
+    constexpr int bk      = 16;                   // == the wmma K tile
+
+    const int g    = blockIdx.y;
+    const int row0 = blockIdx.x * (bm_t * 16);
+    const int tid  = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane    = tid % 32;
+    const int tiles_y = n / 16;
+    const int Mb      = m / 16;
+
+    __shared__ half Xsh[n_warps][tpb][16][bk];    // raw gathered activations
+    __shared__ half Bsh[n_warps][16][bk];         // gamma-scaled B tile
+    __shared__ float out_sh[n_warps][16*16];
+    __shared__ int pidx_sh[bn];
+    __shared__ int scnt, soff, e_ori;
+
+    ggml_cuda_pdl_sync();
+    if (tid == 0) {
+        scnt   = scr_i[g];
+        soff   = scr_i[n_groups + g];
+        e_ori  = V8 ? scr_i[2*n_groups + g] : 0;
+    }
+    __syncthreads();
+    const int cnt = scnt;
+    if (cnt == 0) {                // block-uniform: whole block exits together
+        return;
+    }
+    const int off = soff;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[bm_t][tpb];
+
+    for (int q0 = 0; q0 < cnt; q0 += bn) {
+#pragma unroll
+        for (int r = 0; r < bm_t; ++r) {
+#pragma unroll
+            for (int t = 0; t < tpb; ++t) {
+                wmma::fill_fragment(acc[r][t], 0.0f);
+            }
+        }
+        for (int i = tid; i < bn; i += 128) {
+            // tail chunk: clamp (duplicate compute, write-guarded below)
+            pidx_sh[i] = scr_i[4*n_groups + off + min(q0 + i, cnt - 1)];
+        }
+        __syncthreads();
+
+        for (int k0 = 0; k0 < n; k0 += bk) {
+#pragma unroll
+            for (int t = 0; t < tpb; ++t) {
+                const int tt0 = (warp_id*tpb + t)*16;
+                for (int idx = lane; idx < 16*bk; idx += 32) {
+                    const int tt = idx / bk;
+                    const int kk = idx % bk;
+                    const int kg = k0 + kk;
+                    float v = 0.0f;
+                    if (kg < n && q0 + tt0 + tt < cnt) {
+                        v = scr_u[(int64_t) pidx_sh[tt0 + tt]*n + kg];
+                    }
+                    Xsh[warp_id][t][tt][kk] = __float2half(v);
+                }
+            }
+            __syncwarp();
+#pragma unroll
+            for (int r = 0; r < bm_t; ++r) {
+                wmma::load_matrix_sync(a_frag,
+                    bank + ((int64_t) g*m + row0 + r*16)*n + k0, n);
+                float gv = 1.0f;
+                if (V8) {
+                    // closed-form wave index of the fused walk, per column
+                    // tile, for this block's r-th output strip
+                    const int tr_r = row0/16 + r;
+                    const int wv = (tr_r + k0/16 <= tiles_y - 1)
+                        ? Mb + tiles_y - 1 - (tr_r + k0/16)
+                        : Mb + tiles_y - 2 - (tr_r + k0/16);
+                    gv = __half2float(gamma[(int64_t) e_ori*(Mb + tiles_y) + wv]);
+                }
+#pragma unroll
+                for (int t = 0; t < tpb; ++t) {
+                    if (V8) {
+                        for (int idx = lane; idx < 16*bk; idx += 32) {
+                            const int tt = idx / bk;
+                            const int kk = idx % bk;
+                            Bsh[warp_id][tt][kk] = __float2half(
+                                gv*__half2float(Xsh[warp_id][t][tt][kk]));
+                        }
+                        __syncwarp();
+                        wmma::load_matrix_sync(b_frag, &Bsh[warp_id][0][0], bk);
+                    } else {
+                        wmma::load_matrix_sync(b_frag, &Xsh[warp_id][t][0][0], bk);
+                    }
+                    wmma::mma_sync(acc[r][t], a_frag, b_frag, acc[r][t]);
+                }
+            }
+            __syncwarp();
+        }
+
+#pragma unroll
+        for (int r = 0; r < bm_t; ++r) {
+#pragma unroll
+            for (int t = 0; t < tpb; ++t) {
+                wmma::store_matrix_sync(&out_sh[warp_id][0], acc[r][t], 16, wmma::mem_row_major);
+                __syncwarp();
+                const int tt0 = (warp_id*tpb + t)*16;
+                for (int idx = lane; idx < 16*16; idx += 32) {
+                    const int row = idx / 16;
+                    const int tt  = idx % 16;
+                    if (q0 + tt0 + tt < cnt) {
+                        scr_v[(int64_t) pidx_sh[tt0 + tt]*m + row0 + r*16 + row] =
+                            out_sh[warp_id][idx];
+                    }
+                }
+                __syncwarp();
+            }
+        }
+    }
+}
+
 // --- per-routing-slot expert bank cache (nt==1 only), GGML_PAW_EXP_CACHE=1 ---
 //
 // The dense decode/apply path above already only touches active groups
@@ -5160,9 +5411,17 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         });
         const ggml_cuda_kernel_launch_params app_params =
             ggml_cuda_kernel_launch_params(dim3(m/16, n_groups, 1), dim3(128, 1, 1), 0, stream);
+        static const bool exp_ws = paw_env_int("GGML_PAW_EXP_APPLY_WS", 1) != 0;
         static const int exp_pc = paw_env_int("GGML_PAW_EXP_PC", 8);
         paw_timed(stream, std::string("exp_apply") + shp, [&]() {
-        if (v8) {
+        if (v8 && exp_ws && m % 64 == 0 && m >= 1024) {
+            paw_launch(paw_exp_apply_kernel_ws<true, 4>,
+                ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128, 1, 1), 0, stream),
+                (const half *) bank, (const int32_t *) scr_i, (const float *) scr_u, scr_v,
+                (const half *) gamma->data, m, n, n_groups);
+        } else if (v8) {
+        // m < 1024 keeps the scalar PC path: measured slower than WS there
+        // (the pair-gather latency chain dominates the short row dimension)
             if (exp_pc == 1) {
                 paw_launch(paw_exp_apply_kernel<true, 1>, app_params,
                     (const half *) bank, (const int32_t *) scr_i, (const float *) scr_u, scr_v,
@@ -5296,14 +5555,26 @@ bool ggml_cuda_paw_supported(const ggml_tensor * op) {
                    (op->src[4]->ne[0] == 2) == (op->src[8] == nullptr) &&
                    op->src[4]->type == (op->src[4]->ne[0] == 2 ? GGML_TYPE_F32
                                                                : GGML_TYPE_F16);
-        case GGML_OP_PAW_RT_MM:
-            // rt_u stages n floats (<= 4096) and rt_out m floats (<= 8192 =
-            // 32 KB static shared) per block
-            return op->src[1]->ne[0] <= 4096 && op->src[2]->ne[0] <= 8192 &&
+        case GGML_OP_PAW_RT_MM: {
+            // rt_u stages one rotation block of n (<= 4096) and rt_out one of
+            // m (<= 8192 = 32 KB static shared). Unblocked payloads take the
+            // whole dimension as the block, which is the old bound verbatim.
+            const int64_t n   = op->src[1]->ne[0];
+            const int64_t m   = op->src[2]->ne[0];
+            const int64_t blk = op->op_params[GGML_PAW_RHT_BLK_SLOT];
+            const int64_t bn  = blk ? blk : n;
+            const int64_t bm  = blk ? blk : m;
+            const int64_t words = op->src[0]->ne[0];
+            return bn <= 4096 && bm <= 8192 && n % bn == 0 && m % bm == 0 &&
+                   words % 8 == 0 && words >= 16 && words <= 64 &&
                    op->src[3]->type == GGML_TYPE_F16;
+        }
         case GGML_OP_PAW_RT_MM_BATCH:
-            // per-matrix bounds same as rt_mm; tlut is src[3K]
-            return op->src[3*op->op_params[0]]->type == GGML_TYPE_F16 &&
+            // per-matrix bounds same as rt_mm; tlut is src[3K]. The batched
+            // kernels have not been taught blocked rotations yet, so a blocked
+            // payload falls back to the per-matrix path.
+            return op->op_params[GGML_PAW_RHT_BLK_SLOT] == 0 &&
+                   op->src[3*op->op_params[0]]->type == GGML_TYPE_F16 &&
                    op->src[3*op->op_params[0] + 1]->type == GGML_TYPE_F32;
         case GGML_OP_PAW_NE_MM:
         case GGML_OP_PAW_EMBED_ROWS:

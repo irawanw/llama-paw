@@ -4264,13 +4264,16 @@ struct test_paw_exp_mm : public test_paw_exp_common {
 };
 
 struct test_paw_rt_mm : public test_case {
-    const int64_t m, n, words = 64, n_tok;
+    const int64_t m, n, words, n_tok;
+    const int     rht_blk;   // 0 = one Hadamard per dimension (legacy payloads)
 
-    test_paw_rt_mm(int64_t m = 64, int64_t n = 128, int64_t n_tok = 3)
-        : m(m), n(n), n_tok(n_tok) {}
+    // words = 16*K: 64 -> K=4 (shipped), 32 -> K=2, 16 -> K=1
+    test_paw_rt_mm(int64_t m = 64, int64_t n = 128, int64_t n_tok = 3, int rht_blk = 0,
+                   int64_t words = 64)
+        : m(m), n(n), words(words), n_tok(n_tok), rht_blk(rht_blk) {}
 
     std::string vars() override {
-        return VARS_TO_STR4(m, n, words, n_tok);
+        return VARS_TO_STR5(m, n, words, n_tok, rht_blk);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4279,7 +4282,7 @@ struct test_paw_rt_mm : public test_case {
         ggml_tensor * sv   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
         ggml_tensor * tlut = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 2, 512);
         ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tok);
-        return ggml_paw_rt_mm(ctx, trellis, su, sv, tlut, x);
+        return ggml_paw_rt_mm(ctx, trellis, su, sv, tlut, x, rht_blk);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -9900,6 +9903,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_paw_exp_mm(false, true));
     test_cases.emplace_back(new test_paw_exp_mm(true,  true));
     test_cases.emplace_back(new test_paw_rt_mm());
+    // Block-diagonal rotation (rht_blk != 0). blk == the dimension must
+    // reproduce the unblocked path exactly; the rest are the dense lane's
+    // shapes, none of which are powers of two and which exceed the old
+    // single-block staging bounds on both sides.
+    test_cases.emplace_back(new test_paw_rt_mm(  128,  128, 3,  128));
+    test_cases.emplace_back(new test_paw_rt_mm( 2048, 2048, 3, 2048));
+    test_cases.emplace_back(new test_paw_rt_mm( 2048, 5120, 3, 1024));
+    test_cases.emplace_back(new test_paw_rt_mm( 5120, 2048, 3, 1024));
+    test_cases.emplace_back(new test_paw_rt_mm( 5120, 5120, 1, 1024));
+    test_cases.emplace_back(new test_paw_rt_mm(17408, 5120, 1, 1024));   // mlp gate/up
+    test_cases.emplace_back(new test_paw_rt_mm( 5120,17408, 1, 1024));   // mlp down
+    test_cases.emplace_back(new test_paw_rt_mm(12288, 5120, 1, 1024));   // q proj + gate
+    test_cases.emplace_back(new test_paw_rt_mm(10240, 5120, 1, 1024));   // gdn qkv
+    // Sub-4-bit trellis rates. words = 16*K, so the state window stops being
+    // byte-aligned below K=4 -- these cover the generalised walk.
+    for (int64_t words : {(int64_t) 48, (int64_t) 32, (int64_t) 24, (int64_t) 16}) {  // K=3, 2, 1.5, 1
+        test_cases.emplace_back(new test_paw_rt_mm(  64,  128, 3,    0, words));
+        test_cases.emplace_back(new test_paw_rt_mm(2048, 2048, 3,    0, words));
+        test_cases.emplace_back(new test_paw_rt_mm(5120, 2048, 3, 1024, words));
+        test_cases.emplace_back(new test_paw_rt_mm(17408, 5120, 1, 1024, words));
+        test_cases.emplace_back(new test_paw_rt_mm(5120, 17408, 1, 1024, words));
+    }
     test_cases.emplace_back(new test_paw_head_mm());
     test_cases.emplace_back(new test_paw_embed_gather());
     test_cases.emplace_back(new test_paw_exp_basis(false));
@@ -10223,6 +10248,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_paw_rt_mm(8192, 2048, n_tok));   // qkvz proj
         test_cases.emplace_back(new test_paw_rt_mm(2048, 4096, n_tok));   // out proj (assumed)
         test_cases.emplace_back(new test_paw_rt_mm(2048, 2048, n_tok));   // square proj (assumed)
+        // Block-diagonal rotation: the dense lane's shapes, none of which are
+        // powers of two and both of which exceed the old single-block bounds.
+        test_cases.emplace_back(new test_paw_rt_mm(17408, 5120, n_tok, 1024));   // mlp gate/up
+        test_cases.emplace_back(new test_paw_rt_mm(5120, 17408, n_tok, 1024));   // mlp down
+        test_cases.emplace_back(new test_paw_rt_mm(12288, 5120, n_tok, 1024));   // q proj + gate
+        test_cases.emplace_back(new test_paw_rt_mm(5120,  6144, n_tok, 1024));   // o proj
+        test_cases.emplace_back(new test_paw_rt_mm(10240, 5120, n_tok, 1024));   // gdn qkv
+        // blk == dimension must reproduce the unblocked path exactly
+        test_cases.emplace_back(new test_paw_rt_mm(2048, 2048, n_tok, 2048));
     }
     test_cases.emplace_back(new test_paw_head_mm(2048, 151936, 1));
     test_cases.emplace_back(new test_paw_head_mm(2048, 151936, 8));
