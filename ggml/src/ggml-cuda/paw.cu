@@ -1905,11 +1905,47 @@ static __global__ void paw_rt_apply_kernel_mma(
 // host-side mode dispatch shared by every rt_apply mma call site so the
 // bisect modes stay consistent across the cached-bank, fresh-bank and
 // batched paths.
+
+// fp32 -> fp16 activation cast feeding the cuBLAS dense apply
+static __global__ void paw_cast_f32_f16_kernel(
+        const float * GGML_CUDA_RESTRICT x, half * GGML_CUDA_RESTRICT h, const int k) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < k) {
+        h[i] = __float2half(x[i]);
+    }
+}
+
 // host dispatch shared by every rt_apply call site. The weight-stationary
 // tensor-core kernel needs m tiled by 64; anything else falls back to the
 // scalar dense apply.
-static void paw_launch_rt_apply_mma(cudaStream_t stream, const half * bank,
+static void paw_launch_rt_apply_mma(ggml_backend_cuda_context & ctx,
+        cudaStream_t stream, const half * bank,
         const float * scr_u, float * scr_v, const int m, const int n, const int nt) {
+    static const int blas_min_tok = paw_env_int("GGML_PAW_RT_BLAS_MIN_TOK", 128);
+    if (m % 16 == 0 && n % 8 == 0 && nt >= blas_min_tok) {
+        // dense apply against a materialized bank is an ordinary GEMM; hand
+        // large batches to the tensor-core BLAS. Activations are cast once
+        // to fp16 -- the same conversion the custom kernels stage anyway.
+        ggml_cuda_pool_alloc<half> u_h_alloc(ctx.pool());
+        half * u_h = u_h_alloc.alloc((size_t) nt*n);
+        paw_launch(paw_cast_f32_f16_kernel,
+            ggml_cuda_kernel_launch_params(
+                dim3(((size_t) nt*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            scr_u, u_h, (int)((size_t) nt*n));
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(),
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                m, nt, n,
+                &alpha,
+                bank, CUDA_R_16F, n,
+                u_h,  CUDA_R_16F, n,
+                &beta,
+                scr_v, CUDA_R_32F, m,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        return;
+    }
     if (m % 64 == 0) {
         paw_launch(paw_rt_apply_kernel_mma,
             ggml_cuda_kernel_launch_params(dim3(m/64, 1, (nt + 127)/128), dim3(128, 1, 1), 0, stream),
@@ -2731,7 +2767,7 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         } else {
             paw_timed(stream, std::string("rt_apply") + shp, [&]() {
             if (rt_apply_mma) {
-                paw_launch_rt_apply_mma(stream, dense_bank, (const float *) scr_u, scr_v, m, n, nt);
+                paw_launch_rt_apply_mma(ctx, stream, dense_bank, (const float *) scr_u, scr_v, m, n, nt);
             } else if (rt_tc4) {
                 paw_launch(paw_rt_apply_kernel<4>,
                     ggml_cuda_kernel_launch_params(
@@ -2762,7 +2798,7 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             // comment above. TC fixed at 16 (wmma's fp16 tile shape). m must
             // be a multiple of 16 (same assumption the scalar path already
             // makes via m/16 grid dims).
-            paw_launch_rt_apply_mma(stream, (const half *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            paw_launch_rt_apply_mma(ctx, stream, (const half *) bank, (const float *) scr_u, scr_v, m, n, nt);
         } else if (rt_tc4) {
             paw_launch(paw_rt_apply_kernel<4>,
                 ggml_cuda_kernel_launch_params(
@@ -3297,7 +3333,7 @@ void ggml_cuda_op_paw_rt_mm_batch(ggml_backend_cuda_context & ctx, ggml_tensor *
             float * v_i       = scr_v + hdesc[i].v_off;
             paw_timed(stream, std::string("rt_apply") + shp, [&]() {
             if (rt_apply_mma) {
-                paw_launch_rt_apply_mma(stream, hdesc[i].dense_bank, u_i, v_i, mi, ni, nt);
+                paw_launch_rt_apply_mma(ctx, stream, hdesc[i].dense_bank, u_i, v_i, mi, ni, nt);
             } else if (rt_tc4) {
                 paw_launch(paw_rt_apply_kernel<4>,
                     ggml_cuda_kernel_launch_params(
@@ -4134,7 +4170,8 @@ static __global__ void paw_exp_dense_decode_kernel(
         const float    * GGML_CUDA_RESTRICT p4lv,    // P4 only, nullptr otherwise
         const int32_t  * GGML_CUDA_RESTRICT scr_i,
         half           * GGML_CUDA_RESTRICT bank,    // [n_groups, m, n]
-        const int m, const int n, const int n_kept, const int n_groups) {
+        const int m, const int n, const int n_kept, const int n_groups,
+        const half    * GGML_CUDA_RESTRICT wgamma) { // V8 wave gamma or nullptr
     static_assert(V8 || !P4, "P4 is a V8-tlut repack");
     constexpr int WG = 256;
     __shared__ float lv[16];
@@ -4249,6 +4286,21 @@ static __global__ void paw_exp_dense_decode_kernel(
             // round IS this store
             tmp[2*s + 0] = __float2half_rn(v0);
             tmp[2*s + 1] = __float2half_rn(v1);
+        }
+    }
+    if (V8 && wgamma != nullptr) {
+        // fold the wave gamma into the weights so the apply runs as a plain
+        // GEMM; product terms match folding it into the activations up to a
+        // contractible fp16 rounding site
+        const int e_ori = scr_i[2*n_groups + g];
+        const int Mb      = m/16;
+        const int tiles_y = n/16;
+        const int wv = (tr + tc <= tiles_y - 1) ? Mb + tiles_y - 1 - (tr + tc)
+                                                : Mb + tiles_y - 2 - (tr + tc);
+        const float gv = __half2float(wgamma[(int64_t) e_ori*(Mb + tiles_y) + wv]);
+#pragma unroll
+        for (int c = 0; c < 16; ++c) {
+            tmp[c] = __float2half_rn(gv*__half2float(tmp[c]));
         }
     }
     paw_store_half16(dst, tmp);   // same bits, 2x16B instead of 16x2B
@@ -4380,6 +4432,78 @@ static __global__ void paw_exp_apply_kernel(
 }
 
 
+
+// Groups the routed-pair activation slab by expert: xg[(off_g + j)*n + k] =
+// x[plist[off_g + j]*n + k]. Turns the apply kernels' random-row gathers
+// into sequential reads; costs one extra pass over P*n floats.
+static __global__ void paw_exp_permute_x_kernel(
+        const int32_t * GGML_CUDA_RESTRICT scr_i,
+        const float   * GGML_CUDA_RESTRICT x,
+        half          * GGML_CUDA_RESTRICT xg,
+        const int n, const int n_groups) {
+    const int g  = blockIdx.y;
+    const int kg = blockIdx.x*blockDim.x + threadIdx.x;
+    if (kg >= n) {
+        return;
+    }
+    const int cnt = scr_i[g];
+    const int off = scr_i[n_groups + g];
+    const int32_t * plist = scr_i + 4*n_groups;
+    // halves on purpose: the ws apply staged these exact conversions anyway,
+    // and the slab must fit next to the weights on small cards
+    for (int j = 0; j < cnt; ++j) {
+        xg[(int64_t)(off + j)*n + kg] = __float2half(x[(int64_t) plist[off + j]*n + kg]);
+    }
+}
+
+
+// In-place wave-gamma scale of a decoded group bank: W'[r,k] = W[r,k] * g,
+// with the closed-form diagonal wave index of the fused walk. Folding the
+// gamma into the weights (instead of the activations) lets the apply run
+// as a plain GEMM; the product terms are unchanged up to one fp16 rounding
+// site, the same contractible class the dense paths already accept.
+static __global__ void paw_exp_scale_bank_gamma_kernel(
+        half          * GGML_CUDA_RESTRICT bank,
+        const int32_t * GGML_CUDA_RESTRICT scr_i,
+        const half    * GGML_CUDA_RESTRICT gamma,
+        const int m, const int n, const int n_groups) {
+    const int g = blockIdx.y;
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= m*n) {
+        return;
+    }
+    const int tr_r = (i / n) >> 4;
+    const int kt   = (i % n) >> 4;
+    const int e_ori = scr_i[2*n_groups + g];
+    const int Mb      = m/16;
+    const int tiles_y = n/16;
+    const int wv = (tr_r + kt <= tiles_y - 1) ? Mb + tiles_y - 1 - (tr_r + kt)
+                                              : Mb + tiles_y - 2 - (tr_r + kt);
+    const size_t o = (size_t) g*m*n + i;
+    bank[o] = __float2half(__half2float(bank[o]) *
+                           __half2float(gamma[(int64_t) e_ori*(Mb + tiles_y) + wv]));
+}
+
+// inverse of the grouped slab: scr_v[pidx] = yg[off + j]
+static __global__ void paw_exp_unpermute_y_kernel(
+        const int32_t * GGML_CUDA_RESTRICT scr_i,
+        const half    * GGML_CUDA_RESTRICT yg,
+        float         * GGML_CUDA_RESTRICT scr_v,
+        const int m, const int n_groups) {
+    const int g   = blockIdx.y;
+    const int col = blockIdx.x*blockDim.x + threadIdx.x;
+    if (col >= m) {
+        return;
+    }
+    const int cnt = scr_i[g];
+    const int off = scr_i[n_groups + g];
+    const int32_t * plist = scr_i + 4*n_groups;
+    for (int j = 0; j < cnt; ++j) {
+        scr_v[(int64_t) plist[off + j]*m + col] =
+            __half2float(yg[(int64_t)(off + j)*m + col]);
+    }
+}
+
 // Weight-stationary tensor-core twin of paw_exp_apply_kernel for the dense
 // prefill path (V8 and legacy payloads). One persistent block per (group,
 // 64-row tile) sweeps that group's routed pairs in chunks of bn pairs; a
@@ -4389,11 +4513,12 @@ static __global__ void paw_exp_apply_kernel(
 // of folding it into the shared activation slab the B tile is rescaled per
 // A-tile into a small scratch buffer -- the association is contractible in
 // the same sense the fused walk documents. Requires m % 64 == 0.
-template <bool V8, int BMT>
+template <bool V8, int BMT, bool GX>
 static __global__ void paw_exp_apply_kernel_ws(
         const half    * GGML_CUDA_RESTRICT bank,     // [n_groups, m, n]
         const int32_t * GGML_CUDA_RESTRICT scr_i,
         const float   * GGML_CUDA_RESTRICT scr_u,    // [P, n]
+        const half    * GGML_CUDA_RESTRICT xg,       // [P, n] grouped fp16 (GX)
         float         * GGML_CUDA_RESTRICT scr_v,    // [P, m]
         const half    * GGML_CUDA_RESTRICT gamma,    // V8 only, else nullptr
         const int m, const int n, const int n_groups) {
@@ -4460,7 +4585,12 @@ static __global__ void paw_exp_apply_kernel_ws(
                     const int kg = k0 + kk;
                     float v = 0.0f;
                     if (kg < n && q0 + tt0 + tt < cnt) {
-                        v = scr_u[(int64_t) pidx_sh[tt0 + tt]*n + kg];
+                        // GX: activations arrive pre-grouped (and pre-cast),
+                        // rows are read sequentially instead of gathered
+                        const int64_t row = GX ? (int64_t)(off + q0 + tt0 + tt)
+                                               : (int64_t) pidx_sh[tt0 + tt];
+                        v = GX ? __half2float(xg[row*n + kg])
+                               : scr_u[(int64_t) pidx_sh[tt0 + tt]*n + kg];
                     }
                     Xsh[warp_id][t][tt][kk] = __float2half(v);
                 }
@@ -5387,6 +5517,22 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     if (P >= dense_min) {
         // dense prefill: decode active groups once, then apply
         half * bank = bank_alloc.alloc((size_t) n_groups*m*n);
+        static const bool exp_ws  = paw_env_int("GGML_PAW_EXP_APPLY_WS", 1) != 0;
+        static const bool exp_gp  = paw_env_int("GGML_PAW_EXP_XGROUP", 1) != 0;
+        static const int exp_pc   = paw_env_int("GGML_PAW_EXP_PC", 8);
+        ggml_cuda_pool_alloc<half> xg_alloc(ctx.pool());
+        half * xg = nullptr;
+        if (v8 && exp_ws && exp_gp) {
+            xg = xg_alloc.alloc((size_t) P*n);
+            paw_timed(stream, std::string("exp_xgroup") + shp, [&]() {
+            paw_launch(paw_exp_permute_x_kernel,
+                ggml_cuda_kernel_launch_params(
+                    dim3((n + 255)/256, n_groups, 1), dim3(256, 1, 1), 0, stream),
+                (const int32_t *) scr_i, (const float *) scr_u, xg, n, n_groups);
+            });
+        }
+        static const bool exp_blas = paw_env_int("GGML_PAW_EXP_BLAS", 1) != 0;
+        const bool use_blas = v8 && exp_blas && xg && m % 16 == 0;
         const ggml_cuda_kernel_launch_params dec_params =
             ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, n_groups),
                                            dim3(256, 1, 1), 0, stream);
@@ -5395,29 +5541,73 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             if (p4) {
                 paw_launch(paw_exp_dense_decode_kernel<true, true>, dec_params,
                     kept_d, dem_d, (const void *) tlut->data, p4t.packed, p4t.levels,
-                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups);
+                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups,
+                    use_blas ? (const half *) gamma->data : nullptr);
             } else {
                 paw_launch(paw_exp_dense_decode_kernel<true, false>, dec_params,
                     kept_d, dem_d, (const void *) tlut->data,
                     (const uint32_t *) nullptr, (const float *) nullptr,
-                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups);
+                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups,
+                    use_blas ? (const half *) gamma->data : nullptr);
             }
         } else {
             paw_launch(paw_exp_dense_decode_kernel<false, false>, dec_params,
                 kept_d, dem_d, (const void *) tlut->data,
                 (const uint32_t *) nullptr, (const float *) nullptr,
-                (const int32_t *) scr_i, bank, m, n, n_kept, n_groups);
+                (const int32_t *) scr_i, bank, m, n, n_kept, n_groups,
+                use_blas ? (const half *) gamma->data : nullptr);
         }
         });
         const ggml_cuda_kernel_launch_params app_params =
             ggml_cuda_kernel_launch_params(dim3(m/16, n_groups, 1), dim3(128, 1, 1), 0, stream);
-        static const bool exp_ws = paw_env_int("GGML_PAW_EXP_APPLY_WS", 1) != 0;
-        static const int exp_pc = paw_env_int("GGML_PAW_EXP_PC", 8);
+        if (use_blas) {
+            // tall-skinny shape: per-expert dense GEMMs over the grouped
+            // slab beat every custom kernel here; the wave gamma is folded
+            // into the decoded banks first
+            // fp16 output keeps the padded slab small enough for 12GB cards;
+            // the unpermute pass widens back to fp32 for downstream ops
+            ggml_cuda_pool_alloc<half> ygf_alloc(ctx.pool());
+            half * ygf = ygf_alloc.alloc((size_t) P*m);
+            // the per-group GEMM dims live on device; pull the count table
+            // once (a few hundred bytes). Requires uncaptured stream, so the
+            // caller keeps this branch behind GGML_CUDA_DISABLE_GRAPHS=1.
+            std::vector<int32_t> hscr(2*n_groups);
+            CUDA_CHECK(cudaMemcpyAsync(hscr.data(), scr_i,
+                (size_t) 2*n_groups*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+            const float alpha = 1.0f;
+            const float beta  = 0.0f;
+            paw_timed(stream, std::string("exp_blas") + shp, [&]() {
+            for (int g = 0; g < n_groups; ++g) {
+                const int cnt = hscr[g];
+                if (cnt == 0) {
+                    continue;
+                }
+                const int off = hscr[n_groups + g];
+                CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(),
+                        CUBLAS_OP_T, CUBLAS_OP_N,
+                        m, cnt, n,
+                        &alpha,
+                        (const half *) bank + (size_t) g*m*n, CUDA_R_16F, n,
+                        xg + (int64_t) off*n,                   CUDA_R_16F, n,
+                        &beta,
+                        ygf + (int64_t) off*m,                  CUDA_R_16F, m,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
+            });
+            paw_timed(stream, std::string("exp_unperm") + shp, [&]() {
+            paw_launch(paw_exp_unpermute_y_kernel,
+                ggml_cuda_kernel_launch_params(
+                    dim3((m + 255)/256, n_groups, 1), dim3(256, 1, 1), 0, stream),
+                (const int32_t *) scr_i, ygf, scr_v, m, n_groups);
+            });
+        } else {
         paw_timed(stream, std::string("exp_apply") + shp, [&]() {
-        if (v8 && exp_ws && m % 64 == 0 && m >= 1024) {
-            paw_launch(paw_exp_apply_kernel_ws<true, 4>,
+        if (v8 && exp_ws && xg && m % 64 == 0 && m >= 1024) {
+            paw_launch(paw_exp_apply_kernel_ws<true, 4, true>,
                 ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128, 1, 1), 0, stream),
-                (const half *) bank, (const int32_t *) scr_i, (const float *) scr_u, scr_v,
+                (const half *) bank, (const int32_t *) scr_i, nullptr, xg, scr_v,
                 (const half *) gamma->data, m, n, n_groups);
         } else if (v8) {
         // m < 1024 keeps the scalar PC path: measured slower than WS there
@@ -5451,6 +5641,7 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             }
         }
         });
+        }
     } else {
         static const bool walk_compact = paw_env_int("GGML_PAW_EXP_WALK_COMPACT", 0) != 0;
         const bool do_compact = walk_compact && n_tok == 1;
