@@ -2015,7 +2015,11 @@ static __global__ void paw_cast_f32_f16_kernel(
 // scalar dense apply.
 static void paw_launch_rt_apply_mma(ggml_backend_cuda_context & ctx,
         cudaStream_t stream, const half * bank,
-        const float * scr_u, float * scr_v, const int m, const int n, const int nt) {
+        const float * scr_u, float * scr_v, const int m, const int n, const int nt,
+        const int voff = 0) {
+    // voff: first output ROW of this chunk inside the full-m strided dst
+    // (the two-half decode/apply overlap writes scr_v[m0..m) from a bank
+    // slice while keeping the full-row leading dimension)
     static const int blas_min_tok = paw_env_int("GGML_PAW_RT_BLAS_MIN_TOK", 128);
     // the host count/cast staging is incompatible with graph capture
     cudaStreamCaptureStatus rcst = cudaStreamCaptureStatusNone;
@@ -2042,10 +2046,11 @@ static void paw_launch_rt_apply_mma(ggml_backend_cuda_context & ctx,
                 bank, CUDA_R_16F, n,
                 u_h,  CUDA_R_16F, n,
                 &beta,
-                scr_v, CUDA_R_32F, m,
+                scr_v + voff, CUDA_R_32F, m,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         return;
     }
+    GGML_ASSERT(voff == 0 && "row-offset apply only supported on the cublas path");
     if (m % 64 == 0) {
         paw_launch(paw_rt_apply_kernel_mma,
             ggml_cuda_kernel_launch_params(dim3(m/64, 1, (nt + 127)/128), dim3(128, 1, 1), 0, stream),
@@ -2962,21 +2967,58 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         // cached-bank branch uses. The generic walk this replaces re-decodes
         // every weight per token -- measured 7.4 t/s prompt at nt~1000.
         static const bool rt_apply_mma_d = paw_env_int("GGML_PAW_RT_APPLY_MMA", 1) != 0;
+        // split the matrix into two row halves and decode half 2 on the aux
+        // stream while half 1 applies on the main stream -- hides roughly
+        // half the decode traffic behind apply traffic. Same event pattern
+        // as the expert blas pipeline; capture-unsafe, so graphs-off only.
+        cudaStreamCaptureStatus dcst = cudaStreamCaptureStatusNone;
+        const bool dcap = cudaStreamIsCapturing(stream, &dcst) == cudaSuccess &&
+                          dcst == cudaStreamCaptureStatusActive;
+        static const bool rt_ovl = paw_env_int("GGML_PAW_RT_DECODE_OVL", 1) != 0;
+        // voff applies only on the cublas path, which needs nt >= its own
+        // threshold; below that keep the serial single-bank flow
+        const bool ovl = rt_ovl && !dcap && m >= 2048 &&
+                         nt >= paw_env_int("GGML_PAW_RT_BLAS_MIN_TOK", 128);
         ggml_cuda_pool_alloc<half> bank_alloc(ctx.pool());
         half * apply_bank = bank_alloc.alloc((size_t) m*n);
-        paw_rt_dense_decode_rate_launch((const uint16_t *) trellis->data,
-            (const half *) tlut->data, apply_bank, m, n, rt_words, stream);
-        paw_timed(stream, std::string("rt_apply_dense") + shp, [&]() {
-        if (rt_apply_mma_d) {
-            paw_launch_rt_apply_mma(ctx, stream, apply_bank,
-                (const float *) scr_u, scr_v, m, n, nt);
+        auto apply_fn = [&](const half * bk, int rows, int voff) {
+            if (rt_apply_mma_d) {
+                paw_launch_rt_apply_mma(ctx, stream, bk,
+                    (const float *) scr_u, scr_v, rows, n, nt, voff);
+            } else {
+                paw_launch(paw_rt_apply_kernel<8>,
+                    ggml_cuda_kernel_launch_params(
+                        dim3(rows/16, 1, (nt + 7)/8), dim3(128, 1, 1), 0, stream),
+                    bk, (const float *) scr_u, scr_v, rows, n, nt);
+            }
+        };
+        if (!ovl) {
+            paw_rt_dense_decode_rate_launch((const uint16_t *) trellis->data,
+                (const half *) tlut->data, apply_bank, m, n, rt_words, stream);
+            paw_timed(stream, std::string("rt_apply_dense") + shp, [&]() {
+                apply_fn(apply_bank, m, 0);
+            });
         } else {
-            paw_launch(paw_rt_apply_kernel<8>,
-                ggml_cuda_kernel_launch_params(
-                    dim3(m/16, 1, (nt + 7)/8), dim3(128, 1, 1), 0, stream),
-                apply_bank, (const float *) scr_u, scr_v, m, n, nt);
+            const int m0 = m/2;   // multiples of 16 guaranteed (m >= 2048)
+            cudaEvent_t ev0, ev1;
+            CUDA_CHECK(cudaEventCreate(&ev0));
+            CUDA_CHECK(cudaEventCreate(&ev1));
+            cudaStream_t ds = paw_aux_stream();
+            paw_rt_dense_decode_rate_launch((const uint16_t *) trellis->data,
+                (const half *) tlut->data, apply_bank, m0, n, rt_words, stream);
+            CUDA_CHECK(cudaEventRecord(ev0, stream));
+            paw_rt_dense_decode_rate_launch((const uint16_t *) trellis->data,
+                (const half *) tlut->data, apply_bank + (size_t) m0*n,
+                m - m0, n, rt_words, ds);
+            CUDA_CHECK(cudaEventRecord(ev1, ds));
+            paw_timed(stream, std::string("rt_apply_dense") + shp, [&]() {
+                apply_fn(apply_bank, m0, 0);
+                CUDA_CHECK(cudaStreamWaitEvent(stream, ev1));
+                apply_fn(apply_bank + (size_t) m0*n, m - m0, m0);
+            });
+            CUDA_CHECK(cudaEventDestroy(ev0));
+            CUDA_CHECK(cudaEventDestroy(ev1));
         }
-        });
     } else {
     ggml_cuda_pool_alloc<half> bank_alloc(ctx.pool());
     // paw_rt_dense_decode_kernel bakes in the K=4 stream layout: 64 words per
