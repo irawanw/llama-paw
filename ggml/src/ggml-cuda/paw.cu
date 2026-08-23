@@ -1529,24 +1529,66 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
     const int tid4     = lane & 3;
     float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
 
-    for (int ct = wid; ct < tiles_y; ct += 8) {
+    // the per-lane state windows (bit offsets into the tile's stream) do not
+    // depend on ct -- only the tile base word moves -- so the trellis loads
+    // are software-pipelined one ct iteration ahead: issue iteration ct+8's
+    // loads before consuming iteration ct's, giving them a full MMA-plus-
+    // decode of latency slack instead of stalling the loop every step
+    const int ri = lane >> 1;
+    const int jb = (lane & 1)*4;
+    int      wi0[4], wi1[4], offv[4];
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+        const int b = step*(8*ri + jb + jj);
+        wi0[jj]  = (b >> 4) % WORDS;
+        offv[jj] = b & 15;
+        wi1[jj]  = (wi0[jj] + 1) % WORDS;
+    }
+    uint32_t c0[4], c1[4];
+    float    ucur = 0.f;
+    {
+        const int64_t tw = ((int64_t) tr*tiles_y + wid)*WORDS;
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) {
+            c0[jj] = trellis[tw + wi0[jj]];
+            c1[jj] = offv[jj] != 0 ? trellis[tw + wi1[jj]] : 0u;
+        }
+        if (lane < 16) {
+            ucur = scr_u[wid*16 + lane];
+        }
+    }
+
+    // gridDim.y > 1: several blocks SHARE one output tile, each walking a
+    // strided subset of the tile columns (the serial chain per warp shrinks
+    // by gridDim.y); partials are atomic-added into scr_v
+    for (int ct = wid + 8*blockIdx.y; ct < tiles_y; ct += 8*gridDim.y) {
+        // --- prefetch this lane's windows for the NEXT ct this warp owns ---
+        const int ctn = ct + 8*gridDim.y;
+        uint32_t n0[4], n1[4];
+        float    unext = 0.f;
+        if (ctn < tiles_y) {
+            const int64_t twn = ((int64_t) tr*tiles_y + ctn)*WORDS;
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                n0[jj] = trellis[twn + wi0[jj]];
+                n1[jj] = offv[jj] != 0 ? trellis[twn + wi1[jj]] : 0u;
+            }
+            if (lane < 16) {
+                unext = scr_u[ctn*16 + lane];
+            }
+        }
         // --- decode this (tr, ct) 16x16 tile: lanes 0-15 each decode one
         // full row (16 columns), generic rate-aware window math ---
-        if (true) {
+        {
             // all 32 lanes decode: two lanes per row, four states each --
             // halves the serial chain vs one lane doing the whole row
-            const int ri = lane >> 1;
-            const int jb = (lane & 1)*4;
-            const int64_t tw = ((int64_t) tr*tiles_y + ct)*WORDS;
 #pragma unroll
             for (int jj = 0; jj < 4; ++jj) {
                 const int j   = jb + jj;
-                const int b   = step*(8*ri + j);
-                const int wi  = (b >> 4) % WORDS;
-                const int off = b & 15;
-                const uint32_t w0 = trellis[tw + wi];
+                const int off = offv[jj];
+                const uint32_t w0 = c0[jj];
                 const uint32_t st = off == 0 ? w0
-                    : (((w0 << off) | ((uint32_t) trellis[tw + (wi + 1) % WORDS] >> (16 - off)))
+                    : (((w0 << off) | (c1[jj] >> (16 - off)))
                        & 0xFFFFu);
                 const uint32_t ph = st*(st + 1u);
                 const uint32_t row = (ph >> 6) & 511u;
@@ -1561,7 +1603,7 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
         }
         // --- stage this K-step's 16 activation values (nt==1: col 0 real) ---
         if (lane < 16) {
-            bcol[wid][lane] = __float2half_rn(scr_u[ct*16 + lane]);   // nt==1: one shared u vector
+            bcol[wid][lane] = __float2half_rn(ucur);   // nt==1: one shared u vector
         }
         __syncwarp();
 
@@ -1595,11 +1637,19 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
             : "r"(ra0), "r"(ra1), "r"(ra2), "r"(ra3), "r"(rb0), "r"(rb1)
         );
         __syncwarp();   // tile16/bcol reused by the next ct
+
+        // slide the prefetched windows down for the next iteration
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) {
+            c0[jj] = n0[jj];
+            c1[jj] = n1[jj];
+        }
+        ucur = unext;
     }
 
     // only tid4==0 (groupID's col 0 slot) is the real token; d0 -> row
     // groupID, d2 -> row groupID+8 (per the validated D-fragment layout).
-    // four warps covered disjoint ct subsets -- reduce through shared
+    // eight warps covered disjoint ct subsets -- reduce through shared
     __shared__ float xred[8][16];
     if (tid4 == 0) {
         xred[wid][groupID]     = d0;
@@ -1609,9 +1659,117 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
     if (wid == 0 && tid4 == 0) {
         #pragma unroll
         for (int r = 0; r < 16; ++r) {
-            scr_v[tr*16 + r] = xred[0][r] + xred[1][r] + xred[2][r] + xred[3][r]
-                             + xred[4][r] + xred[5][r] + xred[6][r] + xred[7][r];
+            const float sum = xred[0][r] + xred[1][r] + xred[2][r] + xred[3][r]
+                            + xred[4][r] + xred[5][r] + xred[6][r] + xred[7][r];
+            if (gridDim.y == 1) {
+                scr_v[(int64_t) blockIdx.z*m + tr*16 + r] = sum;
+            } else {
+                atomicAdd(&scr_v[(int64_t) blockIdx.z*m + tr*16 + r], sum);
+            }
         }
+    }
+}
+
+
+// fragment-direct qtip walk: each lane decodes EXACTLY its own mma.sync
+// fragment elements straight out of the trellis stream -- the four states a
+// lane needs are fixed by the m16n8k16 layout ((row=g,g+8) x (j=tid4,tid4+4)),
+// so no shared-memory staging, no syncwarp in the loop, no cross-lane
+// exchange at all. Verified bit-exact against paw_rt_walk_qtip_rate_kernel
+// in an isolated probe before landing here.
+template <int WORDS>
+static __global__ void paw_rt_walk_qtip_frag_kernel(
+        const uint16_t * GGML_CUDA_RESTRICT trellis,
+        const half     * GGML_CUDA_RESTRICT tlut,
+        const float    * GGML_CUDA_RESTRICT scr_u,
+        float          * GGML_CUDA_RESTRICT scr_v,
+        const int m, const int n) {
+    constexpr int step = WORDS/8;
+    const int wid  = threadIdx.x >> 5;
+    const int tr   = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int tiles_y = n / 16;
+    const int groupID = lane >> 2;
+    const int tid4    = lane & 3;
+
+    const int rrows[2] = {groupID, groupID + 8};
+    const int rjs[2]   = {tid4, tid4 + 4};
+    int wi0[2][2], wi1[2][2], offv[2][2];
+#pragma unroll
+    for (int k = 0; k < 2; ++k)
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const int b = step*(8*rrows[k] + rjs[q]);
+            wi0[k][q]  = (b >> 4) % WORDS;
+            offv[k][q] = b & 15;
+            wi1[k][q]  = (wi0[k][q] + 1) % WORDS;
+        }
+
+    // B fragment: this K-step's (== this tile column's) 16 activation
+    // values; the lane needs k in {tid4*2,+1, tid4*2+8,+9}
+    auto load_b = [&](int ct, half2& h0, half2& h1) {
+        const float * ub = scr_u + ct*16;
+        h0 = __floats2half2_rn(ub[tid4*2 + 0], ub[tid4*2 + 1]);
+        h1 = __floats2half2_rn(ub[tid4*2 + 8], ub[tid4*2 + 9]);
+    };
+    half2 hb0 = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
+    half2 hb1 = hb0;
+    if (wid < tiles_y) load_b(wid, hb0, hb1);
+    const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+
+    auto load_at = [&](int64_t tw, uint32_t (&a)[2][2], uint32_t (&b)[2][2]) {
+#pragma unroll
+        for (int k = 0; k < 2; ++k)
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                a[k][q] = __ldg(trellis + tw + wi0[k][q]);
+                b[k][q] = offv[k][q] ? __ldg(trellis + tw + wi1[k][q]) : 0u;
+            }
+    };
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+    uint32_t c0[2][2], c1[2][2];
+    if (wid < tiles_y) load_at((int64_t) tr*tiles_y*WORDS + wid*WORDS, c0, c1);
+
+    for (int ct = wid; ct < tiles_y; ct += 8) {
+        const int ctn = ct + 8;
+        uint32_t n0[2][2], n1[2][2];
+        if (ctn < tiles_y) load_at((int64_t) tr*tiles_y*WORDS + ctn*WORDS, n0, n1);
+        half2 nb0 = hb0, nb1 = hb1;
+        if (ctn < tiles_y) load_b(ctn, nb0, nb1);
+        const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+        uint32_t ra[4];
+#pragma unroll
+        for (int k = 0; k < 2; ++k)
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const int off = offv[k][q];
+                const uint32_t w0 = c0[k][q];
+                const uint32_t st = off == 0 ? w0
+                    : (((w0 << off) | (c1[k][q] >> (16 - off))) & 0xFFFFu);
+                const uint32_t ph  = st*(st + 1u);
+                const uint32_t row = (ph >> 6) & 511u;
+                    // packed u32 tlut access: lo half = a0 (sign-flippable by
+                    // xor on the fp16 sign bit), hi half = a1
+                const uint32_t pair = *(const uint32_t*)(const void*)(tlut + 2*row);
+                const uint32_t a0h  = (ph & 0x8000u) ? (pair ^ 0x00008000u) : pair;
+                half2 h = __halves2half2(__ushort_as_half((unsigned short) a0h),
+                                         __ushort_as_half((unsigned short)(pair >> 16)));
+                ra[k + 2*q] = *(uint32_t*)&h;   // (row-group, j-pair): q is the outer axis
+            }
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+            : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+#pragma unroll
+        for (int k = 0; k < 2; ++k)
+#pragma unroll
+            for (int q = 0; q < 2; ++q) { c0[k][q] = n0[k][q]; c1[k][q] = n1[k][q]; }
+        hb0 = nb0; hb1 = nb1;
+    }
+    if (tid4 == 0) {
+        atomicAdd(&scr_v[(size_t) tr*16 + groupID],      d0);
+        atomicAdd(&scr_v[(size_t) tr*16 + groupID + 8],  d2);
     }
 }
 
@@ -2220,27 +2378,53 @@ static std::unordered_map<paw_bank_key, const void *, paw_bank_key_hash> paw_rt_
 
 // rate-dispatch wrapper: any supported trellis rate through the templated
 // tensor-core walk (K4 included -- the generic window math is bit-identical)
+template <int WORDS>
+static void paw_rt_walk_qtip_frag_dispatch(const uint16_t * trellis,
+        const half * tlut, const float * scr_u, float * scr_v,
+        const int m, const int n, cudaStream_t stream) {
+    paw_launch(paw_rt_walk_qtip_frag_kernel<WORDS>,
+        ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
+        trellis, tlut, scr_u, scr_v, m, n);
+}
+
 static void paw_rt_walk_qtip_rate_launch(const uint16_t * trellis,
         const half * tlut, const float * scr_u, float * scr_v,
         const int m, const int n, const int words, cudaStream_t stream) {
+    // column-split factor: enough blocks in flight that no single warp walks
+    // a long serial chain of tile columns (the walk is latency-bound); the
+    // machine holds ~42k threads = ~168 of these 256-thread blocks, so any
+    // matrix with fewer than ~1500 output-tile blocks gets split
+    static const int split_min_blocks =
+        paw_env_int("GGML_PAW_WALK_SPLIT_BLOCKS", 1500);
+    static const int split_max   = paw_env_int("GGML_PAW_WALK_SPLIT_MAX", 8);
+    int S = 1;
+    if (split_min_blocks > 0 && m/16 < split_min_blocks && n >= 256) {
+        S = (split_min_blocks + m/16 - 1)/(m/16);
+        if (S > split_max)  S = split_max;
+        if (S*16 > n/16*8)  S = std::max(1, (n/16*8)/16);   // keep every warp busy
+        if (S < 1)          S = 1;
+    }
+    if (S > 1) {
+        CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) m*sizeof(float), stream));
+    }
     switch (words) {
         case 16: paw_launch(paw_rt_walk_qtip_rate_kernel<16>,
-            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         case 24: paw_launch(paw_rt_walk_qtip_rate_kernel<24>,
-            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         case 32: paw_launch(paw_rt_walk_qtip_rate_kernel<32>,
-            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         case 40: paw_launch(paw_rt_walk_qtip_rate_kernel<40>,
-            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         case 56: paw_launch(paw_rt_walk_qtip_rate_kernel<56>,
-            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         case 64: paw_launch(paw_rt_walk_qtip_rate_kernel<64>,
-            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         default: GGML_ABORT("paw: unsupported trellis rate for qtip walk");
     }
@@ -2812,7 +2996,8 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const bool gemvu = k4 && !blocked && rt_gemvu && bank_cache && nt < dense_min_tok &&
                        n >= 256 && n % 2 == 0 && m % 8 == 0;
 
-    if (!gemvu) {
+    static const bool uout_noop = paw_env_int("GGML_PAW_UOUT_NOOP", 0) != 0;
+    if (!gemvu && !uout_noop) {
     paw_timed(stream, std::string("rt_u") + shp, [&]() {
     if (!blocked && paw_fwht_v2_on() && paw_fwht_v2_ok(n)) {
         paw_fwht_for_wg(n/16, [&](auto WG) {
@@ -2889,7 +3074,67 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         // paw_rt_walk_qtip_kernel's header comment. Falls through to the
         // rt_out call below (same as every other branch here) -- does NOT
         // return early.
-        paw_timed(stream, std::string("rt_walk_qtip") + shp, [&]() {
+        static const bool walk_noop = paw_env_int("GGML_PAW_WALK_NOOP", 0) != 0;
+        // fragment-direct variant (default ON): each lane decodes exactly its
+        // own mma.sync fragment elements straight from the trellis -- no
+        // shared staging, no syncwarp in the loop; scr_v is accumulated with
+        // atomics so it must be zeroed first
+        static const bool walk_frag = paw_env_int("GGML_PAW_WALK_FRAG", 1) != 0;
+        static const bool frag_dbg_on = paw_env_int("GGML_PAW_WALK_FRAG_DEBUG", 0) != 0;
+        static int frag_dbg_calls = 0;
+        if (!walk_noop && walk_frag && frag_dbg_on && frag_dbg_calls < 4 &&
+            (rt_words == 16 || rt_words == 24)) {
+            // correctness probe: frag variant vs the generic reference walk
+            ggml_cuda_pool_alloc<float> ref_v_alloc(ctx.pool(), (size_t) m);
+            float * ref_v = ref_v_alloc.get();
+            CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) m*sizeof(float), stream));
+            switch (rt_words) {
+                case 24: paw_rt_walk_qtip_frag_dispatch<24>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                default: paw_rt_walk_qtip_frag_dispatch<16>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+            }
+            #define PAW_FRAG_DBG(WG) \
+                switch (rt_words) { \
+                    case 16: paw_launch((paw_rt_walk_kernel<WG, 16>),\
+                        ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(WG, 1, 1), 0, stream),\
+                        (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n); break;\
+                    case 24: paw_launch((paw_rt_walk_kernel<WG, 24>),\
+                        ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(WG, 1, 1), 0, stream),\
+                        (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n); break;\
+                    default: GGML_ABORT("frag-dbg: rate");\
+                }
+            if (n/16 <= 128) { PAW_FRAG_DBG(128) } else { PAW_FRAG_DBG(256) }
+            #undef PAW_FRAG_DBG
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<float> hv(m), hr(m);
+            CUDA_CHECK(cudaMemcpy(hv.data(), scr_v, m*sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hr.data(), ref_v, m*sizeof(float), cudaMemcpyDeviceToHost));
+            double md=0, sc=0; int maxi=-1;
+            for (int i = 0; i < m; ++i) { double d=fabs(hv[i]-hr[i]); if(d>md){md=d;maxi=i;} sc=fmax(sc,fabs(hr[i])); }
+            fprintf(stderr, "[frag-dbg] m=%d n=%d words=%d maxdiff=%g scale=%g rel=%.2e at %d | frag[0..2]=%g,%g,%g ref=%g,%g,%g\n",
+                m,n,rt_words,md,sc,md/(sc+1e-30),maxi,hv[0],hv[1],hv[2],hr[0],hr[1],hr[2]);
+            frag_dbg_calls++;
+            return;   // skip normal path this call; v already computed by frag
+        }
+        if (!walk_noop && walk_frag) {
+            CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) m*sizeof(float), stream));
+            switch (rt_words) {
+                case 16: paw_rt_walk_qtip_frag_dispatch<16>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                case 24: paw_rt_walk_qtip_frag_dispatch<24>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                case 32: paw_rt_walk_qtip_frag_dispatch<32>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                case 40: paw_rt_walk_qtip_frag_dispatch<40>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                case 56: paw_rt_walk_qtip_frag_dispatch<56>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                case 64: paw_rt_walk_qtip_frag_dispatch<64>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                default: GGML_ABORT("paw: unsupported trellis rate for frag walk");
+            }
+        } else if (!walk_noop) paw_timed(stream, std::string("rt_walk_qtip") + shp, [&]() {
         paw_rt_walk_qtip_rate_launch((const uint16_t *) trellis->data,
             (const half *) tlut->data, (const float *) scr_u, scr_v,
             m, n, rt_words, stream);
@@ -3111,7 +3356,7 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     }
     }
 
-    paw_timed(stream, std::string("rt_out") + shp, [&]() {
+    if (!uout_noop) paw_timed(stream, std::string("rt_out") + shp, [&]() {
     if (epilogue_dot) {
         GGML_ASSERT(!blocked && m == 2048 && paw_fwht_v2_on() && paw_fwht_v2_ok(m));
         paw_launch((paw_rt_out_epilogue_dot_kernel<128>),
