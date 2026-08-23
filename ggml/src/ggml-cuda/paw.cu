@@ -1499,7 +1499,10 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
         const float    * GGML_CUDA_RESTRICT scr_u,    // [nt=1, n]
         float          * GGML_CUDA_RESTRICT scr_v,    // [nt=1, m]
         const int m, const int n) {
-    __shared__ float  slut[1024];
+    // stride-3 padding: a packed [512][2] float table makes every warp's
+    // random row gather land on even banks only (2+ way conflicts); with a
+    // stride of 3 the bank index (3*row)%32 covers all 32 banks uniformly
+    __shared__ float  slut[512*3];
     // per-warp decode scratch: each warp owns an independent output tile
     __shared__ half   tile16[4][16][16];
     __shared__ half   bcol[4][16];   // this K-step's 16 activation values (col 0 real, rest 0)
@@ -1515,8 +1518,9 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
 
     ggml_cuda_pdl_sync();
 
-    for (int i = threadIdx.x; i < 1024; i += 128) {
-        slut[i] = __half2float(tlut[i]);
+    for (int i = threadIdx.x; i < 512; i += 128) {
+        slut[3*i + 0] = __half2float(tlut[2*i + 0]);
+        slut[3*i + 1] = __half2float(tlut[2*i + 1]);
     }
     __syncthreads();   // all four warps share this table
 
@@ -1527,11 +1531,15 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
     for (int ct = 0; ct < tiles_y; ++ct) {
         // --- decode this (tr, ct) 16x16 tile: lanes 0-15 each decode one
         // full row (16 columns), generic rate-aware window math ---
-        if (lane < 16) {
-            const int ri = lane;
+        if (true) {
+            // all 32 lanes decode: two lanes per row, four states each --
+            // halves the serial chain vs one lane doing the whole row
+            const int ri = lane >> 1;
+            const int jb = (lane & 1)*4;
             const int64_t tw = ((int64_t) tr*tiles_y + ct)*WORDS;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
+            for (int jj = 0; jj < 4; ++jj) {
+                const int j   = jb + jj;
                 const int b   = step*(8*ri + j);
                 const int wi  = (b >> 4) % WORDS;
                 const int off = b & 15;
@@ -1541,8 +1549,8 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
                        & 0xFFFFu);
                 const uint32_t ph = st*(st + 1u);
                 const uint32_t row = (ph >> 6) & 511u;
-                float a0 = slut[2*row + 0];
-                const float a1 = slut[2*row + 1];
+                float a0 = slut[3*row + 0];
+                const float a1 = slut[3*row + 1];
                 if (ph & 0x8000u) {
                     a0 = -a0;
                 }
