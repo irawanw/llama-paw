@@ -1726,12 +1726,17 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
                 b[k][q] = offv[k][q] ? __ldg(trellis + tw + wi1[k][q]) : 0u;
             }
     };
+    // gridDim.y > 1: several blocks share an output tile, each walking a
+    // strided subset of its columns (small-m matrices otherwise leave the
+    // machine idle); partials fold through the atomicAdd epilogue
     float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
     uint32_t c0[2][2], c1[2][2];
-    if (wid < tiles_y) load_at((int64_t) tr*tiles_y*WORDS + wid*WORDS, c0, c1);
+    const int ct_first = wid + 8*(int) blockIdx.y;
+    if (wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8))
+        load_at((int64_t) tr*tiles_y*WORDS + ct_first*WORDS, c0, c1);
 
-    for (int ct = wid; ct < tiles_y; ct += 8) {
-        const int ctn = ct + 8;
+    for (int ct = ct_first; ct < tiles_y; ct += 8*gridDim.y) {
+        const int ctn = ct + 8*gridDim.y;
         uint32_t n0[2][2], n1[2][2];
         if (ctn < tiles_y) load_at((int64_t) tr*tiles_y*WORDS + ctn*WORDS, n0, n1);
         half2 nb0 = hb0, nb1 = hb1;
@@ -2382,8 +2387,23 @@ template <int WORDS>
 static void paw_rt_walk_qtip_frag_dispatch(const uint16_t * trellis,
         const half * tlut, const float * scr_u, float * scr_v,
         const int m, const int n, cudaStream_t stream) {
+    // enough blocks that no warp walks a long serial chain of tile columns
+    // (measured neutral on PAW-27B -- small-m attention projections are not
+    // on the critical path; kept for narrow-m payloads)
+    static const int split_min_blocks =
+        paw_env_int("GGML_PAW_WALK_SPLIT_BLOCKS", 0);
+    static const int split_max   = paw_env_int("GGML_PAW_WALK_SPLIT_MAX", 8);
+    int S = 1;
+    if (split_min_blocks > 0 && m/16 < split_min_blocks && n >= 256) {
+        S = (split_min_blocks + m/16 - 1)/(m/16);
+        if (S > split_max) S = split_max;
+        if (S < 1)         S = 1;
+    }
+    if (S > 1) {
+        CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) m*sizeof(float), stream));
+    }
     paw_launch(paw_rt_walk_qtip_frag_kernel<WORDS>,
-        ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
+        ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
         trellis, tlut, scr_u, scr_v, m, n);
 }
 
