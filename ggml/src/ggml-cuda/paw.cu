@@ -1790,6 +1790,66 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
             if (ctn < tiles_y) { L0=nL0; H0=nH0; L8=nL8; H8=nH8; }
             hb0 = nb0; hb1 = nb1;
         }
+    } else if constexpr (WORDS == 24) {
+        // w24: state (ri, j=t) starts at bit 24*ri + 3t; the j=t+4 state
+        // starts 12 bits later -- same unit pair unless that crosses into
+        // the next unit (then one extra unit covers it). Two fetch_pairs
+        // plus occasional single units replace eight per-state gathers.
+        uint32_t L0, H0, X0, L8, H8, X8, nL0, nH0, nX0, nL8, nH8, nX8;
+        uint32_t o0[2], o2[2]; int u0[2], u2[2];
+        L0=H0=X0=L8=H8=X8=nL0=nH0=nX0=nL8=nH8=nX8=0;
+        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8);
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int bk = 3*(8*rrows[k] + tid4);
+            u0[k]  = (bk >> 4) % WORDS;
+            o0[k]  = bk & 15u;
+            const int cross = (o0[k] + 12) >> 4;   // 0 or 1
+            u2[k]  = (u0[k] + cross) % WORDS;
+            o2[k]  = (o0[k] + 12) & 15u;
+        }
+        if (has) {
+            const int64_t tw = (int64_t) tr*tiles_y*WORDS + ct_first*WORDS;
+            fetch_pair(tw, u0[0], L0, H0);
+            fetch_pair(tw, u0[1], L8, H8);
+            X0 = __ldg(trellis + tw + ((u0[0] + 2) % WORDS));
+            X8 = __ldg(trellis + tw + ((u0[1] + 2) % WORDS));
+            (void) u2; (void) o2;
+        }
+        for (int ct = ct_first; ct < tiles_y; ct += 8*gridDim.y) {
+            const int ctn = ct + 8*gridDim.y;
+            if (ctn < tiles_y) {
+                const int64_t twn = (int64_t) tr*tiles_y*WORDS + ctn*WORDS;
+                fetch_pair(twn, u0[0], nL0, nH0);
+                fetch_pair(twn, u0[1], nL8, nH8);
+                nX0 = __ldg(trellis + twn + ((u0[0] + 2) % WORDS));
+                nX8 = __ldg(trellis + twn + ((u0[1] + 2) % WORDS));
+            }
+            half2 nb0 = hb0, nb1 = hb1;
+            if (ctn < tiles_y) load_b(ctn, nb0, nb1);
+            const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+            uint32_t ra[4];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const uint32_t lo = k ? L8 : L0, hi = k ? H8 : H0;
+                const uint32_t xx = k ? X8 : X0;
+                // j=t state: units (lo,hi) at offset o0[k]
+                ra[k + 2*0] = dec_state(lo, hi, o0[k]);
+                // j=t+4 state: starts 12 bits later
+                ra[k + 2*1] = ((o0[k] + 12) >> 4)
+                    ? dec_state(hi, xx, o2[k])     // crossed into next unit
+                    : dec_state(lo, hi, o2[k]);    // still inside the pair
+            }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+            if (ctn < tiles_y) {
+                L0=nL0; H0=nH0; X0=nX0; L8=nL8; H8=nH8; X8=nX8;
+            }
+            hb0 = nb0; hb1 = nb1;
+        }
     } else {
         uint32_t c0[2][2], c1[2][2];
         if (wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8))
