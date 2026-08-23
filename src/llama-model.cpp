@@ -300,6 +300,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_PAW:
         case LLM_ARCH_MACH1:
             return new llama_model_paw(params);
+        case LLM_ARCH_PAW_DENSE:
+            return new llama_model_paw_dense(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
         case LLM_ARCH_EAGLE3:
@@ -2578,6 +2580,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_PAW:
         case LLM_ARCH_MACH1:
+        case LLM_ARCH_PAW_DENSE:
             return LLAMA_ROPE_TYPE_IMROPE;
 
         case LLM_ARCH_GLM4:

@@ -2684,13 +2684,27 @@ extern "C" {
     //   trellis: I16 [K*16, (m/16)*(n/16)]   tlut: F32 [2, 512]
     //   su: F32 [n]   sv: F32 [m]
     //   x: F32 [n, n_tokens, ...]  ->  dst F32 [m, n_tokens, ...]
+    //
+    // op_params slot carrying rht_blk. The last slot, deliberately: rt_mm
+    // already uses [0] for the epilogue mode and rt_mm_batch uses [0..4] for
+    // the matrix count and row offsets.
+#define GGML_PAW_RHT_BLK_SLOT (GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1)
+
+    // rht_blk selects the rotation's block size. 0 = one Hadamard over the
+    // whole dimension, which requires n and m to be powers of two -- the
+    // shipped 35B checkpoints. A positive power-of-two rht_blk instead applies
+    // diag(H_blk, ..., H_blk), which only requires blk | n and blk | m, so
+    // dense checkpoints whose dimensions are not powers of two (5120, 17408,
+    // ...) are expressible. Encoder and payload must agree on this value; it
+    // travels in the GGUF as "<arch>.rht_block".
     GGML_API struct ggml_tensor * ggml_paw_rt_mm(
             struct ggml_context * ctx,
             struct ggml_tensor  * trellis,
             struct ggml_tensor  * su,
             struct ggml_tensor  * sv,
             struct ggml_tensor  * tlut,
-            struct ggml_tensor  * x);
+            struct ggml_tensor  * x,
+            int                   rht_blk);
 
     // Decode epilogue form: sigmoid(gate) * (W*x) + acc, with gate [1,T]
     // and acc/output [m,T]. The extra work is folded into rt_mm's out phase.
@@ -2702,7 +2716,8 @@ extern "C" {
             struct ggml_tensor  * tlut,
             struct ggml_tensor  * x,
             struct ggml_tensor  * gate,
-            struct ggml_tensor  * acc);
+            struct ggml_tensor  * acc,
+            int                   rht_blk);
 
     // Decode-only scalar-gate variant: computes dot(gate_w, gate_x) inside
     // the RT output block before applying the epilogue.
@@ -2715,7 +2730,8 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * gate_w,
             struct ggml_tensor  * gate_x,
-            struct ggml_tensor  * acc);
+            struct ggml_tensor  * acc,
+            int                   rht_blk);
 
     // Batched form of ggml_paw_rt_mm: K matrices (2..4) that share the same
     // input x, run through one op so the per-phase kernels launch once for the
@@ -2732,7 +2748,8 @@ extern "C" {
             struct ggml_tensor * const * su,
             struct ggml_tensor * const * sv,
             struct ggml_tensor * tlut,
-            struct ggml_tensor * x);
+            struct ggml_tensor * x,
+            int                  rht_blk);
 
     // Batched form of ggml_paw_exp_mm for exactly two routed-expert
     // projections that share one input x and one routing decision (remap,
