@@ -4171,6 +4171,7 @@ static __global__ void paw_exp_dense_decode_kernel(
         const int32_t  * GGML_CUDA_RESTRICT scr_i,
         half           * GGML_CUDA_RESTRICT bank,    // [n_groups, m, n]
         const int m, const int n, const int n_kept, const int n_groups,
+        const int g0,                                 // first group of this slab
         const half    * GGML_CUDA_RESTRICT wgamma) { // V8 wave gamma or nullptr
     static_assert(V8 || !P4, "P4 is a V8-tlut repack");
     constexpr int WG = 256;
@@ -4181,7 +4182,7 @@ static __global__ void paw_exp_dense_decode_kernel(
     (void) p4lv;
     (void) n_groups;
 
-    const int g   = blockIdx.z;
+    const int g   = g0 + (int) blockIdx.z;
     const int tid = threadIdx.x;
 
     ggml_cuda_pdl_sync();
@@ -4226,7 +4227,7 @@ static __global__ void paw_exp_dense_decode_kernel(
         tbase = ((int64_t) ei*ntiles + tile)*words;
     }
 
-    half * dst = bank + ((int64_t) g*m + tr*16 + rr)*n + tc*16;
+    half * dst = bank + ((int64_t)(g - g0)*m + tr*16 + rr)*n + tc*16;
     half tmp[16];
 
     if constexpr (V8) {
@@ -5516,10 +5517,18 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     ggml_cuda_pool_alloc<half> bank_alloc(ctx.pool());
     if (P >= dense_min) {
         // dense prefill: decode active groups once, then apply
-        half * bank = bank_alloc.alloc((size_t) n_groups*m*n);
         static const bool exp_ws  = paw_env_int("GGML_PAW_EXP_APPLY_WS", 1) != 0;
         static const bool exp_gp  = paw_env_int("GGML_PAW_EXP_XGROUP", 1) != 0;
         static const int exp_pc   = paw_env_int("GGML_PAW_EXP_PC", 8);
+        static const bool exp_blas = paw_env_int("GGML_PAW_EXP_BLAS", 1) != 0;
+        // slab width for the chunked blas pipeline; bounds staging VRAM
+        static const int exp_chunk = paw_env_int("GGML_PAW_EXP_BLAS_CHUNK_G", 16);
+        // pool is strict LIFO: bank must be allocated before xg so the
+        // destructor order (xg first, bank last) unwinds it correctly
+        const bool use_blas = v8 && exp_blas && exp_ws && exp_gp && m % 16 == 0;
+        const int bank_g = use_blas ? (exp_chunk < n_groups ? exp_chunk : n_groups)
+                                    : n_groups;
+        half * bank = bank_alloc.alloc((size_t) bank_g*m*n);
         ggml_cuda_pool_alloc<half> xg_alloc(ctx.pool());
         half * xg = nullptr;
         if (v8 && exp_ws && exp_gp) {
@@ -5531,8 +5540,7 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                 (const int32_t *) scr_i, (const float *) scr_u, xg, n, n_groups);
             });
         }
-        static const bool exp_blas = paw_env_int("GGML_PAW_EXP_BLAS", 1) != 0;
-        const bool use_blas = v8 && exp_blas && xg && m % 16 == 0;
+        if (!use_blas) {
         const ggml_cuda_kernel_launch_params dec_params =
             ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, n_groups),
                                            dim3(256, 1, 1), 0, stream);
@@ -5541,23 +5549,24 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             if (p4) {
                 paw_launch(paw_exp_dense_decode_kernel<true, true>, dec_params,
                     kept_d, dem_d, (const void *) tlut->data, p4t.packed, p4t.levels,
-                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups,
-                    use_blas ? (const half *) gamma->data : nullptr);
+                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups, 0,
+                    nullptr);
             } else {
                 paw_launch(paw_exp_dense_decode_kernel<true, false>, dec_params,
                     kept_d, dem_d, (const void *) tlut->data,
                     (const uint32_t *) nullptr, (const float *) nullptr,
-                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups,
-                    use_blas ? (const half *) gamma->data : nullptr);
+                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups, 0,
+                    nullptr);
             }
         } else {
             paw_launch(paw_exp_dense_decode_kernel<false, false>, dec_params,
                 kept_d, dem_d, (const void *) tlut->data,
                 (const uint32_t *) nullptr, (const float *) nullptr,
-                (const int32_t *) scr_i, bank, m, n, n_kept, n_groups,
-                use_blas ? (const half *) gamma->data : nullptr);
+                (const int32_t *) scr_i, bank, m, n, n_kept, n_groups, 0,
+                nullptr);
         }
         });
+        }
         const ggml_cuda_kernel_launch_params app_params =
             ggml_cuda_kernel_launch_params(dim3(m/16, n_groups, 1), dim3(128, 1, 1), 0, stream);
         if (use_blas) {
@@ -5579,21 +5588,39 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             const float alpha = 1.0f;
             const float beta  = 0.0f;
             paw_timed(stream, std::string("exp_blas") + shp, [&]() {
-            for (int g = 0; g < n_groups; ++g) {
-                const int cnt = hscr[g];
-                if (cnt == 0) {
-                    continue;
+            for (int g0 = 0; g0 < n_groups; g0 += exp_chunk) {
+                const int gc = exp_chunk < n_groups - g0 ? exp_chunk : n_groups - g0;
+                const ggml_cuda_kernel_launch_params dp =
+                    ggml_cuda_kernel_launch_params(
+                        dim3((m/16*n + 255)/256, 1, gc), dim3(256, 1, 1), 0, stream);
+                if (p4) {
+                    paw_launch(paw_exp_dense_decode_kernel<true, true>, dp,
+                        kept_d, dem_d, (const void *) tlut->data, p4t.packed, p4t.levels,
+                        (const int32_t *) scr_i, bank, m, n, n_kept, n_groups, g0,
+                        (const half *) gamma->data);
+                } else {
+                    paw_launch(paw_exp_dense_decode_kernel<true, false>, dp,
+                        kept_d, dem_d, (const void *) tlut->data,
+                        (const uint32_t *) nullptr, (const float *) nullptr,
+                        (const int32_t *) scr_i, bank, m, n, n_kept, n_groups, g0,
+                        (const half *) gamma->data);
                 }
-                const int off = hscr[n_groups + g];
-                CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(),
-                        CUBLAS_OP_T, CUBLAS_OP_N,
-                        m, cnt, n,
-                        &alpha,
-                        (const half *) bank + (size_t) g*m*n, CUDA_R_16F, n,
-                        xg + (int64_t) off*n,                   CUDA_R_16F, n,
-                        &beta,
-                        ygf + (int64_t) off*m,                  CUDA_R_16F, m,
-                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                for (int gi = 0; gi < gc; ++gi) {
+                    const int cnt = hscr[g0 + gi];
+                    if (cnt == 0) {
+                        continue;
+                    }
+                    const int off = hscr[n_groups + g0 + gi];
+                    CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(),
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            m, cnt, n,
+                            &alpha,
+                            (const half *) bank + (size_t) gi*m*n, CUDA_R_16F, n,
+                            xg + (int64_t) off*n,                   CUDA_R_16F, n,
+                            &beta,
+                            ygf + (int64_t) off*m,                  CUDA_R_16F, m,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                }
             }
             });
             paw_timed(stream, std::string("exp_unperm") + shp, [&]() {
