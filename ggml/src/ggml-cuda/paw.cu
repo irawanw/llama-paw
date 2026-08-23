@@ -842,7 +842,8 @@ static __global__ void paw_rt_bank_gemv_idx80(
 }
 
 static bool paw_head_packed_on() {
-    static const bool on = paw_env_int("GGML_PAW_HEAD_PACKED", 0) != 0;
+    // measured 2.4x faster than the I16-code gemv on RTX 3060 decode
+    static const bool on = paw_env_int("GGML_PAW_HEAD_PACKED", 1) != 0;
     return on;
 }
 
@@ -1932,7 +1933,12 @@ static void paw_launch_rt_apply_mma(ggml_backend_cuda_context & ctx,
         cudaStream_t stream, const half * bank,
         const float * scr_u, float * scr_v, const int m, const int n, const int nt) {
     static const int blas_min_tok = paw_env_int("GGML_PAW_RT_BLAS_MIN_TOK", 128);
-    if (m % 16 == 0 && n % 8 == 0 && nt >= blas_min_tok) {
+    // the host count/cast staging is incompatible with graph capture
+    cudaStreamCaptureStatus rcst = cudaStreamCaptureStatusNone;
+    const bool rt_capturing =
+        cudaStreamIsCapturing(stream, &rcst) == cudaSuccess &&
+        rcst == cudaStreamCaptureStatusActive;
+    if (!rt_capturing && m % 16 == 0 && n % 8 == 0 && nt >= blas_min_tok) {
         // dense apply against a materialized bank is an ordinary GEMM; hand
         // large batches to the tensor-core BLAS. Activations are cast once
         // to fp16 -- the same conversion the custom kernels stage anyway.
@@ -2754,7 +2760,8 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             });
         } else if (nt < dense_min_tok) {
             static const bool rt_gemv2 = paw_env_int("GGML_PAW_RT_GEMV2", 0) != 0;
-            static const bool rt_gemv3 = paw_env_int("GGML_PAW_RT_GEMV3", 0) != 0;
+            // float4+shared variant: measured ~3.5 t/s gen gain on RTX 3060
+            static const bool rt_gemv3 = paw_env_int("GGML_PAW_RT_GEMV3", 1) != 0;
             paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
             if (gemvu) {
                 paw_launch(paw_rt_gemv_u_kernel,
@@ -5535,7 +5542,13 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         static const int exp_chunk = paw_env_int("GGML_PAW_EXP_BLAS_CHUNK_G", 16);
         // pool is strict LIFO: bank must be allocated before xg so the
         // destructor order (xg first, bank last) unwinds it correctly
-        const bool use_blas = v8 && exp_blas && exp_ws && exp_gp && m % 16 == 0;
+        // the blas branch pulls group counts to host (uncaptured stream);
+        // under graph capture fall back to the fully device-driven path
+        cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
+        const bool capturing = cudaStreamIsCapturing(stream, &cst) == cudaSuccess &&
+                               cst == cudaStreamCaptureStatusActive;
+        const bool use_blas = v8 && exp_blas && exp_ws && exp_gp &&
+                              m % 16 == 0 && !capturing;
         // overlap decode of slab i+1 with GEMMs of slab i on a second stream
         // off by default: measured no gain (decode and GEMM contend for the same
 // bandwidth on this part); kept for parts where that does not hold
@@ -5684,7 +5697,8 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             });
         } else {
         paw_timed(stream, std::string("exp_apply") + shp, [&]() {
-        if (v8 && exp_ws && xg && m % 64 == 0 && m >= 1024) {
+        static const int ws_min_m = paw_env_int("GGML_PAW_EXP_WS_MIN_M", 1024);
+        if (v8 && exp_ws && xg && m % 64 == 0 && m >= ws_min_m) {
             paw_launch(paw_exp_apply_kernel_ws<true, 4, true>,
                 ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128, 1, 1), 0, stream),
                 (const half *) bank, (const int32_t *) scr_i, nullptr, xg, scr_v,
