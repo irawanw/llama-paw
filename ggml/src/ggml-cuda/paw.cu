@@ -2749,10 +2749,11 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                 (const uint16_t *) bank, (const half *) tlut->data,
                 (const float *) scr_u, scr_v, m, n, nt);
             });
-        } else if (fp8) {
-            // fp8 bank: one gemv kernel serves both the decode and prefill
-            // paths (grid.z = nt). The fp16-only variants read the wrong
-            // element size, so bypass them wholesale.
+        } else if (fp8 && nt < dense_min_tok) {
+            // fp8 bank gemv: decode-side only. Large batches go through the
+            // dense-apply pipeline below, which re-decodes from trellis and
+            // never touches the stored bank, so the bank format is free to
+            // differ per batch size.
             paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
             paw_launch(paw_rt_bank_gemv_fp8,
                 ggml_cuda_kernel_launch_params(dim3((m + 7)/8, 1, nt), dim3(256, 1, 1), 0, stream),
@@ -2782,19 +2783,30 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             }
             });
         } else {
+            // an fp8 cached bank cannot feed the fp16 GEMM: decode a fresh
+            // fp16 bank from trellis into scratch for this pass
+            ggml_cuda_pool_alloc<half> fp16_bank_alloc(ctx.pool());
+            const half * apply_bank = dense_bank;
+            if (fp8) {
+                apply_bank = fp16_bank_alloc.alloc((size_t) m*n);
+                paw_launch(paw_rt_dense_decode_kernel,
+                    ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+                    (const uint16_t *) trellis->data, (const half *) tlut->data,
+                    (half *) apply_bank, m, n);
+            }
             paw_timed(stream, std::string("rt_apply") + shp, [&]() {
             if (rt_apply_mma) {
-                paw_launch_rt_apply_mma(ctx, stream, dense_bank, (const float *) scr_u, scr_v, m, n, nt);
+                paw_launch_rt_apply_mma(ctx, stream, apply_bank, (const float *) scr_u, scr_v, m, n, nt);
             } else if (rt_tc4) {
                 paw_launch(paw_rt_apply_kernel<4>,
                     ggml_cuda_kernel_launch_params(
                         dim3(m/16, 1, (nt + 3)/4), dim3(128, 1, 1), 0, stream),
-                    dense_bank, (const float *) scr_u, scr_v, m, n, nt);
+                    apply_bank, (const float *) scr_u, scr_v, m, n, nt);
             } else {
                 paw_launch(paw_rt_apply_kernel<8>,
                     ggml_cuda_kernel_launch_params(
                         dim3(m/16, 1, (nt + 7)/8), dim3(128, 1, 1), 0, stream),
-                    dense_bank, (const float *) scr_u, scr_v, m, n, nt);
+                    apply_bank, (const float *) scr_u, scr_v, m, n, nt);
             }
             });
         }
