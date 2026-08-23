@@ -79,6 +79,11 @@ static bool paw_debug_on() {
     return on;
 }
 
+static bool debug_diff_on() {
+    static const bool on = paw_env_int("GGML_PAW_RT_WALK_QTIP_DEBUG", 0) != 0;
+    return on;
+}
+
 struct paw_time_table {
     std::mutex mtx;
     std::map<std::string, std::pair<long long, double>> acc;   // key -> (calls, total us)
@@ -114,6 +119,15 @@ static cudaStream_t paw_aux_stream() {
 template <typename F>
 static void paw_timed(cudaStream_t stream, const std::string & key, F && launch) {
     if (!paw_time_on()) {
+        launch();
+        return;
+    }
+    // timing syncs are illegal inside a graph capture (the dense path
+    // captures where the 35B blas path did not); time only the replay-free
+    // eager launches and let captured work run unprofiled
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap);
+    if (cap != cudaStreamCaptureStatusNone) {
         launch();
         return;
     }
@@ -1474,28 +1488,37 @@ static __global__ void paw_rt_walk_kernel(
 // decode and mma. One block = one warp = one 16-row output tile; grid.x =
 // m/16 (matches rt_bank_gemv's block count, avoiding the v1 occupancy
 // mistake from the rt_apply attempts).
-static __global__ void paw_rt_walk_qtip_kernel(
+// rate-templated twin of paw_rt_walk_qtip_kernel: same mma.sync epilogue,
+// but the per-row state windows come from the generic bit-stream math
+// (paw_rt_walk_kernel) instead of the K4-only (4*ri+q)&63 wrap, so the
+// dense payload's K1/K1.5 rates get the register-walk fast path too.
+template <int WORDS>
+static __global__ void paw_rt_walk_qtip_rate_kernel(
         const uint16_t * GGML_CUDA_RESTRICT trellis,
         const half     * GGML_CUDA_RESTRICT tlut,     // pre-rounded fp16, [2,512]
         const float    * GGML_CUDA_RESTRICT scr_u,    // [nt=1, n]
         float          * GGML_CUDA_RESTRICT scr_v,    // [nt=1, m]
         const int m, const int n) {
     __shared__ float  slut[1024];
-    __shared__ half   tile16[16][16];
-    __shared__ half   bcol[16];   // this K-step's 16 activation values (col 0 real, rest 0)
+    // per-warp decode scratch: each warp owns an independent output tile
+    __shared__ half   tile16[4][16][16];
+    __shared__ half   bcol[4][16];   // this K-step's 16 activation values (col 0 real, rest 0)
 
-    const int tr   = blockIdx.x;
-    const int lane = threadIdx.x;
+    constexpr int step  = WORDS/8;   // fresh bits per state, V = 2
+    // one WARP per output tile; four warps per block so resident-warps/SM
+    // is not capped by the 32-thread-block limit
+    const int wid  = threadIdx.x >> 5;
+    const int tr   = blockIdx.x*4 + wid;
+    const int lane = threadIdx.x & 31;
 
-    constexpr int words   = 64;
     const int tiles_y = n / 16;
 
     ggml_cuda_pdl_sync();
 
-    for (int i = lane; i < 1024; i += 32) {
+    for (int i = threadIdx.x; i < 1024; i += 128) {
         slut[i] = __half2float(tlut[i]);
     }
-    __syncwarp();
+    __syncthreads();   // all four warps share this table
 
     const int groupID = lane >> 2;
     const int tid4     = lane & 3;
@@ -1503,20 +1526,19 @@ static __global__ void paw_rt_walk_qtip_kernel(
 
     for (int ct = 0; ct < tiles_y; ++ct) {
         // --- decode this (tr, ct) 16x16 tile: lanes 0-15 each decode one
-        // full row (16 columns), verbatim rt_walk math ---
+        // full row (16 columns), generic rate-aware window math ---
         if (lane < 16) {
             const int ri = lane;
-            const int64_t tw = ((int64_t) tr*tiles_y + ct)*words;
-            uint32_t w[5];
-#pragma unroll
-            for (int q = 0; q < 5; ++q) {
-                w[q] = trellis[tw + ((4*ri + q) & 63)];
-            }
+            const int64_t tw = ((int64_t) tr*tiles_y + ct)*WORDS;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                const uint32_t hi = w[j >> 1];
-                const uint32_t st = (j & 1) == 0 ? hi
-                    : (((hi << 8) | (w[(j >> 1) + 1] >> 8)) & 0xFFFFu);
+                const int b   = step*(8*ri + j);
+                const int wi  = (b >> 4) % WORDS;
+                const int off = b & 15;
+                const uint32_t w0 = trellis[tw + wi];
+                const uint32_t st = off == 0 ? w0
+                    : (((w0 << off) | ((uint32_t) trellis[tw + (wi + 1) % WORDS] >> (16 - off)))
+                       & 0xFFFFu);
                 const uint32_t ph = st*(st + 1u);
                 const uint32_t row = (ph >> 6) & 511u;
                 float a0 = slut[2*row + 0];
@@ -1524,18 +1546,18 @@ static __global__ void paw_rt_walk_qtip_kernel(
                 if (ph & 0x8000u) {
                     a0 = -a0;
                 }
-                tile16[ri][2*j + 0] = __float2half_rn(a0);
-                tile16[ri][2*j + 1] = __float2half_rn(a1);
+                tile16[wid][ri][2*j + 0] = __float2half_rn(a0);
+                tile16[wid][ri][2*j + 1] = __float2half_rn(a1);
             }
         }
         // --- stage this K-step's 16 activation values (nt==1: col 0 real) ---
         if (lane < 16) {
-            bcol[lane] = __float2half_rn(scr_u[ct*16 + lane]);
+            bcol[wid][lane] = __float2half_rn(scr_u[ct*16 + lane]);   // nt==1: one shared u vector
         }
         __syncwarp();
 
         // --- build A/B fragments per the validated m16n8k16 layout ---
-        auto Aat = [&](int r, int c) -> half { return tile16[r][c]; };
+        auto Aat = [&](int r, int c) -> half { return tile16[wid][r][c]; };
         half2 a01 = __halves2half2(Aat(groupID,   tid4*2+0), Aat(groupID,   tid4*2+1));
         half2 a23 = __halves2half2(Aat(groupID+8, tid4*2+0), Aat(groupID+8, tid4*2+1));
         half2 a45 = __halves2half2(Aat(groupID,   tid4*2+8), Aat(groupID,   tid4*2+9));
@@ -1552,8 +1574,8 @@ static __global__ void paw_rt_walk_qtip_kernel(
         // (tid4==0 below) is a valid read of the real result. Wasteful
         // (computes the same dot product 8x redundantly across tid4) but
         // not incorrect, and simpler than truly zero-padding 7 columns.
-        half2 b01 = __halves2half2(bcol[tid4*2+0], bcol[tid4*2+1]);
-        half2 b23 = __halves2half2(bcol[tid4*2+8], bcol[tid4*2+9]);
+        half2 b01 = __halves2half2(bcol[wid][tid4*2+0], bcol[wid][tid4*2+1]);
+        half2 b23 = __halves2half2(bcol[wid][tid4*2+8], bcol[wid][tid4*2+9]);
         uint32_t rb0 = *(uint32_t*)&b01;
         uint32_t rb1 = *(uint32_t*)&b23;
 
@@ -1579,6 +1601,60 @@ static __global__ void paw_rt_walk_qtip_kernel(
 // pre-rounded tlut halves (sign flip is exact), then apply the bank with a
 // plain fp32 GEMM-ish kernel. Replaces only the walk stage; rt_u/rt_out are
 // untouched.
+
+// rate-templated twin of paw_rt_dense_decode_kernel: same bank layout,
+// generic per-row state windows (paw_rt_walk_kernel math) so the dense
+// payload's K1/K1.5 rates can materialize fp16 banks for batched apply.
+template <int WORDS>
+static __global__ void paw_rt_dense_decode_rate_kernel(
+        const uint16_t * GGML_CUDA_RESTRICT trellis,
+        const half     * GGML_CUDA_RESTRICT tlut,     // pre-rounded fp16
+        half           * GGML_CUDA_RESTRICT bank,     // [m, n]
+        const int m, const int n) {
+    constexpr int WG = 256;
+    constexpr int step = WORDS/8;
+    __shared__ half slut[1024];
+
+    const int tid = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    for (int i = tid; i < 1024; i += WG) {
+        slut[i] = tlut[i];
+    }
+    __syncthreads();
+
+    const int tiles_y = n / 16;
+    const int gx = blockIdx.x*WG + tid;
+    if (gx >= (m/16)*16*tiles_y) {   // one thread per (tile, tile-row)
+        return;
+    }
+    // column tile fastest: a warp writes 16 consecutive 16-half row chunks
+    const int tc     = gx % tiles_y;
+    const int rowall = gx / tiles_y;
+    const int tr     = rowall >> 4;
+    const int rr     = rowall & 15;
+
+    const int64_t tw = ((int64_t) tr*tiles_y + tc)*WORDS;
+    half * dst = bank + (int64_t)(tr*16 + rr)*n + tc*16;
+    half tmp[16];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int b   = step*(8*rr + j);
+        const int wi  = (b >> 4) % WORDS;
+        const int off = b & 15;
+        const uint32_t w0 = trellis[tw + wi];
+        const uint32_t st = off == 0 ? w0
+            : (((w0 << off) | (trellis[tw + (wi + 1) % WORDS] >> (16 - off)))
+               & 0xFFFFu);
+        const uint32_t ph  = st*(st + 1u);
+        const uint32_t row = (ph >> 6) & 511u;
+        const float a0 = __half2float(slut[2*row + 0]);
+        // negate-then-round-trip is bit-exact for fp16 values (sign bit)
+        tmp[2*j + 0] = __float2half_rn((ph & 0x8000u) ? -a0 : a0);
+        tmp[2*j + 1] = slut[2*row + 1];
+    }
+    paw_store_half16(dst, tmp);   // same bits, 2x16B instead of 16x2B
+}
 
 static __global__ void paw_rt_dense_decode_kernel(
         const uint16_t * GGML_CUDA_RESTRICT trellis,
@@ -2118,6 +2194,61 @@ struct paw_bank_key_hash {
 static std::mutex paw_rt_bank_mutex;
 static std::unordered_map<paw_bank_key, const void *, paw_bank_key_hash> paw_rt_banks;
 
+// rate-dispatch wrapper: any supported trellis rate through the templated
+// tensor-core walk (K4 included -- the generic window math is bit-identical)
+static void paw_rt_walk_qtip_rate_launch(const uint16_t * trellis,
+        const half * tlut, const float * scr_u, float * scr_v,
+        const int m, const int n, const int words, cudaStream_t stream) {
+    switch (words) {
+        case 16: paw_launch(paw_rt_walk_qtip_rate_kernel<16>,
+            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        case 24: paw_launch(paw_rt_walk_qtip_rate_kernel<24>,
+            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        case 32: paw_launch(paw_rt_walk_qtip_rate_kernel<32>,
+            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        case 40: paw_launch(paw_rt_walk_qtip_rate_kernel<40>,
+            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        case 56: paw_launch(paw_rt_walk_qtip_rate_kernel<56>,
+            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        case 64: paw_launch(paw_rt_walk_qtip_rate_kernel<64>,
+            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        default: GGML_ABORT("paw: unsupported trellis rate for qtip walk");
+    }
+}
+
+static void paw_rt_dense_decode_rate_launch(const uint16_t * trellis,
+        const half * tlut, half * bank, const int m, const int n,
+        const int words, cudaStream_t stream) {
+    switch (words) {
+        case 16: paw_launch(paw_rt_dense_decode_rate_kernel<16>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 24: paw_launch(paw_rt_dense_decode_rate_kernel<24>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 32: paw_launch(paw_rt_dense_decode_rate_kernel<32>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 40: paw_launch(paw_rt_dense_decode_rate_kernel<40>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 56: paw_launch(paw_rt_dense_decode_rate_kernel<56>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 64: paw_launch(paw_rt_dense_decode_rate_kernel<64>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        default: GGML_ABORT("paw: unsupported trellis rate for dense decode");
+    }
+}
+
+
 static bool paw_bank_cache_on() {
     static const bool on = paw_env_int("GGML_PAW_BANK_CACHE", 1) != 0;
     return on;
@@ -2619,6 +2750,9 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     static const bool rt_fused = paw_env_int("GGML_PAW_RT_FUSED", 0) != 0;
     static const int  dense_min_tok = paw_env_int("GGML_PAW_DENSE_MIN_TOK", 4);
+    // above this many tokens, a per-pass fp16 bank + batched apply beats the
+    // generic per-token walk on non-K4 payloads
+    static const int  rt_blas_min_nt = paw_env_int("GGML_PAW_RT_BLAS_MIN_NT", 8);
     if (k4 && !blocked && rt_fused && !paw_rt_bank_fp8_on() && !paw_rt_bank_idx_on() && nt < dense_min_tok && paw_bank_cache_on()) {
         // cooperative single-launch RT_MM (rt_u + bank GEMV + rt_out)
         const int id = ggml_cuda_get_device();
@@ -2675,7 +2809,13 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     });
     }
 
-    if (k4 && rt_walk_qtip && nt == 1) {
+    // the rate-templated walk is default-ON for non-K4 payloads: they have
+    // no cached-bank alternative at nt==1 (banking the whole dense FFN would
+    // not fit VRAM), and the generic walk is ~10x slower per call
+    static const bool rt_walk_qtip_dense = paw_env_int("GGML_PAW_RT_WALK_QTIP_DENSE", 1) != 0;
+    const bool use_qtip = nt == 1 && !debug_diff_on() &&
+                          (k4 ? rt_walk_qtip : rt_walk_qtip_dense);
+    if (use_qtip) {
         static int debug_calls = 0;
         static const bool debug_diff = paw_env_int("GGML_PAW_RT_WALK_QTIP_DEBUG", 0) != 0;
         if (debug_diff && debug_calls < 6) {
@@ -2690,10 +2830,9 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                     ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
                     (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n);
             }
-            paw_launch(paw_rt_walk_qtip_kernel,
-                ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(32, 1, 1), 0, stream),
-                (const uint16_t *) trellis->data, (const half *) tlut->data,
-                (const float *) scr_u, scr_v, m, n);
+            paw_rt_walk_qtip_rate_launch((const uint16_t *) trellis->data,
+                (const half *) tlut->data, (const float *) scr_u, scr_v,
+                m, n, rt_words, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::vector<float> hv(m), hr(m);
             CUDA_CHECK(cudaMemcpy(hv.data(), scr_v, m*sizeof(float), cudaMemcpyDeviceToHost));
@@ -2727,10 +2866,9 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         // rt_out call below (same as every other branch here) -- does NOT
         // return early.
         paw_timed(stream, std::string("rt_walk_qtip") + shp, [&]() {
-        paw_launch(paw_rt_walk_qtip_kernel,
-            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(32, 1, 1), 0, stream),
-            (const uint16_t *) trellis->data, (const half *) tlut->data,
-            (const float *) scr_u, scr_v, m, n);
+        paw_rt_walk_qtip_rate_launch((const uint16_t *) trellis->data,
+            (const half *) tlut->data, (const float *) scr_u, scr_v,
+            m, n, rt_words, stream);
         });
         }
     } else if (k4 && bank_cache) {
@@ -2810,6 +2948,27 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             }
             });
         }
+    } else if (!k4 && nt >= rt_blas_min_nt) {
+        // dense payload prefill: materialize an fp16 bank ONCE per pass
+        // (rate-templated decode) and run the same batched apply the K4
+        // cached-bank branch uses. The generic walk this replaces re-decodes
+        // every weight per token -- measured 7.4 t/s prompt at nt~1000.
+        static const bool rt_apply_mma_d = paw_env_int("GGML_PAW_RT_APPLY_MMA", 1) != 0;
+        ggml_cuda_pool_alloc<half> bank_alloc(ctx.pool());
+        half * apply_bank = bank_alloc.alloc((size_t) m*n);
+        paw_rt_dense_decode_rate_launch((const uint16_t *) trellis->data,
+            (const half *) tlut->data, apply_bank, m, n, rt_words, stream);
+        paw_timed(stream, std::string("rt_apply_dense") + shp, [&]() {
+        if (rt_apply_mma_d) {
+            paw_launch_rt_apply_mma(ctx, stream, apply_bank,
+                (const float *) scr_u, scr_v, m, n, nt);
+        } else {
+            paw_launch(paw_rt_apply_kernel<8>,
+                ggml_cuda_kernel_launch_params(
+                    dim3(m/16, 1, (nt + 7)/8), dim3(128, 1, 1), 0, stream),
+                apply_bank, (const float *) scr_u, scr_v, m, n, nt);
+        }
+        });
     } else {
     ggml_cuda_pool_alloc<half> bank_alloc(ctx.pool());
     // paw_rt_dense_decode_kernel bakes in the K=4 stream layout: 64 words per
