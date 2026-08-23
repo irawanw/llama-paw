@@ -4191,7 +4191,7 @@ static __global__ void paw_exp_walk_v8_warp_kernel(
 // enters the chain). exp_group/exp_u/exp_out are untouched.
 
 template <bool V8, bool P4>
-static __global__ void paw_exp_dense_decode_kernel(
+static __global__ void __launch_bounds__(256, 8) paw_exp_dense_decode_kernel(
         const uint16_t * GGML_CUDA_RESTRICT kept,
         const uint16_t * GGML_CUDA_RESTRICT dem,     // placeholder (= kept) when absent
         const void     * GGML_CUDA_RESTRICT tlut,    // float (V2) or half (V8)
@@ -4334,6 +4334,371 @@ static __global__ void paw_exp_dense_decode_kernel(
         }
     }
     paw_store_half16(dst, tmp);   // same bits, 2x16B instead of 16x2B
+}
+
+
+// warp-per-tile variant of paw_exp_dense_decode_kernel (V8 layout): the 16
+// rows of a tile all live in the same 24 stream words, so the warp stages
+// them in shared once instead of every lane re-reading them from global;
+// lanes 0..15 then decode one row each off shared. Removes the redundant
+// global traffic and the per-row serial load chain that starved the old
+// mapping (measured ~3.4 GB/s effective on RTX 3060).
+template <bool P4>
+static __global__ void paw_exp_dense_decode_kernel_v2(
+        const uint16_t * GGML_CUDA_RESTRICT kept,
+        const void     * GGML_CUDA_RESTRICT tlut,
+        const uint32_t * GGML_CUDA_RESTRICT p4,
+        const float    * GGML_CUDA_RESTRICT p4lv,
+        const int32_t  * GGML_CUDA_RESTRICT scr_i,
+        half           * GGML_CUDA_RESTRICT bank,
+        const int m, const int n, const int n_groups,
+        const int g0,
+        const half    * GGML_CUDA_RESTRICT wgamma) {
+    constexpr int WARPS = 8;
+    constexpr int WG    = 24;                    // words per tile
+    __shared__ float    lv[16];
+    __shared__ uint16_t wsh[WARPS][WG];
+
+    const int g    = g0 + (int) blockIdx.z;
+    const int tid  = threadIdx.x;
+    const int wid  = tid >> 5;
+    const int lane = tid & 31;
+
+    ggml_cuda_pdl_sync();
+    if (scr_i[g] == 0) {                         // block-uniform
+        return;
+    }
+    if constexpr (P4) {
+        if (tid < 16) {
+            lv[tid] = p4lv[tid];
+        }
+        __syncthreads();
+    }
+
+    const int tiles_y = n / 16;
+    const int ntiles  = (m / 16)*tiles_y;
+    const int tile    = blockIdx.x*WARPS + wid;
+    if (tile >= ntiles) {
+        return;
+    }
+
+    // stage this tile's stream words once per warp
+    if (lane < WG) {
+        wsh[wid][lane] = kept[((int64_t) g*ntiles + tile)*WG + lane];
+    }
+    __syncwarp();
+
+    half tmp16[16];
+
+    const int tr   = tile / tiles_y;
+    const int tc   = tile % tiles_y;
+    const int rr   = lane & 15;
+    half * dst = bank + ((int64_t)(g - g0)*m + tr*16 + rr)*n + tc*16;
+
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+        const int      i   = 2*rr + jj;
+        const int      bb  = 12*i;
+        const int      wi  = bb >> 4;
+        const int      o   = bb & 15;
+        const int      wn  = wi + 1 < WG ? wi + 1 : 0;
+        const uint32_t w2  = ((uint32_t) wsh[wid][wi] << 16) | (uint32_t) wsh[wid][wn];
+        const uint32_t reg = (w2 >> (16 - o)) & 0xFFFFu;
+        const uint32_t ph  = reg*(reg + 1u);
+        const uint32_t row = ph & 0x7FFFu;
+        if constexpr (P4) {
+            const uint32_t pk = p4[row];
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                float vv = lv[(pk >> (4*c)) & 0xFu];
+                if (c == 0 && (ph & 0x8000u)) {
+                    vv = -vv;
+                }
+                tmp16[jj*8 + c] = __float2half_rn(vv);
+            }
+        } else {
+            const half * tl = (const half *) tlut + 8*(int64_t) row;
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                float vv = __half2float(tl[c]);
+                if (c == 0 && (ph & 0x8000u)) {
+                    vv = -vv;
+                }
+                tmp16[jj*8 + c] = __float2half_rn(vv);
+            }
+        }
+    }
+    if (wgamma != nullptr) {
+        const int e_ori = scr_i[2*n_groups + g];
+        const int Mb    = m/16;
+        const int wv    = (tr + tc <= tiles_y - 1) ? Mb + tiles_y - 1 - (tr + tc)
+                                                   : Mb + tiles_y - 2 - (tr + tc);
+        const float gv = __half2float(wgamma[(int64_t) e_ori*(Mb + tiles_y) + wv]);
+#pragma unroll
+        for (int c = 0; c < 16; ++c) {
+            tmp16[c] = __float2half_rn(gv*__half2float(tmp16[c]));
+        }
+    }
+    paw_store_half16(dst, tmp16);
+}
+
+
+
+// Fully-fused expert apply: the WS apply skeleton, but the weight tiles are
+// decoded from the QTIP stream directly into shared memory right before the
+// wmma load -- no fp16 bank materialization at all. Kills the ~2 GB/pass
+// bank write+readback of the decode->GEMM pipeline and overlaps the LUT
+// gather latency with tensor-core work.
+template <bool P4, int BMT>
+static __global__ void __launch_bounds__(128, 4) paw_exp_apply_kernel_fused(
+        const uint16_t * GGML_CUDA_RESTRICT kept,
+        const void     * GGML_CUDA_RESTRICT tlut,
+        const uint32_t * GGML_CUDA_RESTRICT p4,
+        const float    * GGML_CUDA_RESTRICT p4lv,
+        const int32_t  * GGML_CUDA_RESTRICT scr_i,
+        const half     * GGML_CUDA_RESTRICT xg,      // [P, n] grouped fp16
+        float          * GGML_CUDA_RESTRICT scr_v,   // [P, m]
+        const half     * GGML_CUDA_RESTRICT gamma,   // V8 wave gamma
+        const int m, const int n, const int n_groups) {
+    using namespace nvcuda;
+
+    constexpr int n_warps = 4;
+    constexpr int bm_t    = BMT;
+    constexpr int tpb     = 2;
+    constexpr int bn      = n_warps*tpb*16;
+    constexpr int bk      = 16;
+
+    const int g    = blockIdx.y;
+    const int row0 = blockIdx.x*(bm_t*16);
+    const int tid  = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane   = tid & 31;
+    const int tiles_y = n/16;
+    const int ntiles  = (m/16)*tiles_y;
+
+    __shared__ half       Xsh[n_warps][tpb][16][bk];
+    __shared__ half       Wsh[n_warps][16][bk];
+    __shared__ float      out_sh[n_warps][16*16];
+    __shared__ int        pidx_sh[bn];
+    __shared__ uint16_t   wsh[n_warps][24];
+
+    ggml_cuda_pdl_sync();
+    const int cnt = scr_i[g];
+    if (cnt == 0) {
+        return;
+    }
+    const int off   = scr_i[n_groups + g];
+    const int e_ori = scr_i[2*n_groups + g];
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[bm_t][tpb];
+
+    for (int q0 = 0; q0 < cnt; q0 += bn) {
+#pragma unroll
+        for (int r = 0; r < bm_t; ++r) {
+#pragma unroll
+            for (int t = 0; t < tpb; ++t) {
+                wmma::fill_fragment(acc[r][t], 0.0f);
+            }
+        }
+        for (int i = tid; i < bn; i += 128) {
+            pidx_sh[i] = scr_i[4*n_groups + off + min(q0 + i, cnt - 1)];
+        }
+        __syncthreads();
+
+        for (int k0 = 0; k0 < n; k0 += bk) {
+            // stage this warp's activations for the k-slab
+#pragma unroll
+            for (int t = 0; t < tpb; ++t) {
+                const int tt0 = (warp_id*tpb + t)*16;
+                for (int idx = lane; idx < 16*bk; idx += 32) {
+                    const int tt = idx / bk;
+                    const int kk = idx % bk;
+                    float v = 0.0f;
+                    if (q0 + tt0 + tt < cnt) {
+                        const int64_t row = (int64_t)(off + q0 + tt0 + tt);
+                        v = __half2float(xg[row*n + k0 + kk]);
+                    }
+                    Xsh[warp_id][t][tt][kk] = __float2half(v);
+                }
+            }
+
+            // decode this warp's weight tile [16 x bk] from the stream
+            {
+                const int tr_r  = row0/16 + warp_id;   // one row-strip per warp
+                const int tc    = k0/16;
+                const int tile  = tr_r*tiles_y + tc;
+                const int tbase = ((int64_t) g*ntiles + tile)*24;
+                if (lane < 24) {
+                    wsh[warp_id][lane] = kept[tbase + lane];
+                }
+                __syncwarp();
+                const int rr  = lane & 15;
+                const int Mb  = m/16;
+                const int wv  = (tr_r + tc <= tiles_y - 1)
+                                    ? Mb + tiles_y - 1 - (tr_r + tc)
+                                    : Mb + tiles_y - 2 - (tr_r + tc);
+                const float gv = __half2float(
+                    gamma[(int64_t) e_ori*(Mb + tiles_y) + wv]);
+                if (lane < 16) {
+#pragma unroll
+                    for (int jj = 0; jj < 2; ++jj) {
+                        const int      i   = 2*rr + jj;
+                        const int      bb  = 12*i;
+                        const int      wi  = bb >> 4;
+                        const int      o   = bb & 15;
+                        const int      wn  = wi + 1 < 24 ? wi + 1 : 0;
+                        const uint32_t w2  = ((uint32_t) wsh[warp_id][wi] << 16)
+                                           | (uint32_t) wsh[warp_id][wn];
+                        const uint32_t reg = (w2 >> (16 - o)) & 0xFFFFu;
+                        const uint32_t ph  = reg*(reg + 1u);
+                        const uint32_t lrow = ph & 0x7FFFu;
+                        if constexpr (P4) {
+                            const uint32_t pk = p4[lrow];
+#pragma unroll
+                            for (int c = 0; c < 8; ++c) {
+                                float vv = p4lv[(pk >> (4*c)) & 0xFu];
+                                if (c == 0 && (ph & 0x8000u)) {
+                                    vv = -vv;
+                                }
+                                // round to weight precision first, exactly
+                                // like the bank-decoding path, then scale
+                                Wsh[warp_id][rr][8*jj + c] =
+                                    __float2half_rn(gv*__half2float(__float2half_rn(vv)));
+                            }
+                        } else {
+                            const half * tl = (const half *) tlut + 8*(int64_t) lrow;
+#pragma unroll
+                            for (int c = 0; c < 8; ++c) {
+                                float vv = __half2float(tl[c]);
+                                if (c == 0 && (ph & 0x8000u)) {
+                                    vv = -vv;
+                                }
+                                // round to weight precision first, exactly
+                                // like the bank-decoding path, then scale
+                                Wsh[warp_id][rr][8*jj + c] =
+                                    __float2half_rn(gv*__half2float(__float2half_rn(vv)));
+                            }
+                        }
+                    }
+                }
+                __syncwarp();
+                wmma::load_matrix_sync(a_frag, &Wsh[warp_id][0][0], bk);
+            }
+
+#pragma unroll
+            for (int t = 0; t < tpb; ++t) {
+                wmma::load_matrix_sync(b_frag, &Xsh[warp_id][t][0][0], bk);
+                wmma::mma_sync(acc[0][t], a_frag, b_frag, acc[0][t]);
+            }
+            __syncwarp();
+        }
+
+        // store this warp's single row-strip
+#pragma unroll
+        for (int t = 0; t < tpb; ++t) {
+            wmma::store_matrix_sync(&out_sh[warp_id][0], acc[0][t], 16,
+                                    wmma::mem_row_major);
+            __syncwarp();
+            const int tt0 = (warp_id*tpb + t)*16;
+            for (int idx = lane; idx < 16*16; idx += 32) {
+                const int row = idx / 16;
+                const int tt  = idx % 16;
+                if (q0 + tt0 + tt < cnt) {
+                    scr_v[(int64_t) pidx_sh[tt0 + tt]*m + row0 + warp_id*16 + row] =
+                        out_sh[warp_id][idx];
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+// ---- decode-kernel microbench (dev harness, not used by inference) -------
+// Launches the v1 and v2 dense-decode kernels on synthetic data at real
+// shapes, checks bit-exact agreement of the banks, and prints timings.
+
+
+extern "C" void paw_decode_bench(int m, int n, int n_groups, int iters) {
+    const size_t words = (size_t) n_groups*(m/16)*(n/16)*24;
+    const size_t tlut_n = 32768*8;
+    uint16_t * kept;  CUDA_CHECK(cudaMalloc(&kept,  words*2));
+    half     * tlut;  CUDA_CHECK(cudaMalloc(&tlut,  tlut_n*2));
+    uint32_t * p4t;   CUDA_CHECK(cudaMalloc(&p4t,   32768*4));
+    float    * p4l;   CUDA_CHECK(cudaMalloc(&p4l,   16*4));
+    int32_t  * scr;   CUDA_CHECK(cudaMalloc(&scr,   (size_t) 3*n_groups*4));
+    half     * b1;    CUDA_CHECK(cudaMalloc(&b1,   (size_t) n_groups*m*n*2));
+    half     * b2;    CUDA_CHECK(cudaMalloc(&b2,   (size_t) n_groups*m*n*2));
+    half     * gam;   CUDA_CHECK(cudaMalloc(&gam,   (size_t) 256*(m/16 + n/16)*2));
+
+    // deterministic pseudo-random fill
+    std::vector<uint16_t> hk(words);
+    unsigned rng = 12345;
+    for (auto & w : hk) { rng = rng*1103515245u + 12345u; w = (uint16_t)(rng >> 9); }
+    CUDA_CHECK(cudaMemcpy(kept, hk.data(), words*2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(tlut, 0, tlut_n*2));
+    CUDA_CHECK(cudaMemset(p4t, 0, 32768*4));
+    std::vector<float> hl(16, 0.5f);
+    CUDA_CHECK(cudaMemcpy(p4l, hl.data(), 64, cudaMemcpyHostToDevice));
+    std::vector<int32_t> hs(3*(size_t) n_groups, 8);   // all groups active
+    CUDA_CHECK(cudaMemcpy(scr, hs.data(), hs.size()*4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(gam, 0, (size_t) 256*(m/16 + n/16)*2));
+
+    cudaStream_t st; CUDA_CHECK(cudaStreamCreate(&st));
+    cudaEvent_t e0, e1; CUDA_CHECK(cudaEventCreate(&e0)); CUDA_CHECK(cudaEventCreate(&e1));
+    half * gnullptr_h = nullptr;
+
+    auto launch_v1 = [&](half * bank) {
+        if (m % 16 == 0 && n % 16 == 0) {
+            paw_launch(paw_exp_dense_decode_kernel<true, true>,
+                ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, n_groups), dim3(256,1,1), 0, st),
+                kept, kept, (const void *) tlut, p4t,
+                p4l, scr, bank, m, n, n_groups, n_groups, 0,
+                (const half *) gam);
+        }
+    };
+    auto launch_v2 = [&](half * bank) {
+        paw_launch(paw_exp_dense_decode_kernel_v2<true>,
+            ggml_cuda_kernel_launch_params(dim3(((m/16)*(n/16) + 7)/8, 1, n_groups), dim3(256,1,1), 0, st),
+            kept, (const void *) tlut, p4t,
+            p4l, scr, bank, m, n, n_groups, 0,
+            (const half *) gam);
+    };
+
+    // correctness: one pass each, compare banks
+    CUDA_CHECK(cudaMemset(b1, 0xaa, (size_t) n_groups*m*n*2));
+    CUDA_CHECK(cudaMemset(b2, 0xbb, (size_t) n_groups*m*n*2));
+    launch_v1(b1); launch_v2(b2);
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    std::vector<half> h1((size_t) n_groups*m*n), h2((size_t) n_groups*m*n);
+    CUDA_CHECK(cudaMemcpy(h1.data(), b1, h1.size()*2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h2.data(), b2, h2.size()*2, cudaMemcpyDeviceToHost));
+    size_t diff = 0;
+    for (size_t i = 0; i < h1.size(); ++i) {
+        if (((uint16_t*)h1.data())[i] != ((uint16_t*)h2.data())[i]) ++diff;
+    }
+
+    // timing
+    float ms1 = -1.f, ms2 = -1.f;
+    CUDA_CHECK(cudaEventRecord(e0, st));
+    for (int i = 0; i < iters; ++i) { launch_v1(b1); }
+    CUDA_CHECK(cudaEventRecord(e1, st));
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    CUDA_CHECK(cudaEventElapsedTime(&ms1, e0, e1));
+    CUDA_CHECK(cudaEventRecord(e0, st));
+    for (int i = 0; i < iters; ++i) { launch_v2(b2); }
+    CUDA_CHECK(cudaEventRecord(e1, st));
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    CUDA_CHECK(cudaEventElapsedTime(&ms2, e0, e1));
+    (void) gnullptr_h;
+    printf("decode-bench m=%d n=%d groups=%d | v1 %.3f ms | v2 %.3f ms | speedup %.2fx | bitdiff %zu / %zu\n",
+           m, n, n_groups, ms1/iters, ms2/iters, ms1/ms2, diff, h1.size());
+    fflush(stdout);
+
+    cudaStreamDestroy(st);
+    cudaFree(kept); cudaFree(tlut); cudaFree(p4t); cudaFree(p4l);
+    cudaFree(scr); cudaFree(b1); cudaFree(b2); cudaFree(gam);
 }
 
 // grid (m/16, n_groups): each block owns 16 output rows of one group's bank
@@ -4679,6 +5044,85 @@ static __global__ void paw_exp_apply_kernel_ws(
             }
         }
     }
+}
+
+extern "C" int paw_fused_bench(int m, int n, int n_groups, int P) {
+    const size_t words = (size_t) n_groups*(m/16)*(n/16)*24;
+    uint16_t * kept;  CUDA_CHECK(cudaMalloc(&kept, words*2));
+    half     * tlut;  CUDA_CHECK(cudaMalloc(&tlut, (size_t)32768*8*2));
+    uint32_t * p4t;   CUDA_CHECK(cudaMalloc(&p4t,  32768*4));
+    float    * p4l;   CUDA_CHECK(cudaMalloc(&p4l,  16*4));
+    int32_t  * scr;   CUDA_CHECK(cudaMalloc(&scr,  (size_t)(5*n_groups + P)*4));
+    half     * xg;    CUDA_CHECK(cudaMalloc(&xg,   (size_t) P*n*2));
+    float    * v;     CUDA_CHECK(cudaMalloc(&v,    (size_t) P*m*4));
+    half     * gam;   CUDA_CHECK(cudaMalloc(&gam,  (size_t) 256*(m/16 + n/16)*2));
+
+    std::vector<uint16_t> hk(words, 0x1555u);
+    CUDA_CHECK(cudaMemcpy(kept, hk.data(), words*2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(tlut, 0, (size_t)32768*16));
+    CUDA_CHECK(cudaMemset(p4t, 0, 32768*4));
+    std::vector<float> hl(16, 0.5f);
+    CUDA_CHECK(cudaMemcpy(p4l, hl.data(), 64, cudaMemcpyHostToDevice));
+    // group g active with cnt=8, offsets staggered
+    const int CNT = getenv("FUSED_CNT") ? atoi(getenv("FUSED_CNT")) : 8;
+    std::vector<int32_t> hs(5*(size_t)n_groups + (size_t)(CNT>0?0:P), 0);
+    // pair-list region sized by total routed pairs
+    hs.resize(5*(size_t)n_groups + (size_t) n_groups*CNT);
+    int32_t * pairs = hs.data() + 4*n_groups;
+    for (int g = 0; g < n_groups; ++g) {
+        hs[g] = CNT;
+        hs[n_groups + g] = CNT*g;            // off
+        hs[2*n_groups + g] = g % 256;        // e_ori
+        for (int q = 0; q < CNT; ++q) {
+            pairs[CNT*g + q] = (CNT*g + q) % P;         // pair list
+        }
+    }
+    CUDA_CHECK(cudaMemcpy(scr, hs.data(), hs.size()*4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(xg, 0, (size_t)P*n*2));
+    CUDA_CHECK(cudaMemset(v, 0, (size_t)P*m*4));
+    std::vector<half> hg((size_t)256*(m/16 + n/16), __float2half(1.0f));
+    CUDA_CHECK(cudaMemcpy(gam, hg.data(), hg.size()*2, cudaMemcpyHostToDevice));
+
+    cudaStream_t st; CUDA_CHECK(cudaStreamCreate(&st));
+    paw_launch(paw_exp_apply_kernel_fused<true, 4>,
+        ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128,1,1), 0, st),
+        kept, (const void *) tlut, p4t, p4l,
+        (const int32_t *) scr, xg, v, (const half *) gam, m, n, n_groups);
+    cudaError_t le = cudaGetLastError();
+
+    // reference: decode into a bank, then WS apply over it
+    half * bank; CUDA_CHECK(cudaMalloc(&bank, (size_t) n_groups*m*n*2));
+    float * vref; CUDA_CHECK(cudaMalloc(&vref, (size_t) P*m*4));
+    CUDA_CHECK(cudaMemset(vref, 0, (size_t) P*m*4));
+    paw_launch(paw_exp_dense_decode_kernel<true, true>,
+        ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, n_groups), dim3(256,1,1), 0, st),
+        kept, kept, (const void *) tlut, p4t, p4l,
+        (const int32_t *) scr, bank, m, n, n_groups, n_groups, 0,
+        (const half *) gam);
+    paw_launch(paw_exp_apply_kernel_ws<true, 4, true>,
+        ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128,1,1), 0, st),
+        (const half *) bank, (const int32_t *) scr, nullptr, xg, vref,
+        (const half *) gam, m, n, n_groups);
+
+    cudaError_t se = cudaStreamSynchronize(st);
+    printf("fused-bench m=%d n=%d groups=%d P=%d | launch=%s sync=%s\n",
+           m, n, n_groups, P, cudaGetErrorString(le), cudaGetErrorString(se));
+    std::vector<float> hv((size_t)P*m), hr((size_t)P*m);
+    CUDA_CHECK(cudaMemcpy(hv.data(), v, hv.size()*4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hr.data(), vref, hr.size()*4, cudaMemcpyDeviceToHost));
+    size_t diff = 0; double maxd = 0;
+    for (size_t i = 0; i < hv.size(); ++i) {
+        double d = fabs((double)hv[i] - (double)hr[i]);
+        if (d > 0) ++diff;
+        if (d > maxd) maxd = d;
+    }
+    printf("out diff %zu / %zu max=%.6f\n", diff, hv.size(), maxd);
+    fflush(stdout);
+    cudaFree(bank); cudaFree(vref);
+    cudaStreamDestroy(st);
+    cudaFree(kept); cudaFree(tlut); cudaFree(p4t); cudaFree(p4l);
+    cudaFree(scr); cudaFree(xg); cudaFree(v); cudaFree(gam);
+    return (int)(le != cudaSuccess || se != cudaSuccess);
 }
 
 // --- per-routing-slot expert bank cache (nt==1 only), GGML_PAW_EXP_CACHE=1 ---
@@ -5564,8 +6008,14 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         // below this, micro-batches skip the cuBLAS pipeline (host sync
         // per pass dominates); measured neutral-to-better at 29k ctx
         static const int exp_blas_min_nt = paw_env_int("GGML_PAW_EXP_BLAS_MIN_NT", 128);
+        // fully-fused trellis->wmma apply: no bank materialization, no host
+        // sync; supersedes the chunked cuBLAS pipeline where it applies
+        static const bool exp_fused = paw_env_int("GGML_PAW_EXP_FUSED", 1) != 0;
+        const bool use_fused = v8 && exp_fused && exp_ws && exp_gp &&
+                               m % 16 == 0 && n_tok >= exp_blas_min_nt;
         const bool use_blas = v8 && exp_blas && exp_ws && exp_gp &&
-                              m % 16 == 0 && n_tok >= exp_blas_min_nt && !capturing;
+                              m % 16 == 0 && n_tok >= exp_blas_min_nt &&
+                              !use_fused && !capturing;
         // overlap decode of slab i+1 with GEMMs of slab i on a second stream
         // off by default: measured no gain (decode and GEMM contend for the same
 // bandwidth on this part); kept for parts where that does not hold
@@ -5575,7 +6025,8 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         const int bank_bufs = do_ovl ? 2 : 1;
         const int bank_g = use_blas ? (exp_chunk < n_groups ? exp_chunk : n_groups)
                                     : n_groups;
-        half * bank = bank_alloc.alloc((size_t) bank_g*bank_bufs*m*n);
+        half * bank = use_fused ? nullptr
+                                : bank_alloc.alloc((size_t) bank_g*bank_bufs*m*n);
         ggml_cuda_pool_alloc<half> xg_alloc(ctx.pool());
         half * xg = nullptr;
         if (v8 && exp_ws && exp_gp) {
@@ -5587,22 +6038,46 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                 (const int32_t *) scr_i, (const float *) scr_u, xg, n, n_groups);
             });
         }
-        if (!use_blas) {
+        if (use_fused) {
+            const ggml_cuda_kernel_launch_params fparams =
+                ggml_cuda_kernel_launch_params(
+                    dim3(m/64, n_groups, 1), dim3(128, 1, 1), 0, stream);
+            paw_timed(stream, std::string("exp_fused") + shp, [&]() {
+                if (p4) {
+                    paw_launch(paw_exp_apply_kernel_fused<true, 4>, fparams,
+                        kept_d, (const void *) tlut->data, p4t.packed, p4t.levels,
+                        (const int32_t *) scr_i, xg, scr_v,
+                        (const half *) gamma->data, m, n, n_groups);
+                } else {
+                    paw_launch(paw_exp_apply_kernel_fused<false, 4>, fparams,
+                        kept_d, (const void *) tlut->data,
+                        (const uint32_t *) nullptr, (const float *) nullptr,
+                        (const int32_t *) scr_i, xg, scr_v,
+                        (const half *) gamma->data, m, n, n_groups);
+                }
+            });
+        } else if (!use_blas) {
+        static const bool dec_v2 = paw_env_int("GGML_PAW_EXP_DECODE_V2", 1) != 0;
         const ggml_cuda_kernel_launch_params dec_params =
             ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, n_groups),
                                            dim3(256, 1, 1), 0, stream);
         paw_timed(stream, std::string("exp_dense_decode") + shp, [&]() {
         if (v8) {
-            if (p4) {
-                paw_launch(paw_exp_dense_decode_kernel<true, true>, dec_params,
-                    kept_d, dem_d, (const void *) tlut->data, p4t.packed, p4t.levels,
-                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups, 0,
+            // warp-per-tile decode: same bits out, fewer passes over the
+            // stream words
+            const ggml_cuda_kernel_launch_params v2_params =
+                ggml_cuda_kernel_launch_params(
+                    dim3(((m/16)*(n/16) + 7)/8, 1, n_groups), dim3(256, 1, 1), 0, stream);
+            if (p4 && dec_v2) {
+                paw_launch(paw_exp_dense_decode_kernel_v2<true>, v2_params,
+                    kept_d, (const void *) tlut->data, p4t.packed, p4t.levels,
+                    (const int32_t *) scr_i, bank, m, n, n_groups, 0,
                     nullptr);
-            } else {
-                paw_launch(paw_exp_dense_decode_kernel<true, false>, dec_params,
-                    kept_d, dem_d, (const void *) tlut->data,
+            } else if (dec_v2) {
+                paw_launch(paw_exp_dense_decode_kernel_v2<false>, v2_params,
+                    kept_d, (const void *) tlut->data,
                     (const uint32_t *) nullptr, (const float *) nullptr,
-                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups, 0,
+                    (const int32_t *) scr_i, bank, m, n, n_groups, 0,
                     nullptr);
             }
         } else {
@@ -5659,16 +6134,20 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                         // gate: previous slab's GEMMs released this buffer
                         CUDA_CHECK(cudaStreamWaitEvent(ds, ev[2*si]));
                     }
-                    if (p4) {
-                        paw_launch(paw_exp_dense_decode_kernel<true, true>, dp,
-                            kept_d, dem_d, (const void *) tlut->data, p4t.packed, p4t.levels,
-                            (const int32_t *) scr_i, buf, m, n, n_kept, n_groups, g0,
+                    static const bool dec_v2 = paw_env_int("GGML_PAW_EXP_DECODE_V2", 1) != 0;
+                    const ggml_cuda_kernel_launch_params v2p =
+                        ggml_cuda_kernel_launch_params(
+                            dim3(((m/16)*(n/16) + 7)/8, 1, gc), dim3(256, 1, 1), 0, ds);
+                    if (p4 && dec_v2) {
+                        paw_launch(paw_exp_dense_decode_kernel_v2<true>, v2p,
+                            kept_d, (const void *) tlut->data, p4t.packed, p4t.levels,
+                            (const int32_t *) scr_i, buf, m, n, n_groups, g0,
                             (const half *) gamma->data);
-                    } else {
-                        paw_launch(paw_exp_dense_decode_kernel<true, false>, dp,
-                            kept_d, dem_d, (const void *) tlut->data,
+                    } else if (dec_v2) {
+                        paw_launch(paw_exp_dense_decode_kernel_v2<false>, v2p,
+                            kept_d, (const void *) tlut->data,
                             (const uint32_t *) nullptr, (const float *) nullptr,
-                            (const int32_t *) scr_i, buf, m, n, n_kept, n_groups, g0,
+                            (const int32_t *) scr_i, buf, m, n, n_groups, g0,
                             (const half *) gamma->data);
                     }
                     if (do_ovl) {
@@ -5712,7 +6191,9 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                     dim3((m + 255)/256, n_groups, 1), dim3(256, 1, 1), 0, stream),
                 (const int32_t *) scr_i, ygf, scr_v, m, n_groups);
             });
-        } else {
+        } else if (!use_fused) {
+        // fused handled everything above; this branch applies over a
+        // materialized bank and must not run when no bank exists
         paw_timed(stream, std::string("exp_apply") + shp, [&]() {
         static const int ws_min_m = paw_env_int("GGML_PAW_EXP_WS_MIN_M", 512);
         if (v8 && exp_ws && xg && m % 64 == 0 && m >= ws_min_m) {
