@@ -5561,7 +5561,9 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                                cst == cudaStreamCaptureStatusActive;
         // single-token passes go through the fused WS kernel instead: no
         // staging round-trip and no host sync (measured +3 t/s generation)
-        static const int exp_blas_min_nt = paw_env_int("GGML_PAW_EXP_BLAS_MIN_NT", 2);
+        // below this, micro-batches skip the cuBLAS pipeline (host sync
+        // per pass dominates); measured neutral-to-better at 29k ctx
+        static const int exp_blas_min_nt = paw_env_int("GGML_PAW_EXP_BLAS_MIN_NT", 128);
         const bool use_blas = v8 && exp_blas && exp_ws && exp_gp &&
                               m % 16 == 0 && n_tok >= exp_blas_min_nt && !capturing;
         // overlap decode of slab i+1 with GEMMs of slab i on a second stream
