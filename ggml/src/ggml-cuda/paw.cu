@@ -1850,6 +1850,59 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
             }
             hb0 = nb0; hb1 = nb1;
         }
+    } else if constexpr (WORDS == 32) {
+        // w32: state (ri, j) starts at bit 32*ri + 4*j -> unit
+        // 2*ri + j/4, offset 4*(j&3). The j=t+4 state lives one unit
+        // later at the SAME offset, so each row-group needs units
+        // {u, u+1, u+2}: one fetch_pair plus a single extra unit.
+        uint32_t L0, H0, X0, L8, H8, X8, nL0, nH0, nX0, nL8, nH8, nX8;
+        uint32_t ov[2]; int uv[2];
+        L0=H0=X0=L8=H8=X8=nL0=nH0=nX0=nL8=nH8=nX8=0;
+        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8);
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int b = 4*(8*rrows[k] + tid4);
+            uv[k] = (b >> 4) % WORDS;
+            ov[k] = b & 15u;
+        }
+        if (has) {
+            const int64_t tw = (int64_t) tr*tiles_y*WORDS + ct_first*WORDS;
+            fetch_pair(tw, uv[0], L0, H0);
+            fetch_pair(tw, uv[1], L8, H8);
+            X0 = __ldg(trellis + tw + ((uv[0] + 2) % WORDS));
+            X8 = __ldg(trellis + tw + ((uv[1] + 2) % WORDS));
+        }
+        for (int ct = ct_first; ct < tiles_y; ct += 8*gridDim.y) {
+            const int ctn = ct + 8*gridDim.y;
+            if (ctn < tiles_y) {
+                const int64_t twn = (int64_t) tr*tiles_y*WORDS + ctn*WORDS;
+                fetch_pair(twn, uv[0], nL0, nH0);
+                fetch_pair(twn, uv[1], nL8, nH8);
+                nX0 = __ldg(trellis + twn + ((uv[0] + 2) % WORDS));
+                nX8 = __ldg(trellis + twn + ((uv[1] + 2) % WORDS));
+            }
+            half2 nb0 = hb0, nb1 = hb1;
+            if (ctn < tiles_y) load_b(ctn, nb0, nb1);
+            const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+            uint32_t ra[4];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const uint32_t lo = k ? L8 : L0, hi = k ? H8 : H0;
+                const uint32_t xx = k ? X8 : X0;
+                // j=t state from units (lo,hi); j=t+4 from (hi,x) -- same offset
+                ra[k + 2*0] = dec_state(lo, hi, ov[k]);
+                ra[k + 2*1] = dec_state(hi, xx, ov[k]);
+            }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+            if (ctn < tiles_y) {
+                L0=nL0; H0=nH0; X0=nX0; L8=nL8; H8=nH8; X8=nX8;
+            }
+            hb0 = nb0; hb1 = nb1;
+        }
     } else {
         uint32_t c0[2][2], c1[2][2];
         if (wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8))
@@ -3226,14 +3279,17 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         static const bool walk_frag = paw_env_int("GGML_PAW_WALK_FRAG", 1) != 0;
         static const bool frag_dbg_on = paw_env_int("GGML_PAW_WALK_FRAG_DEBUG", 0) != 0;
         static int frag_dbg_calls = 0;
-        if (!walk_noop && walk_frag && frag_dbg_on && frag_dbg_calls < 4 &&
-            (rt_words == 16 || rt_words == 24)) {
+        if (!walk_noop && walk_frag && frag_dbg_on &&
+            frag_dbg_calls < paw_env_int("GGML_PAW_WALK_FRAG_DEBUG_MAX", 4) &&
+            (rt_words == 16 || rt_words == 24 || rt_words == 32)) {
             // correctness probe: frag variant vs the generic reference walk
             ggml_cuda_pool_alloc<float> ref_v_alloc(ctx.pool(), (size_t) m);
             float * ref_v = ref_v_alloc.get();
             CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) m*sizeof(float), stream));
             switch (rt_words) {
                 case 24: paw_rt_walk_qtip_frag_dispatch<24>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                case 32: paw_rt_walk_qtip_frag_dispatch<32>((const uint16_t *) trellis->data,
                     (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
                 default: paw_rt_walk_qtip_frag_dispatch<16>((const uint16_t *) trellis->data,
                     (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
@@ -3244,6 +3300,9 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                         ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(WG, 1, 1), 0, stream),\
                         (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n); break;\
                     case 24: paw_launch((paw_rt_walk_kernel<WG, 24>),\
+                        ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(WG, 1, 1), 0, stream),\
+                        (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n); break;\
+                    case 32: paw_launch((paw_rt_walk_kernel<WG, 32>),\
                         ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(WG, 1, 1), 0, stream),\
                         (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n); break;\
                     default: GGML_ABORT("frag-dbg: rate");\
