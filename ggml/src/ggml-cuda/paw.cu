@@ -1719,6 +1719,30 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
     if (wid < tiles_y) load_b(wid, hb0, hb1);
     const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
 
+    // WORDS==16 packed path: a lane's four states live in just two unit
+    // pairs ((ri,ri+1) for ri = g and g+8), so each pair is fetched once
+    // per column -- one aligned u32 load when the pair does not wrap --
+    // instead of eight separate u16 gathers.
+    auto fetch_pair = [&](int64_t tw, int u, uint32_t& lo_u, uint32_t& hi_u) {
+        const int v = (u + 1) % WORDS;
+        if ((u & 1) == 0 && v == u + 1) {
+            const uint32_t W = *(const uint32_t*)(const void*)(trellis + tw + u);
+            lo_u = W & 0xFFFFu;
+            hi_u = W >> 16;
+        } else {
+            lo_u = __ldg(trellis + tw + u);
+            hi_u = __ldg(trellis + tw + v);
+        }
+    };
+    auto dec_state = [&](uint32_t lo, uint32_t hi, int off) {
+        const uint32_t st = off == 0 ? lo
+            : (((lo << off) | (hi >> (16 - off))) & 0xFFFFu);
+        const uint32_t ph  = st*(st + 1u);
+        const uint32_t row = (ph >> 6) & 511u;
+        const uint32_t pair = *(const uint32_t*)(const void*)(tlut + 2*row);
+        return (ph & 0x8000u) ? (pair ^ 0x00008000u) : pair;
+    };
+
     auto load_at = [&](int64_t tw, uint32_t (&a)[2][2], uint32_t (&b)[2][2]) {
 #pragma unroll
         for (int k = 0; k < 2; ++k)
@@ -1732,47 +1756,82 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
     // strided subset of its columns (small-m matrices otherwise leave the
     // machine idle); partials fold through the atomicAdd epilogue
     float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
-    uint32_t c0[2][2], c1[2][2];
     const int ct_first = wid + 8*(int) blockIdx.y;
-    if (wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8))
-        load_at((int64_t) tr*tiles_y*WORDS + ct_first*WORDS, c0, c1);
 
-    for (int ct = ct_first; ct < tiles_y; ct += 8*gridDim.y) {
-        const int ctn = ct + 8*gridDim.y;
-        uint32_t n0[2][2], n1[2][2];
-        if (ctn < tiles_y) load_at((int64_t) tr*tiles_y*WORDS + ctn*WORDS, n0, n1);
-        half2 nb0 = hb0, nb1 = hb1;
-        if (ctn < tiles_y) load_b(ctn, nb0, nb1);
-        const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
-        uint32_t ra[4];
-#pragma unroll
-        for (int k = 0; k < 2; ++k)
-#pragma unroll
-            for (int q = 0; q < 2; ++q) {
-                const int off = offv[k][q];
-                const uint32_t w0 = c0[k][q];
-                const uint32_t st = off == 0 ? w0
-                    : (((w0 << off) | (c1[k][q] >> (16 - off))) & 0xFFFFu);
-                const uint32_t ph  = st*(st + 1u);
-                const uint32_t row = (ph >> 6) & 511u;
-                    // packed u32 tlut access: lo half = a0 (sign-flippable by
-                    // xor on the fp16 sign bit), hi half = a1
-                const uint32_t pair = *(const uint32_t*)(const void*)(tlut + 2*row);
-                const uint32_t a0h  = (ph & 0x8000u) ? (pair ^ 0x00008000u) : pair;
-                half2 h = __halves2half2(__ushort_as_half((unsigned short) a0h),
-                                         __ushort_as_half((unsigned short)(pair >> 16)));
-                ra[k + 2*q] = *(uint32_t*)&h;   // (row-group, j-pair): q is the outer axis
+    if constexpr (WORDS == 16) {
+        uint32_t L0, H0, L8, H8, nL0, nH0, nL8, nH8;
+        L0 = H0 = L8 = H8 = nL0 = nH0 = nL8 = nH8 = 0;
+        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8);
+        if (has) {
+            const int64_t tw = (int64_t) tr*tiles_y*WORDS + ct_first*WORDS;
+            fetch_pair(tw, groupID, L0, H0);
+            fetch_pair(tw, (groupID + 8) % WORDS, L8, H8);
+        }
+        for (int ct = ct_first; ct < tiles_y; ct += 8*gridDim.y) {
+            const int ctn = ct + 8*gridDim.y;
+            if (ctn < tiles_y) {
+                const int64_t twn = (int64_t) tr*tiles_y*WORDS + ctn*WORDS;
+                fetch_pair(twn, groupID, nL0, nH0);
+                fetch_pair(twn, (groupID + 8) % WORDS, nL8, nH8);
             }
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
-            : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-            : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+            half2 nb0 = hb0, nb1 = hb1;
+            if (ctn < tiles_y) load_b(ctn, nb0, nb1);
+            const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+            // ra order: [k + 2*q]; k=row-group (g,g+8), q=j-pair (t,t+4)
+            const uint32_t ra0 = dec_state(L0, H0, offv[0][0]);
+            const uint32_t ra1 = dec_state(L8, H8, offv[1][0]);
+            const uint32_t ra2 = dec_state(L0, H0, offv[0][1]);
+            const uint32_t ra3 = dec_state(L8, H8, offv[1][1]);
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(ra0), "r"(ra1), "r"(ra2), "r"(ra3), "r"(rb0), "r"(rb1));
+            if (ctn < tiles_y) { L0=nL0; H0=nH0; L8=nL8; H8=nH8; }
+            hb0 = nb0; hb1 = nb1;
+        }
+    } else {
+        uint32_t c0[2][2], c1[2][2];
+        if (wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8))
+            load_at((int64_t) tr*tiles_y*WORDS + ct_first*WORDS, c0, c1);
+
+        for (int ct = ct_first; ct < tiles_y; ct += 8*gridDim.y) {
+            const int ctn = ct + 8*gridDim.y;
+            uint32_t n0[2][2], n1[2][2];
+            if (ctn < tiles_y) load_at((int64_t) tr*tiles_y*WORDS + ctn*WORDS, n0, n1);
+            half2 nb0 = hb0, nb1 = hb1;
+            if (ctn < tiles_y) load_b(ctn, nb0, nb1);
+            const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+            uint32_t ra[4];
 #pragma unroll
-        for (int k = 0; k < 2; ++k)
+            for (int k = 0; k < 2; ++k)
 #pragma unroll
-            for (int q = 0; q < 2; ++q) { c0[k][q] = n0[k][q]; c1[k][q] = n1[k][q]; }
-        hb0 = nb0; hb1 = nb1;
+                for (int q = 0; q < 2; ++q) {
+                    const int off = offv[k][q];
+                    const uint32_t w0 = c0[k][q];
+                    const uint32_t st = off == 0 ? w0
+                        : (((w0 << off) | (c1[k][q] >> (16 - off))) & 0xFFFFu);
+                    const uint32_t ph  = st*(st + 1u);
+                    const uint32_t row = (ph >> 6) & 511u;
+                        // packed u32 tlut access: lo half = a0 (sign-flippable by
+                        // xor on the fp16 sign bit), hi half = a1
+                    const uint32_t pair = *(const uint32_t*)(const void*)(tlut + 2*row);
+                    const uint32_t a0h  = (ph & 0x8000u) ? (pair ^ 0x00008000u) : pair;
+                    half2 h = __halves2half2(__ushort_as_half((unsigned short) a0h),
+                                             __ushort_as_half((unsigned short)(pair >> 16)));
+                    ra[k + 2*q] = *(uint32_t*)&h;   // (row-group, j-pair): q is the outer axis
+                }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+#pragma unroll
+            for (int k = 0; k < 2; ++k)
+#pragma unroll
+                for (int q = 0; q < 2; ++q) { c0[k][q] = n0[k][q]; c1[k][q] = n1[k][q]; }
+            hb0 = nb0; hb1 = nb1;
+        }
     }
     if (tid4 == 0) {
         atomicAdd(&scr_v[(size_t) tr*16 + groupID],      d0);
