@@ -3833,6 +3833,51 @@ static __device__ __forceinline__ void paw_exp_walk_v2_steps(
 //             table and resolve levels from shared — bit-identical values.
 // --- grid compaction for exp_walk at nt==1, GGML_PAW_EXP_WALK_COMPACT=1 ---
 //
+// consolidated P4 tables in a single allocation so an L2 persisting window
+// can pin them: the fused kernel's gathers were going to DRAM whenever the
+// live attention/KV traffic evicted the tables between launches
+struct paw_l2_tables {
+    uint32_t * packed = nullptr;
+    float    * levels = nullptr;
+    void     * base   = nullptr;
+};
+static paw_l2_tables g_paw_l2tab;
+
+static const paw_l2_tables & paw_l2_tables_get(cudaStream_t stream,
+        const paw_p4_table & t) {
+    if (!g_paw_l2tab.base && t.packed) {
+        constexpr size_t packed_b = (size_t) 32768*4;
+        constexpr size_t levels_b = 16*4;
+        void * base = nullptr;
+        if (cudaMalloc(&base, packed_b + levels_b) == cudaSuccess) {
+            CUDA_CHECK(cudaMemcpyAsync(base, t.packed, packed_b,
+                cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync((char *) base + packed_b, t.levels,
+                levels_b, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            cudaStreamAttrValue attr = {};
+            attr.accessPolicyWindow.base_ptr = base;
+            attr.accessPolicyWindow.num_bytes = packed_b + levels_b;
+            attr.accessPolicyWindow.hitRatio = 1.0f;
+            attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+            attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+            cudaStreamSetAttribute(stream,
+                cudaStreamAttributeAccessPolicyWindow, &attr);
+            size_t carve = 0;
+            cudaDeviceGetLimit(&carve, cudaLimitPersistingL2CacheSize);
+            if (carve < packed_b + levels_b) {
+                cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                    packed_b + levels_b);
+            }
+            g_paw_l2tab.packed = (uint32_t *) base;
+            g_paw_l2tab.levels = (float *)((char *) base + packed_b);
+            g_paw_l2tab.base = base;
+        }
+    }
+    return g_paw_l2tab;
+}
+
+
 // The walk kernels below launch grid.z=n_groups (up to 256) but at nt==1
 // only n_used (~8) are ever active -- every other block reads scr_i[g]==0
 // and exits immediately. This writes the n_used active group ids directly
@@ -6220,9 +6265,11 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                     dim3(m/64, n_groups, 1), dim3(128, 1, 1), 0, stream);
             paw_timed(stream, std::string("exp_fused") + shp, [&]() {
                 if (p4) {
+                    const paw_l2_tables & lt = paw_l2_tables_get(stream, p4t);
                     paw_launch(paw_exp_apply_kernel_fused<true, 4>, fparams,
                         kept_d, (const half *) nullptr, (const void *) tlut->data,
-                        p4t.packed, p4t.levels,
+                        lt.packed ? lt.packed : p4t.packed,
+                        lt.levels ? lt.levels : p4t.levels,
                         (const int32_t *) scr_i, xg, scr_v,
                         (const half *) gamma->data,
                         (float *) nullptr, m, n, n_groups);
