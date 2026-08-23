@@ -101,6 +101,16 @@ static paw_time_table & paw_times() {
     return t;
 }
 
+// secondary stream for decoding expert slabs concurrently with the cuBLAS
+// GEMMs of the previous slab (created once, never captured by graphs)
+static cudaStream_t paw_aux_stream() {
+    static cudaStream_t s = nullptr;
+    if (!s) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    }
+    return s;
+}
+
 template <typename F>
 static void paw_timed(cudaStream_t stream, const std::string & key, F && launch) {
     if (!paw_time_on()) {
@@ -5526,9 +5536,16 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         // pool is strict LIFO: bank must be allocated before xg so the
         // destructor order (xg first, bank last) unwinds it correctly
         const bool use_blas = v8 && exp_blas && exp_ws && exp_gp && m % 16 == 0;
+        // overlap decode of slab i+1 with GEMMs of slab i on a second stream
+        // off by default: measured no gain (decode and GEMM contend for the same
+// bandwidth on this part); kept for parts where that does not hold
+        static const bool exp_ovl = paw_env_int("GGML_PAW_EXP_OVERLAP", 0) != 0;
+        const bool do_ovl = use_blas && exp_ovl && n_groups > exp_chunk;
+        const int n_slabs = use_blas ? (n_groups + exp_chunk - 1)/exp_chunk : 1;
+        const int bank_bufs = do_ovl ? 2 : 1;
         const int bank_g = use_blas ? (exp_chunk < n_groups ? exp_chunk : n_groups)
                                     : n_groups;
-        half * bank = bank_alloc.alloc((size_t) bank_g*m*n);
+        half * bank = bank_alloc.alloc((size_t) bank_g*bank_bufs*m*n);
         ggml_cuda_pool_alloc<half> xg_alloc(ctx.pool());
         half * xg = nullptr;
         if (v8 && exp_ws && exp_gp) {
@@ -5587,23 +5604,47 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
             const float alpha = 1.0f;
             const float beta  = 0.0f;
+            // diagnostic: GGML_PAW_EXP_BLAS_SKIP_DECODE=1 times GEMMs alone
+            // (output is garbage; perf signal only)
+            static const bool blas_skip_dec =
+                paw_env_int("GGML_PAW_EXP_BLAS_SKIP_DECODE", 0) != 0;
             paw_timed(stream, std::string("exp_blas") + shp, [&]() {
-            for (int g0 = 0; g0 < n_groups; g0 += exp_chunk) {
+            std::vector<cudaEvent_t> ev(do_ovl ? 2*n_slabs + 1 : 0);
+            if (do_ovl) {
+                for (auto & e : ev) {
+                    CUDA_CHECK(cudaEventCreate(&e));
+                }
+                CUDA_CHECK(cudaEventRecord(ev[0], stream));
+            }
+            cudaStream_t ds = do_ovl ? paw_aux_stream() : stream;
+            for (int si = 0; si < n_slabs; ++si) {
+                const int g0 = si*exp_chunk;
                 const int gc = exp_chunk < n_groups - g0 ? exp_chunk : n_groups - g0;
+                half * buf = bank + (size_t)(do_ovl ? (si % 2) : 0)*bank_g*m*n;
                 const ggml_cuda_kernel_launch_params dp =
                     ggml_cuda_kernel_launch_params(
-                        dim3((m/16*n + 255)/256, 1, gc), dim3(256, 1, 1), 0, stream);
-                if (p4) {
-                    paw_launch(paw_exp_dense_decode_kernel<true, true>, dp,
-                        kept_d, dem_d, (const void *) tlut->data, p4t.packed, p4t.levels,
-                        (const int32_t *) scr_i, bank, m, n, n_kept, n_groups, g0,
-                        (const half *) gamma->data);
-                } else {
-                    paw_launch(paw_exp_dense_decode_kernel<true, false>, dp,
-                        kept_d, dem_d, (const void *) tlut->data,
-                        (const uint32_t *) nullptr, (const float *) nullptr,
-                        (const int32_t *) scr_i, bank, m, n, n_kept, n_groups, g0,
-                        (const half *) gamma->data);
+                        dim3((m/16*n + 255)/256, 1, gc), dim3(256, 1, 1), 0, ds);
+                if (!blas_skip_dec) {
+                    if (do_ovl) {
+                        // gate: previous slab's GEMMs released this buffer
+                        CUDA_CHECK(cudaStreamWaitEvent(ds, ev[2*si]));
+                    }
+                    if (p4) {
+                        paw_launch(paw_exp_dense_decode_kernel<true, true>, dp,
+                            kept_d, dem_d, (const void *) tlut->data, p4t.packed, p4t.levels,
+                            (const int32_t *) scr_i, buf, m, n, n_kept, n_groups, g0,
+                            (const half *) gamma->data);
+                    } else {
+                        paw_launch(paw_exp_dense_decode_kernel<true, false>, dp,
+                            kept_d, dem_d, (const void *) tlut->data,
+                            (const uint32_t *) nullptr, (const float *) nullptr,
+                            (const int32_t *) scr_i, buf, m, n, n_kept, n_groups, g0,
+                            (const half *) gamma->data);
+                    }
+                    if (do_ovl) {
+                        CUDA_CHECK(cudaEventRecord(ev[2*si + 1], ds));
+                        CUDA_CHECK(cudaStreamWaitEvent(stream, ev[2*si + 1]));
+                    }
                 }
                 for (int gi = 0; gi < gc; ++gi) {
                     const int cnt = hscr[g0 + gi];
@@ -5615,11 +5656,23 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                             CUBLAS_OP_T, CUBLAS_OP_N,
                             m, cnt, n,
                             &alpha,
-                            (const half *) bank + (size_t) gi*m*n, CUDA_R_16F, n,
+                            buf + (size_t) gi*m*n,                  CUDA_R_16F, n,
                             xg + (int64_t) off*n,                   CUDA_R_16F, n,
                             &beta,
                             ygf + (int64_t) off*m,                  CUDA_R_16F, m,
                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                }
+                if (do_ovl && si + 1 < n_slabs) {
+                    CUDA_CHECK(cudaEventRecord(ev[2*si + 2], stream));
+                }
+            }
+            if (do_ovl) {
+                // pool frees ride on the main stream: pin aux work to it too
+                CUDA_CHECK(cudaEventRecord(ev[2*n_slabs], ds));
+                CUDA_CHECK(cudaStreamWaitEvent(stream, ev[2*n_slabs]));
+                CUDA_CHECK(cudaStreamWaitEvent(ds, ev[2*n_slabs]));
+                for (auto & e : ev) {
+                    CUDA_CHECK(cudaEventDestroy(e));
                 }
             }
             });
