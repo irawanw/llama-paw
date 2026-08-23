@@ -1311,15 +1311,18 @@ static __global__ void paw_rt_u_kernel(
         const int blk) {
     // blk == n is the legacy single-Hadamard path: the loop runs once with
     // off == 0 and the arithmetic is identical to before blocking existed.
+    // blockIdx.y selects the rotation chunk so chunks run on separate SMs
+    // instead of serializing inside one block (per-chunk math is unchanged).
     __shared__ float sh[4096];
 
     const int t   = blockIdx.x;
+    const int off = blockIdx.y * blk;
     const int tid = threadIdx.x;
 
     ggml_cuda_pdl_sync();
     const float sc     = __fsqrt_rn((float) blk);
     const float inv_sc = __frcp_rn(sc);
-    for (int off = 0; off < n; off += blk) {
+    {
         for (int i = tid; i < blk; i += WG) {
             sh[i] = su[off + i] * x[(int64_t) t*n + off + i];
         }
@@ -1332,7 +1335,6 @@ static __global__ void paw_rt_u_kernel(
         for (int i = tid; i < blk; i += WG) {
             scr_u[(int64_t) t*n + off + i] = sh[i] * inv_sc;
         }
-        __syncthreads();
     }
 }
 
@@ -2828,15 +2830,18 @@ static __global__ void paw_rt_out_kernel(
         const int m,
         const int blk) {
     // blk == m reproduces the pre-blocking kernel exactly (one iteration).
+    // blockIdx.y selects the output chunk so chunks run on separate SMs
+    // instead of serializing inside one block (per-chunk math is unchanged).
     __shared__ float sh[8192];
 
     const int t   = blockIdx.x;
+    const int off = blockIdx.y * blk;
     const int tid = threadIdx.x;
 
     ggml_cuda_pdl_sync();
     const float sc     = __fsqrt_rn((float) blk);
     const float inv_sc = __frcp_rn(sc);
-    for (int off = 0; off < m; off += blk) {
+    {
         for (int i = tid; i < blk; i += WG) {
             __pipeline_memcpy_async(&sh[i], &scr_v[(int64_t) t*m + off + i], sizeof(float));
         }
@@ -3023,16 +3028,16 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         paw_fwht_for_wg(n/16, [&](auto WG) {
             constexpr int wg = decltype(WG)::value;
             paw_launch(paw_rt_u_kernel<wg>,
-                ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(wg, 1, 1), 0, stream),
+                ggml_cuda_kernel_launch_params(dim3(nt, n/bn, 1), dim3(wg, 1, 1), 0, stream),
                 (const float *) su->data, (const float *) x->data, scr_u, n, bn);
         });
     } else if (!blocked && paw_fwht_wg512()) {
         paw_launch(paw_rt_u_kernel<512>,
-            ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(nt, n/bn, 1), dim3(512, 1, 1), 0, stream),
             (const float *) su->data, (const float *) x->data, scr_u, n, bn);
     } else {
         paw_launch(paw_rt_u_kernel<256>,
-            ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(nt, n/bn, 1), dim3(256, 1, 1), 0, stream),
             (const float *) su->data, (const float *) x->data, scr_u, n, bn);
     }
     });
@@ -3402,35 +3407,35 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             constexpr int wg = decltype(WG)::value;
             if (epilogue) {
                 paw_launch((paw_rt_out_kernel<wg, true>),
-                    ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(wg, 1, 1), 0, stream),
+                    ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(wg, 1, 1), 0, stream),
                     (const float *) sv->data, scr_v, (float *) dst->data,
                     (const float *) gate->data, (const float *) acc->data, m, bm);
             } else {
                 paw_launch((paw_rt_out_kernel<wg, false>),
-                    ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(wg, 1, 1), 0, stream),
+                    ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(wg, 1, 1), 0, stream),
                     (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m, bm);
             }
         });
     } else if (!blocked && paw_fwht_wg512()) {
         if (epilogue) {
             paw_launch((paw_rt_out_kernel<512, true>),
-                ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), 0, stream),
+                ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(512, 1, 1), 0, stream),
                 (const float *) sv->data, scr_v, (float *) dst->data,
                 (const float *) gate->data, (const float *) acc->data, m, bm);
         } else {
             paw_launch((paw_rt_out_kernel<512, false>),
-                ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), 0, stream),
+                ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(512, 1, 1), 0, stream),
                 (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m, bm);
         }
     } else {
         if (epilogue) {
             paw_launch((paw_rt_out_kernel<256, true>),
-                ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), 0, stream),
+                ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(256, 1, 1), 0, stream),
                 (const float *) sv->data, scr_v, (float *) dst->data,
                 (const float *) gate->data, (const float *) acc->data, m, bm);
         } else {
             paw_launch((paw_rt_out_kernel<256, false>),
-                ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), 0, stream),
+                ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(256, 1, 1), 0, stream),
                 (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m, bm);
         }
     }
