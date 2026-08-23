@@ -3137,7 +3137,19 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             frag_dbg_calls++;
             return;   // skip normal path this call; v already computed by frag
         }
-        if (!walk_noop && walk_frag) {
+        // timing-only attribution knob: skip walks whose m is in the list
+        // (wrong results; use with GGML_PAW_WALK_NOOP-style runs only)
+        static const bool walk_skip_on = paw_env_int("GGML_PAW_WALK_SKIP_M_ON", 0) != 0;
+        static const std::string walk_skip_csv = std::string(",") +
+            (getenv("GGML_PAW_WALK_SKIP_M") ? getenv("GGML_PAW_WALK_SKIP_M") : "") + ",";
+        const bool walk_skip = walk_skip_on &&
+            walk_skip_csv.find("," + std::to_string(m) + ",") != std::string::npos;
+        if (walk_skip_on) {
+            static std::string seen;
+            const std::string key = "," + std::to_string(m) + "x" + std::to_string(n) + "w" + std::to_string(rt_words);
+            if (seen.find(key) == std::string::npos) { seen += key; fprintf(stderr, "[walk-shape]%s\n", key.c_str()); }
+        }
+        if (!walk_noop && !walk_skip && walk_frag) {
             CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) m*sizeof(float), stream));
             switch (rt_words) {
                 case 16: paw_rt_walk_qtip_frag_dispatch<16>((const uint16_t *) trellis->data,
@@ -3154,7 +3166,7 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                     (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
                 default: GGML_ABORT("paw: unsupported trellis rate for frag walk");
             }
-        } else if (!walk_noop) paw_timed(stream, std::string("rt_walk_qtip") + shp, [&]() {
+        } else if (!walk_noop && !walk_skip) paw_timed(stream, std::string("rt_walk_qtip") + shp, [&]() {
         paw_rt_walk_qtip_rate_launch((const uint16_t *) trellis->data,
             (const half *) tlut->data, (const float *) scr_u, scr_v,
             m, n, rt_words, stream);
