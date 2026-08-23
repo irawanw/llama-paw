@@ -5547,8 +5547,11 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
         const bool capturing = cudaStreamIsCapturing(stream, &cst) == cudaSuccess &&
                                cst == cudaStreamCaptureStatusActive;
+        // single-token passes go through the fused WS kernel instead: no
+        // staging round-trip and no host sync (measured +3 t/s generation)
+        static const int exp_blas_min_nt = paw_env_int("GGML_PAW_EXP_BLAS_MIN_NT", 2);
         const bool use_blas = v8 && exp_blas && exp_ws && exp_gp &&
-                              m % 16 == 0 && !capturing;
+                              m % 16 == 0 && n_tok >= exp_blas_min_nt && !capturing;
         // overlap decode of slab i+1 with GEMMs of slab i on a second stream
         // off by default: measured no gain (decode and GEMM contend for the same
 // bandwidth on this part); kept for parts where that does not hold
@@ -5697,7 +5700,7 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             });
         } else {
         paw_timed(stream, std::string("exp_apply") + shp, [&]() {
-        static const int ws_min_m = paw_env_int("GGML_PAW_EXP_WS_MIN_M", 1024);
+        static const int ws_min_m = paw_env_int("GGML_PAW_EXP_WS_MIN_M", 512);
         if (v8 && exp_ws && xg && m % 64 == 0 && m >= ws_min_m) {
             paw_launch(paw_exp_apply_kernel_ws<true, 4, true>,
                 ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128, 1, 1), 0, stream),
