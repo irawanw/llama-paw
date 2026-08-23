@@ -1504,21 +1504,22 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
     // stride of 3 the bank index (3*row)%32 covers all 32 banks uniformly
     __shared__ float  slut[512*3];
     // per-warp decode scratch: each warp owns an independent output tile
-    __shared__ half   tile16[4][16][16];
-    __shared__ half   bcol[4][16];   // this K-step's 16 activation values (col 0 real, rest 0)
+    __shared__ half   tile16[8][16][16];
+    __shared__ half   bcol[8][16];   // this K-step's 16 activation values (col 0 real, rest 0)
 
     constexpr int step  = WORDS/8;   // fresh bits per state, V = 2
-    // one WARP per output tile; four warps per block so resident-warps/SM
-    // is not capped by the 32-thread-block limit
+    // one BLOCK per output tile; four warps SPLIT the tile-column range so
+    // small-m matrices (down proj: only m/16 tiles) still fill the machine
+    // -- the walk is latency-bound, memory-level parallelism is everything
     const int wid  = threadIdx.x >> 5;
-    const int tr   = blockIdx.x*4 + wid;
+    const int tr   = blockIdx.x;
     const int lane = threadIdx.x & 31;
 
     const int tiles_y = n / 16;
 
     ggml_cuda_pdl_sync();
 
-    for (int i = threadIdx.x; i < 512; i += 128) {
+    for (int i = threadIdx.x; i < 512; i += 256) {
         slut[3*i + 0] = __half2float(tlut[2*i + 0]);
         slut[3*i + 1] = __half2float(tlut[2*i + 1]);
     }
@@ -1528,7 +1529,7 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
     const int tid4     = lane & 3;
     float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
 
-    for (int ct = 0; ct < tiles_y; ++ct) {
+    for (int ct = wid; ct < tiles_y; ct += 8) {
         // --- decode this (tr, ct) 16x16 tile: lanes 0-15 each decode one
         // full row (16 columns), generic rate-aware window math ---
         if (true) {
@@ -1598,9 +1599,19 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
 
     // only tid4==0 (groupID's col 0 slot) is the real token; d0 -> row
     // groupID, d2 -> row groupID+8 (per the validated D-fragment layout).
+    // four warps covered disjoint ct subsets -- reduce through shared
+    __shared__ float xred[8][16];
     if (tid4 == 0) {
-        scr_v[tr*16 + groupID]     = d0;
-        scr_v[tr*16 + groupID + 8] = d2;
+        xred[wid][groupID]     = d0;
+        xred[wid][groupID + 8] = d2;
+    }
+    __syncthreads();
+    if (wid == 0 && tid4 == 0) {
+        #pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            scr_v[tr*16 + r] = xred[0][r] + xred[1][r] + xred[2][r] + xred[3][r]
+                             + xred[4][r] + xred[5][r] + xred[6][r] + xred[7][r];
+        }
     }
 }
 
@@ -2214,22 +2225,22 @@ static void paw_rt_walk_qtip_rate_launch(const uint16_t * trellis,
         const int m, const int n, const int words, cudaStream_t stream) {
     switch (words) {
         case 16: paw_launch(paw_rt_walk_qtip_rate_kernel<16>,
-            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         case 24: paw_launch(paw_rt_walk_qtip_rate_kernel<24>,
-            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         case 32: paw_launch(paw_rt_walk_qtip_rate_kernel<32>,
-            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         case 40: paw_launch(paw_rt_walk_qtip_rate_kernel<40>,
-            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         case 56: paw_launch(paw_rt_walk_qtip_rate_kernel<56>,
-            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         case 64: paw_launch(paw_rt_walk_qtip_rate_kernel<64>,
-            ggml_cuda_kernel_launch_params(dim3((m + 63)/64, 1, 1), dim3(128, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
             trellis, tlut, scr_u, scr_v, m, n); break;
         default: GGML_ABORT("paw: unsupported trellis rate for qtip walk");
     }
