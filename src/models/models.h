@@ -2160,6 +2160,13 @@ protected:
     // rt matrices in paw-dense
     virtual void  load_arch_ffn_tensors(llama_model_loader & ml, int il);
 
+    // Which of the 35B's global codecs a checkpoint actually carries. A dense
+    // port has no expert tier at all, and ships embed/head as stock k-quants
+    // (measured: q4_K/q5_K beat both PAW tiers on bits and error), so it
+    // overrides all three and uses the ordinary tok_embd/output tensors.
+    virtual bool  uses_paw_experts() const { return true; }
+    virtual bool  uses_paw_embed()   const { return true; }
+    virtual bool  uses_paw_head()    const { return true; }
 public:
 
     struct graph : public llm_build_delta_net_base {
@@ -2222,6 +2229,10 @@ struct llama_model_paw_dense : public llama_model_paw {
     void load_arch_ffn_tensors(llama_model_loader & ml, int il) override;
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 
+    // dense: no expert tier, stock q4_K embedding, stock q5_K head
+    bool uses_paw_experts() const override { return false; }
+    bool uses_paw_embed()   const override { return false; }
+    bool uses_paw_head()    const override { return false; }
     struct graph : public llama_model_paw::graph {
         graph(const llama_model_paw_dense & model, const llm_graph_params & params);
     protected:

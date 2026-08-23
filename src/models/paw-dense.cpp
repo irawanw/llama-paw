@@ -4,11 +4,17 @@
 
 // PAW-27B — the PAW codec on the dense qwen35 topology.
 //
-// Everything outside the FFN is shared with llama_model_paw: the same GDN /
-// full-attention stack, the same nibble-LUT embedding, the same int-lattice
-// lm_head. Only two things differ:
+// The GDN / full-attention stack and the NE trellis tier are shared with
+// llama_model_paw. Three things differ:
 //   * the FFN is three rt matrices per layer (ffn_gate / ffn_up / ffn_down)
-//     instead of the routed-expert tier plus a shared expert;
+//     instead of the routed-expert tier plus a shared expert. There is no V=8
+//     expert codebook at all, so mach1.tlut is absent;
+//   * embed and lm_head ship as stock k-quants (q4_K / q5_K) rather than the
+//     35B's nibble-LUT embedding and int-lattice head. Measured on this
+//     parent, the stock types win on both bits and error: the 35B's 16-entry
+//     LUT is lossless only because its embedding was pre-quantized RTN-4bit,
+//     while this one ships full BF16. The uses_paw_* predicates switch the
+//     shared loader and graph onto the ordinary tok_embd/output path;
 //   * the dimensions are not powers of two (5120, 6144, 10240, 17408), so the
 //     payload carries paw-dense.rht_block = 1024 and every rotation runs
 //     block-diagonally. m1_rht_blk is read by the shared loader.

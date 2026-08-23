@@ -82,21 +82,35 @@ void llama_model_paw::load_arch_tensors(llama_model_loader & ml) {
 
     m1_layers.resize(n_layer);
 
-    // global: shared expert trellis codebook + packed embedding + packed lm_head
-    m1_tlut = create_m1(tn(LLM_TENSOR_PAW_TLUT), true);
+    // global: shared expert trellis codebook + packed embedding + packed lm_head.
+    // A dense checkpoint has no V=8 expert tier and ships embed/head as stock
+    // k-quants (measured: q4_K and q5_K beat both PAW tiers on bits and error),
+    // so it wants only the NE table and the ordinary tok_embd/output tensors.
+    if (uses_paw_experts()) {
+        m1_tlut = create_m1(tn(LLM_TENSOR_PAW_TLUT), true);
+    }
 
     if (m1_version >= 3) {
-        m1_ne_tlut    = create_m1(tn(LLM_TENSOR_PAW_NE_TLUT), true);
-        m1_embed_codes = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_codes"), true);
-        m1_embed_lut   = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_lut"),   true);
+        m1_ne_tlut = create_m1(tn(LLM_TENSOR_PAW_NE_TLUT), true);
+    }
+
+    if (uses_paw_embed()) {
+        if (m1_version >= 3) {
+            m1_embed_codes = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_codes"), true);
+            m1_embed_lut   = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_lut"),   true);
+        } else {
+            m1_embed_q  = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_q"),  true);
+            m1_embed_mn = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_mn"), true);
+            m1_embed_mx = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_mx"), true);
+        }
     } else {
-        m1_embed_q  = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_q"),  true);
-        m1_embed_mn = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_mn"), true);
-        m1_embed_mx = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_mx"), true);
+        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
     }
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    if (m1_version >= 3) {
+    if (!uses_paw_head()) {
+        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, 0);
+    } else if (m1_version >= 3) {
         m1_head_qp     = create_m1(tn(LLM_TENSOR_OUTPUT, "m1_qp"),     true);
         m1_head_gscale = create_m1(tn(LLM_TENSOR_OUTPUT, "m1_gscale"), true);
     } else {
@@ -328,7 +342,10 @@ ggml_tensor * llama_model_paw::graph::build_inp_embd_paw() {
     std::array<ggml_tensor *, 2> inps;
     inps[0] = model.m1_embed_codes
         ? ggml_paw_embed_gather(ctx0, model.m1_embed_codes, model.m1_embed_lut, inp->tokens)
-        : ggml_paw_embed_rows(ctx0, model.m1_embed_q, model.m1_embed_mn, model.m1_embed_mx, inp->tokens);
+        : model.m1_embed_q
+        ? ggml_paw_embed_rows(ctx0, model.m1_embed_q, model.m1_embed_mn, model.m1_embed_mx, inp->tokens)
+        // stock k-quant embedding (paw-dense): ordinary row gather
+        : ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
     inps[1] = inp->embd;
 
     GGML_ASSERT(ggml_are_same_shape(inps[0], inps[1]));
@@ -431,8 +448,11 @@ void llama_model_paw::graph::build() {
             cur = ggml_cont(ctx0, cur);
         }
         cur = ggml_paw_head_mm(ctx0, model.m1_head_qp, model.m1_head_gscale, cur);
-    } else {
+    } else if (model.m1_output.packed) {
         cur = ne_mm(model.m1_output, cur);
+    } else {
+        // stock k-quant head (paw-dense)
+        cur = build_lora_mm(model.output, cur);
     }
 
     cb(cur, "result_output", -1);

@@ -2812,7 +2812,15 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         }
     } else {
     ggml_cuda_pool_alloc<half> bank_alloc(ctx.pool());
-    if (nt >= dense_min_tok) {
+    // paw_rt_dense_decode_kernel bakes in the K=4 stream layout: 64 words per
+    // tile and the byte-aligned state window that only WORDS=64 gives. On a
+    // lower-rate payload (paw-dense runs K=1/1.5/2) it reads past the end of
+    // the trellis -- an illegal access on the first prefill, since nt >= 4
+    // there. Only the walk below is rate-aware, so every other rate takes it.
+    // TODO: templating the decode kernel on WORDS the way the walk is would
+    // restore the prefill fast path for dense payloads; it needs the generic
+    // bit-offset window extraction and a numeric check against the walk.
+    if (k4 && nt >= dense_min_tok) {
         half * bank = bank_alloc.alloc((size_t) m*n);
         paw_timed(stream, std::string("rt_dense_decode") + shp, [&]() {
         paw_launch(paw_rt_dense_decode_kernel,
