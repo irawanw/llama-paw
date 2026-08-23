@@ -4444,6 +4444,72 @@ static __global__ void paw_exp_dense_decode_kernel_v2(
 
 
 
+
+// decode one 16-row weight strip of one k-tile straight into shared memory
+template <bool P4>
+static __device__ __forceinline__ void paw_fused_decode_strip(
+        const uint16_t * GGML_CUDA_RESTRICT kept,
+        const void     * GGML_CUDA_RESTRICT tlut,
+        const uint32_t * GGML_CUDA_RESTRICT p4,
+        const float    * lv,
+        const half     * GGML_CUDA_RESTRICT gamma,
+        const int g, const int tr_r, const int tc,
+        const int tiles_y, const int ntiles, const int m, const int n,
+        const int n_groups, const int e_ori,
+        uint16_t * wsh, half (* wout)[16], const int lane) {
+    const int tile  = tr_r*tiles_y + tc;
+    const int tbase = ((int64_t) g*ntiles + tile)*24;
+    if (lane < 24) {
+        wsh[lane] = kept[tbase + lane];
+    }
+    __syncwarp();
+    const int rr  = lane & 15;
+    const int Mb  = m/16;
+    const int wv  = (tr_r + tc <= tiles_y - 1)
+                        ? Mb + tiles_y - 1 - (tr_r + tc)
+                        : Mb + tiles_y - 2 - (tr_r + tc);
+    const float gv =
+        __half2float(gamma[(int64_t) e_ori*(Mb + tiles_y) + wv]);
+    if (lane >= 16) {
+        return;
+    }
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+        const int      i   = 2*rr + jj;
+        const int      bb  = 12*i;
+        const int      wi  = bb >> 4;
+        const int      o   = bb & 15;
+        const int      wn  = wi + 1 < 24 ? wi + 1 : 0;
+        const uint32_t w2  = ((uint32_t) wsh[wi] << 16) | (uint32_t) wsh[wn];
+        const uint32_t reg = (w2 >> (16 - o)) & 0xFFFFu;
+        const uint32_t ph  = reg*(reg + 1u);
+        const uint32_t lrow = ph & 0x7FFFu;
+        if constexpr (P4) {
+            const uint32_t pk = p4[lrow];
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                float vv = lv[(pk >> (4*c)) & 0xFu];
+                if (c == 0 && (ph & 0x8000u)) {
+                    vv = -vv;
+                }
+                wout[rr][8*jj + c] =
+                    __float2half_rn(gv*__half2float(__float2half_rn(vv)));
+            }
+        } else {
+            const half * tl = (const half *) tlut + 8*(int64_t) lrow;
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                float vv = __half2float(tl[c]);
+                if (c == 0 && (ph & 0x8000u)) {
+                    vv = -vv;
+                }
+                wout[rr][8*jj + c] =
+                    __float2half_rn(gv*__half2float(__float2half_rn(vv)));
+            }
+        }
+    }
+}
+
 // Fully-fused expert apply: the WS apply skeleton, but the weight tiles are
 // decoded from the QTIP stream directly into shared memory right before the
 // wmma load -- no fp16 bank materialization at all. Kills the ~2 GB/pass
@@ -4452,6 +4518,7 @@ static __global__ void paw_exp_dense_decode_kernel_v2(
 template <bool P4, int BMT>
 static __global__ void __launch_bounds__(128, 4) paw_exp_apply_kernel_fused(
         const uint16_t * GGML_CUDA_RESTRICT kept,
+        const half     * GGML_CUDA_RESTRICT bank,   // debug: pre-decoded weights
         const void     * GGML_CUDA_RESTRICT tlut,
         const uint32_t * GGML_CUDA_RESTRICT p4,
         const float    * GGML_CUDA_RESTRICT p4lv,
@@ -4459,28 +4526,31 @@ static __global__ void __launch_bounds__(128, 4) paw_exp_apply_kernel_fused(
         const half     * GGML_CUDA_RESTRICT xg,      // [P, n] grouped fp16
         float          * GGML_CUDA_RESTRICT scr_v,   // [P, m]
         const half     * GGML_CUDA_RESTRICT gamma,   // V8 wave gamma
+        float          * GGML_CUDA_RESTRICT dbg,     // debug dump or nullptr
         const int m, const int n, const int n_groups) {
     using namespace nvcuda;
 
-    constexpr int n_warps = 4;
-    constexpr int bm_t    = BMT;
-    constexpr int tpb     = 2;
-    constexpr int bn      = n_warps*tpb*16;
-    constexpr int bk      = 16;
+    constexpr int n_warps  = 4;
+    constexpr int bk       = 16;                  // == the wmma K tile
+    constexpr int bn       = 64;                  // token chunk, whole block
+    constexpr int n_tt     = bn / 16;             // token subtiles per chunk
 
     const int g    = blockIdx.y;
-    const int row0 = blockIdx.x*(bm_t*16);
+    const int row0 = blockIdx.x*(n_warps*16);
     const int tid  = threadIdx.x;
     const int warp_id = tid >> 5;
-    const int lane   = tid & 31;
+    const int lane    = tid & 31;
     const int tiles_y = n/16;
     const int ntiles  = (m/16)*tiles_y;
 
-    __shared__ half       Xsh[n_warps][tpb][16][bk];
-    __shared__ half       Wsh[n_warps][16][bk];
-    __shared__ float      out_sh[n_warps][16*16];
-    __shared__ int        pidx_sh[bn];
-    __shared__ uint16_t   wsh[n_warps][24];
+    __shared__ half     Xsh[bn][bk];              // staged activation tile
+    // double-buffered per-warp weight strips: tile k+1 decodes while tile k
+    // is still being multiplied, hiding LUT gather latency behind tensor math
+    __shared__ half     Wsh[2][n_warps][16][bk];
+    __shared__ float    out_sh[n_warps][16*16];
+    __shared__ int      pidx_sh[bn];
+    __shared__ uint16_t wsh[n_warps][24];
+    __shared__ float    lv[16];                   // staged P4 levels
 
     ggml_cuda_pdl_sync();
     const int cnt = scr_i[g];
@@ -4489,129 +4559,95 @@ static __global__ void __launch_bounds__(128, 4) paw_exp_apply_kernel_fused(
     }
     const int off   = scr_i[n_groups + g];
     const int e_ori = scr_i[2*n_groups + g];
+    if constexpr (P4) {
+        if (tid < 16) {
+            lv[tid] = p4lv[tid];
+        }
+        __syncthreads();
+    }
 
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[bm_t][tpb];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[n_tt];
 
     for (int q0 = 0; q0 < cnt; q0 += bn) {
 #pragma unroll
-        for (int r = 0; r < bm_t; ++r) {
-#pragma unroll
-            for (int t = 0; t < tpb; ++t) {
-                wmma::fill_fragment(acc[r][t], 0.0f);
-            }
+        for (int t = 0; t < n_tt; ++t) {
+            wmma::fill_fragment(acc[t], 0.0f);
         }
         for (int i = tid; i < bn; i += 128) {
             pidx_sh[i] = scr_i[4*n_groups + off + min(q0 + i, cnt - 1)];
         }
         __syncthreads();
 
-        for (int k0 = 0; k0 < n; k0 += bk) {
-            // stage this warp's activations for the k-slab
-#pragma unroll
-            for (int t = 0; t < tpb; ++t) {
-                const int tt0 = (warp_id*tpb + t)*16;
-                for (int idx = lane; idx < 16*bk; idx += 32) {
-                    const int tt = idx / bk;
-                    const int kk = idx % bk;
-                    float v = 0.0f;
-                    if (q0 + tt0 + tt < cnt) {
-                        const int64_t row = (int64_t)(off + q0 + tt0 + tt);
-                        v = __half2float(xg[row*n + k0 + kk]);
-                    }
-                    Xsh[warp_id][t][tt][kk] = __float2half(v);
-                }
+        // prologue: decode strip k=0 into buffer 0 before the loop
+        int cur = 0;
+        paw_fused_decode_strip<P4>(kept, tlut, p4, lv, gamma,
+            g, row0/16 + warp_id, 0, tiles_y, ntiles, m, n, n_groups, e_ori,
+            wsh[warp_id], Wsh[0][warp_id], lane);
+
+        for (int k0 = 0; k0 < n; k0 += bk, cur ^= 1) {
+            // kick off the next strip into the other buffer; its LUT
+            // gathers then overlap with this tile's mma chain
+            if (k0 + bk < n) {
+                paw_fused_decode_strip<P4>(kept, tlut, p4, lv, gamma,
+                    g, row0/16 + warp_id, (k0 + bk)/16, tiles_y, ntiles, m, n,
+                    n_groups, e_ori, wsh[warp_id], Wsh[cur ^ 1][warp_id], lane);
             }
 
-            // decode this warp's weight tile [16 x bk] from the stream
-            {
-                const int tr_r  = row0/16 + warp_id;   // one row-strip per warp
-                const int tc    = k0/16;
-                const int tile  = tr_r*tiles_y + tc;
-                const int tbase = ((int64_t) g*ntiles + tile)*24;
-                if (lane < 24) {
-                    wsh[warp_id][lane] = kept[tbase + lane];
-                }
-                __syncwarp();
-                const int rr  = lane & 15;
-                const int Mb  = m/16;
-                const int wv  = (tr_r + tc <= tiles_y - 1)
-                                    ? Mb + tiles_y - 1 - (tr_r + tc)
-                                    : Mb + tiles_y - 2 - (tr_r + tc);
-                const float gv = __half2float(
-                    gamma[(int64_t) e_ori*(Mb + tiles_y) + wv]);
-                if (lane < 16) {
-#pragma unroll
-                    for (int jj = 0; jj < 2; ++jj) {
-                        const int      i   = 2*rr + jj;
-                        const int      bb  = 12*i;
-                        const int      wi  = bb >> 4;
-                        const int      o   = bb & 15;
-                        const int      wn  = wi + 1 < 24 ? wi + 1 : 0;
-                        const uint32_t w2  = ((uint32_t) wsh[warp_id][wi] << 16)
-                                           | (uint32_t) wsh[warp_id][wn];
-                        const uint32_t reg = (w2 >> (16 - o)) & 0xFFFFu;
-                        const uint32_t ph  = reg*(reg + 1u);
-                        const uint32_t lrow = ph & 0x7FFFu;
-                        if constexpr (P4) {
-                            const uint32_t pk = p4[lrow];
-#pragma unroll
-                            for (int c = 0; c < 8; ++c) {
-                                float vv = p4lv[(pk >> (4*c)) & 0xFu];
-                                if (c == 0 && (ph & 0x8000u)) {
-                                    vv = -vv;
-                                }
-                                // round to weight precision first, exactly
-                                // like the bank-decoding path, then scale
-                                Wsh[warp_id][rr][8*jj + c] =
-                                    __float2half_rn(gv*__half2float(__float2half_rn(vv)));
-                            }
-                        } else {
-                            const half * tl = (const half *) tlut + 8*(int64_t) lrow;
-#pragma unroll
-                            for (int c = 0; c < 8; ++c) {
-                                float vv = __half2float(tl[c]);
-                                if (c == 0 && (ph & 0x8000u)) {
-                                    vv = -vv;
-                                }
-                                // round to weight precision first, exactly
-                                // like the bank-decoding path, then scale
-                                Wsh[warp_id][rr][8*jj + c] =
-                                    __float2half_rn(gv*__half2float(__float2half_rn(vv)));
-                            }
-                        }
-                    }
-                }
-                __syncwarp();
-                wmma::load_matrix_sync(a_frag, &Wsh[warp_id][0][0], bk);
-            }
-
-#pragma unroll
-            for (int t = 0; t < tpb; ++t) {
-                wmma::load_matrix_sync(b_frag, &Xsh[warp_id][t][0][0], bk);
-                wmma::mma_sync(acc[0][t], a_frag, b_frag, acc[0][t]);
-            }
             __syncwarp();
+            wmma::load_matrix_sync(a_frag, &Wsh[cur][warp_id][0][0], bk);
+
+            if (dbg && g == 0 && blockIdx.x == 0 && q0 == 0 && k0 == 0) {
+                for (int idx = lane; idx < 16*bk; idx += 32) {
+                    const int rrr = idx / bk;
+                    const int kkk = idx % bk;
+                    dbg[(warp_id*16 + rrr)*bk + kkk] =
+                        __half2float(Wsh[cur][warp_id][rrr][kkk]);
+                }
+                __syncwarp();
+            }
+
+            // vectorized activation staging: 16B per lane, tail rows clamp
+            // onto the last valid pair (store guards discard those slots)
+            {
+                const int last = off + cnt - 1;
+                uint4 * xd = (uint4 *) &Xsh[0][0];
+                for (int idx = tid; idx < bn*(bk/8); idx += 128) {
+                    const int tt = idx / (bk/8);
+                    const int vq = off + q0 + tt;
+                    const uint4 * xs = (const uint4 *)
+                        (xg + (int64_t) min(vq, last)*n + k0);
+                    xd[idx] = xs[idx % (bk/8)];
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int t = 0; t < n_tt; ++t) {
+                wmma::load_matrix_sync(b_frag, &Xsh[t*16][0], bk);
+                wmma::mma_sync(acc[t], a_frag, b_frag, acc[t]);
+            }
         }
 
-        // store this warp's single row-strip
+        // store this warp's strip for every token subtile
 #pragma unroll
-        for (int t = 0; t < tpb; ++t) {
-            wmma::store_matrix_sync(&out_sh[warp_id][0], acc[0][t], 16,
+        for (int t = 0; t < n_tt; ++t) {
+            wmma::store_matrix_sync(&out_sh[warp_id][0], acc[t], 16,
                                     wmma::mem_row_major);
             __syncwarp();
-            const int tt0 = (warp_id*tpb + t)*16;
             for (int idx = lane; idx < 16*16; idx += 32) {
                 const int row = idx / 16;
                 const int tt  = idx % 16;
-                if (q0 + tt0 + tt < cnt) {
-                    scr_v[(int64_t) pidx_sh[tt0 + tt]*m + row0 + warp_id*16 + row] =
+                if (q0 + t*16 + tt < cnt) {
+                    scr_v[(int64_t) pidx_sh[t*16 + tt]*m + row0 + warp_id*16 + row] =
                         out_sh[warp_id][idx];
                 }
             }
             __syncwarp();
         }
+        // block-wide barrier before the next chunk refills pidx_sh: the
+        // store loop above reads it under a mere per-warp sync
+        __syncthreads();
     }
 }
 
@@ -5057,7 +5093,14 @@ extern "C" int paw_fused_bench(int m, int n, int n_groups, int P) {
     float    * v;     CUDA_CHECK(cudaMalloc(&v,    (size_t) P*m*4));
     half     * gam;   CUDA_CHECK(cudaMalloc(&gam,  (size_t) 256*(m/16 + n/16)*2));
 
-    std::vector<uint16_t> hk(words, 0x1555u);
+    std::vector<uint16_t> hk(words);
+    {
+        unsigned rng = 9973;
+        for (size_t i = 0; i < words; ++i) {
+            rng = rng*1103515245u + 12345u;
+            hk[i] = (uint16_t)((rng >> 8) | 1u);   // nonzero streams
+        }
+    }
     CUDA_CHECK(cudaMemcpy(kept, hk.data(), words*2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(tlut, 0, (size_t)32768*16));
     CUDA_CHECK(cudaMemset(p4t, 0, 32768*4));
@@ -5078,17 +5121,56 @@ extern "C" int paw_fused_bench(int m, int n, int n_groups, int P) {
         }
     }
     CUDA_CHECK(cudaMemcpy(scr, hs.data(), hs.size()*4, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(xg, 0, (size_t)P*n*2));
+    {
+        std::vector<half> hx((size_t)P*n);
+        unsigned rng = 31;
+        for (size_t i = 0; i < hx.size(); ++i) {
+            rng = rng*1103515245u + 12345u;
+            hx[i] = __float2half(((int)(rng >> 16 & 0xFF) - 128) / 512.0f);
+        }
+        CUDA_CHECK(cudaMemcpy(xg, hx.data(), hx.size()*2, cudaMemcpyHostToDevice));
+    }
     CUDA_CHECK(cudaMemset(v, 0, (size_t)P*m*4));
     std::vector<half> hg((size_t)256*(m/16 + n/16), __float2half(1.0f));
     CUDA_CHECK(cudaMemcpy(gam, hg.data(), hg.size()*2, cudaMemcpyHostToDevice));
 
+    float * dbgf; CUDA_CHECK(cudaMalloc(&dbgf, 64*16*4));
+    CUDA_CHECK(cudaMemset(dbgf, 0, 64*16*4));
     cudaStream_t st; CUDA_CHECK(cudaStreamCreate(&st));
     paw_launch(paw_exp_apply_kernel_fused<true, 4>,
         ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128,1,1), 0, st),
-        kept, (const void *) tlut, p4t, p4l,
-        (const int32_t *) scr, xg, v, (const half *) gam, m, n, n_groups);
+        kept, (const half *) nullptr, (const void *) tlut, (const uint32_t *) p4t,
+        (const float *) p4l, (const int32_t *) scr, xg, v, (const half *) gam,
+        (float *) nullptr, m, n, n_groups);
     cudaError_t le = cudaGetLastError();
+
+    // structural twin: same loops, bank-fed weights
+    half * bank2; CUDA_CHECK(cudaMalloc(&bank2, (size_t) n_groups*m*n*2));
+    float * vf;   CUDA_CHECK(cudaMalloc(&vf, (size_t) P*m*4));
+    CUDA_CHECK(cudaMemset(vf, 0, (size_t) P*m*4));
+    {
+        std::vector<uint16_t> hkz(words, 0x1555u);
+        CUDA_CHECK(cudaMemcpy(kept, hkz.data(), words*2, cudaMemcpyHostToDevice));
+    }
+    paw_launch(paw_exp_dense_decode_kernel<true, true>,
+        ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, n_groups), dim3(256,1,1), 0, st),
+        kept, kept, (const void *) tlut, p4t, p4l,
+        (const int32_t *) scr, bank2, m, n, n_groups, n_groups, 0,
+        (const half *) gam);
+    {
+        std::vector<uint16_t> hkr(words);
+        unsigned rng = 9973;
+        for (size_t i = 0; i < words; ++i) {
+            rng = rng*1103515245u + 12345u;
+            hkr[i] = (uint16_t)((rng >> 8) | 1u);
+        }
+        CUDA_CHECK(cudaMemcpy(kept, hkr.data(), words*2, cudaMemcpyHostToDevice));
+    }
+    paw_launch(paw_exp_apply_kernel_fused<true, 4>,
+        ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128,1,1), 0, st),
+        kept, (const half *) bank2, (const void *) tlut, p4t, p4l,
+        (const int32_t *) scr, xg, vf, (const half *) gam,
+        dbgf, m, n, n_groups);
 
     // reference: decode into a bank, then WS apply over it
     half * bank; CUDA_CHECK(cudaMalloc(&bank, (size_t) n_groups*m*n*2));
@@ -5107,16 +5189,107 @@ extern "C" int paw_fused_bench(int m, int n, int n_groups, int P) {
     cudaError_t se = cudaStreamSynchronize(st);
     printf("fused-bench m=%d n=%d groups=%d P=%d | launch=%s sync=%s\n",
            m, n, n_groups, P, cudaGetErrorString(le), cudaGetErrorString(se));
-    std::vector<float> hv((size_t)P*m), hr((size_t)P*m);
+    std::vector<float> hv((size_t)P*m), hr((size_t)P*m), hf((size_t)P*m);
     CUDA_CHECK(cudaMemcpy(hv.data(), v, hv.size()*4, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(hr.data(), vref, hr.size()*4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hf.data(), vf, hf.size()*4, cudaMemcpyDeviceToHost));
+    size_t fdiff = 0;
+    for (size_t i = 0; i < hf.size(); ++i) {
+        if (fabs((double)hf[i] - (double)hr[i]) > 0) ++fdiff;
+    }
+    printf("bankfed-fused diff %zu / %zu\n", fdiff, hf.size());
+    {
+        std::vector<float> hd(64*16);
+        CUDA_CHECK(cudaMemcpy(hd.data(), dbgf, hd.size()*4, cudaMemcpyDeviceToHost));
+        std::vector<half> hb((size_t) n_groups*m*n);
+        CUDA_CHECK(cudaMemcpy(hb.data(), bank2, hb.size()*2, cudaMemcpyDeviceToHost));
+        int shown = 0;
+        for (int w = 0; w < 4 && shown < 8; ++w) {
+            for (int e = 0; e < 4 && shown < 8; ++e) {
+                float got = hd[(w*16 + 0)*16 + e];      // row 0 of strip w, k=e
+                float want = __half2float(hb[((size_t)0*m + (0*16 + w*16))*n + e]);
+                if (fabs(got - want) > 1e-3) {
+                    printf("  dbg warp%d k%d: Wsh=%.4f bank=%.4f\n", w, e, got, want);
+                    ++shown;
+                }
+            }
+        }
+        if (!shown) printf("  dbg: all sampled W tiles match bank\n");
+    }
+
+    // ---- host ground truth over group 0's pairs only (fast enough) ----
+    {
+        std::vector<half> hb((size_t) n_groups*m*n);
+        CUDA_CHECK(cudaMemcpy(hb.data(), bank2, hb.size()*2, cudaMemcpyDeviceToHost));
+        std::vector<half> hx((size_t)P*n);
+        CUDA_CHECK(cudaMemcpy(hx.data(), xg, hx.size()*2, cudaMemcpyDeviceToHost));
+        std::vector<int32_t> hsc(5*(size_t)n_groups + (size_t)n_groups*CNT);
+        CUDA_CHECK(cudaMemcpy(hsc.data(), scr, hsc.size()*4, cudaMemcpyDeviceToHost));
+        double worst_f = 0, worst_r = 0;
+        long long bad_f = 0, bad_r = 0, bad_f_row[4] = {0,0,0,0};
+        const int GCHK = n_groups < 4 ? n_groups : 4;
+        for (int g = 0; g < GCHK; ++g) {
+            const int cg = hsc[g];
+            const int og = hsc[n_groups + g];
+            const int32_t * pp = hsc.data() + 4*n_groups + og;
+            for (int i = 0; i < cg; ++i) {
+                const int qp = pp[i];
+                for (int rr = 0; rr < 64; rr += 16) {   // strips via blocks; check first block rows 0..63
+                    for (int r16 = 0; r16 < 16; ++r16) {
+                        const int row = rr + r16;
+                        const half * wr = hb.data() + ((size_t) g*m + row)*n;
+                        const half * xr = hx.data() + (size_t) qp*n;
+                        double acc = 0;
+                        for (int k = 0; k < n; ++k) {
+                            acc += (double)__half2float(wr[k]) * (double)__half2float(xr[k]);
+                        }
+                        const size_t idx = (size_t) qp*m + row;
+                        double df = fabs(acc - (double)hf[idx]);
+                        double dr = fabs(acc - (double)hr[idx]);
+                        if (df > worst_f) worst_f = df;
+                        if (dr > worst_r) worst_r = dr;
+                        if (df > 0.05) { ++bad_f; ++bad_f_row[rr/16]; }
+                        if (dr > 0.05) ++bad_r;
+                    }
+                }
+            }
+        }
+        printf("host-truth: fused bad=%lld worst=%.4f | ref bad=%lld worst=%.4f\n",
+               bad_f, worst_f, bad_r, worst_r);
+        printf("  fused bad by strip: %lld %lld %lld %lld\n",
+               bad_f_row[0], bad_f_row[1], bad_f_row[2], bad_f_row[3]);
+    }
     size_t diff = 0; double maxd = 0;
+    int shown = 0;
+    long long by_strip[8] = {0,0,0,0,0,0,0,0}, by_qmod[8] = {0,0,0,0,0,0,0,0};
     for (size_t i = 0; i < hv.size(); ++i) {
         double d = fabs((double)hv[i] - (double)hr[i]);
         if (d > 0) ++diff;
         if (d > maxd) maxd = d;
+        if (d > 0 && shown < 5 && hr[i] != 0.0f) {
+            size_t qq = i / m, rr = i % m;
+            printf("  mismatch q=%zu row=%zu fused=%.4f ref=%.4f\n",
+                   qq, rr, (double)hv[i], (double)hr[i]);
+            ++shown;
+        }
+        if (d > 0) {
+            by_strip[(i % m)/16 & 7]++;
+            by_qmod[(i / m) & 7]++;
+        }
     }
+    printf("  by_strip:");
+    for (int k2 = 0; k2 < 8; ++k2) printf(" %lld", by_strip[k2]);
+    printf("\n  by_qmod: ");
+    for (int k2 = 0; k2 < 8; ++k2) printf(" %lld", by_qmod[k2]);
+    printf("\n");
     printf("out diff %zu / %zu max=%.6f\n", diff, hv.size(), maxd);
+    {
+        long long by_strip[8] = {0}, by_qmod[8] = {0};
+        for (size_t i = 0; i < hv.size(); ++i) {
+            if (((uint32_t)0)) break;
+        }
+        (void)by_strip; (void)by_qmod;
+    }
     fflush(stdout);
     cudaFree(bank); cudaFree(vref);
     cudaStreamDestroy(st);
@@ -6010,7 +6183,10 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         static const int exp_blas_min_nt = paw_env_int("GGML_PAW_EXP_BLAS_MIN_NT", 128);
         // fully-fused trellis->wmma apply: no bank materialization, no host
         // sync; supersedes the chunked cuBLAS pipeline where it applies
-        static const bool exp_fused = paw_env_int("GGML_PAW_EXP_FUSED", 1) != 0;
+        // correct and graph-safe, but on RTX 3060 the cuBLAS split still
+        // beats it at large nt (see paw_fused_bench); flip when the kernel
+        // closes the activation-restage gap
+        static const bool exp_fused = paw_env_int("GGML_PAW_EXP_FUSED", 0) != 0;
         const bool use_fused = v8 && exp_fused && exp_ws && exp_gp &&
                                m % 16 == 0 && n_tok >= exp_blas_min_nt;
         const bool use_blas = v8 && exp_blas && exp_ws && exp_gp &&
@@ -6045,15 +6221,18 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             paw_timed(stream, std::string("exp_fused") + shp, [&]() {
                 if (p4) {
                     paw_launch(paw_exp_apply_kernel_fused<true, 4>, fparams,
-                        kept_d, (const void *) tlut->data, p4t.packed, p4t.levels,
+                        kept_d, (const half *) nullptr, (const void *) tlut->data,
+                        p4t.packed, p4t.levels,
                         (const int32_t *) scr_i, xg, scr_v,
-                        (const half *) gamma->data, m, n, n_groups);
+                        (const half *) gamma->data,
+                        (float *) nullptr, m, n, n_groups);
                 } else {
                     paw_launch(paw_exp_apply_kernel_fused<false, 4>, fparams,
-                        kept_d, (const void *) tlut->data,
+                        kept_d, (const half *) nullptr, (const void *) tlut->data,
                         (const uint32_t *) nullptr, (const float *) nullptr,
                         (const int32_t *) scr_i, xg, scr_v,
-                        (const half *) gamma->data, m, n, n_groups);
+                        (const half *) gamma->data,
+                        (float *) nullptr, m, n, n_groups);
                 }
             });
         } else if (!use_blas) {
