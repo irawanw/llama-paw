@@ -3267,7 +3267,10 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         cudaStreamCaptureStatus dcst = cudaStreamCaptureStatusNone;
         const bool dcap = cudaStreamIsCapturing(stream, &dcst) == cudaSuccess &&
                           dcst == cudaStreamCaptureStatusActive;
-        static const bool rt_ovl = paw_env_int("GGML_PAW_RT_DECODE_OVL", 1) != 0;
+        // default OFF: the two-half overlap produces corrupted logits after a
+        // long prefill (generation degenerates to repeated '?'); bisected to
+        // this commit. Re-enable only after the race is found.
+        static const bool rt_ovl = paw_env_int("GGML_PAW_RT_DECODE_OVL", 0) != 0;
         // voff applies only on the cublas path, which needs nt >= its own
         // threshold; below that keep the serial single-bank flow
         const bool ovl = rt_ovl && !dcap && m >= 2048 &&
