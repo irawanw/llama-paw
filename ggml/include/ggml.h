@@ -584,6 +584,7 @@ extern "C" {
         GGML_OP_PAW_HEAD_MM,
         GGML_OP_PAW_EMBED_GATHER,
         GGML_OP_PAW_MOE_REDUCE,
+        GGML_OP_PAW_V_REORDER,
 
         GGML_OP_UNARY,
 
@@ -2808,6 +2809,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * experts,
             struct ggml_tensor  * weights);
+
+    // row permutation for the v3 mach1 codec: within the row segment starting
+    // at seg_off (seg_rows = hd*K*r rows), out[(v*K + k)*hd + d] =
+    // in[(k*r + v)*hd + d]; all other rows copy through. y: [M, T] f32 contig.
+    GGML_API struct ggml_tensor * ggml_paw_v_reorder(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * y,
+            int seg_off, int hd, int K, int r);
 
     // DSA lightning indexer
     //

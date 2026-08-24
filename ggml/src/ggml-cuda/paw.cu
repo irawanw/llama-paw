@@ -7383,6 +7383,55 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 // supports_op — mirrors the Vulkan predicate (ggml-vulkan.cpp)
 //
 
+// --- PAW_V_REORDER --------------------------------------------------------
+//
+// Row permutation for the v3 mach1 codec. Within the segment starting at
+// seg_off (seg_rows = hd*K*r rows): out[(v*K + k)*hd + d] =
+// in[(k*r + v)*hd + d]. All other rows copy through. Replaces the
+// cont/permute/cont + concat chains the graph used per SSM layer.
+static __global__ void paw_v_reorder_kernel(
+        const float * GGML_CUDA_RESTRICT y,   // [M, T], rows y_stride floats apart
+        float       * GGML_CUDA_RESTRICT dst, // [M, T] packed
+        const int M, const int T, const int y_stride,
+        const int seg_off, const int hd, const int K, const int r) {
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t total = (int64_t) M*T;
+    if (idx >= total) {
+        return;
+    }
+    const int row = (int)(idx % M);
+    const int t   = (int)(idx / M);
+    int src_row = row;
+    const int j = row - seg_off;
+    if (j >= 0 && j < hd*K*r) {
+        const int v   = j / (K*hd);
+        const int rem = j % (K*hd);
+        const int k   = rem / hd;
+        const int d   = rem % hd;
+        src_row = seg_off + (k*r + v)*hd + d;
+    }
+    dst[idx] = y[(int64_t) t*y_stride + src_row];
+}
+
+void ggml_cuda_op_paw_v_reorder(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * y = dst->src[0];
+    GGML_ASSERT(y->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int seg_off = dst->op_params[0];
+    const int hd      = dst->op_params[1];
+    const int K       = dst->op_params[2];
+    const int r       = dst->op_params[3];
+
+    const int M     = (int) y->ne[0];
+    const int T     = (int) y->ne[1];
+    const int y_str = (int)(y->nb[1] / sizeof(float));
+    const int64_t total = (int64_t) M*T;
+    const int blocks = (int)((total + 255)/256);
+    paw_launch(paw_v_reorder_kernel,
+        ggml_cuda_kernel_launch_params(dim3(blocks, 1, 1), dim3(256, 1, 1), 0, ctx.stream()),
+        (const float *) y->data, (float *) dst->data, M, T, y_str, seg_off, hd, K, r);
+}
+
 bool ggml_cuda_paw_supported(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_PAW_EXP_MM:
@@ -7424,6 +7473,7 @@ bool ggml_cuda_paw_supported(const ggml_tensor * op) {
         case GGML_OP_PAW_EMBED_GATHER:
         case GGML_OP_PAW_EXP_MM_BATCH2:
         case GGML_OP_PAW_MOE_REDUCE:
+        case GGML_OP_PAW_V_REORDER:
             // shapes/types are enforced by the ggml builders
             return true;
         default:

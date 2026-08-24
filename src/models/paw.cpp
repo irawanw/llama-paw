@@ -495,21 +495,26 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_paw::graph::build_qkvz(
     }
     if (model.m1_layers[il].wqkv.rt_trellis && !rt_rows_mapped) {
         // v3: the grouped->tiled V-row reorder is not baked into the rotated
-        // codec, so permute the V segment of the output activations here
+        // codec, so permute the V segment of the output activations here.
+        // One fused row-permutation launch replaces the old
+        // cont + cont + permute + concat chain (the head rows copy through).
         const int64_t key_dim = hparams.ssm_d_state * hparams.ssm_n_group;
         const int64_t val_dim = hparams.ssm_d_state * hparams.ssm_dt_rank;
         const int64_t T = qkv_mixed->ne[1];
-        ggml_tensor * qk = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_mixed, 2*key_dim, T,
-                                                        qkv_mixed->nb[1], 0));
-        ggml_tensor * v  = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_mixed, val_dim, T,
-                                                        qkv_mixed->nb[1], 2*key_dim*sizeof(float)));
-        qkv_mixed = ggml_concat(ctx0, qk, v_tiled(v), 0);
+        const int64_t hd = hparams.ssm_d_state;
+        const int64_t Kg = hparams.ssm_n_group;
+        const int64_t rv = hparams.ssm_dt_rank / Kg;
+        ggml_tensor * qkv_seg = ggml_view_2d(ctx0, qkv_mixed, 2*key_dim + val_dim, T,
+                                             qkv_mixed->nb[1], 0);
+        qkv_mixed = ggml_paw_v_reorder(ctx0, qkv_seg, (int)(2*key_dim), (int)hd, (int)Kg, (int)rv);
     }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     if (model.m1_layers[il].wqkv_gate.rt_trellis && !rt_rows_mapped) {
-        z = v_tiled(z);   // v3: same reorder on the z gate rows
+        z = ggml_paw_v_reorder(ctx0, z, 0,
+                (int) hparams.ssm_d_state, (int) hparams.ssm_n_group,
+                (int)(hparams.ssm_dt_rank / hparams.ssm_n_group));   // v3: same reorder on the z gate rows
     }
     cb(z, "z", il);
 

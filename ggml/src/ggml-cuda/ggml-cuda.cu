@@ -2381,6 +2381,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_PAW_MOE_REDUCE:
             ggml_cuda_op_paw_moe_reduce(ctx, dst);
             break;
+        case GGML_OP_PAW_V_REORDER:
+            ggml_cuda_op_paw_v_reorder(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5286,6 +5289,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_PAW_HEAD_MM:
         case GGML_OP_PAW_EMBED_GATHER:
         case GGML_OP_PAW_MOE_REDUCE:
+        case GGML_OP_PAW_V_REORDER:
             return ggml_cuda_paw_supported(op);
 
         default:

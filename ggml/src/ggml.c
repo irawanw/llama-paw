@@ -1093,6 +1093,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "PAW_HEAD_MM",
     "PAW_EMBED_GATHER",
     "PAW_MOE_REDUCE",
+    "PAW_V_REORDER",
 
     "UNARY",
 
@@ -1110,7 +1111,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1235,7 +1236,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6734,6 +6735,30 @@ struct ggml_tensor * ggml_paw_moe_reduce(
     result->op     = GGML_OP_PAW_MOE_REDUCE;
     result->src[0] = experts;
     result->src[1] = weights;
+
+    return result;
+}
+
+// ggml_paw_v_reorder
+
+struct ggml_tensor * ggml_paw_v_reorder(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * y,
+        int seg_off, int hd, int K, int r) {
+    GGML_ASSERT(y->type == GGML_TYPE_F32);
+    GGML_ASSERT(y->nb[0] == sizeof(float));   // rows must be dense
+
+    const int seg_rows = hd*K*r;
+    GGML_ASSERT(seg_off >= 0 && seg_off + seg_rows <= y->ne[0]);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, y->ne);
+
+    result->op = GGML_OP_PAW_V_REORDER;
+    result->src[0] = y;
+    result->op_params[0] = seg_off;
+    result->op_params[1] = hd;
+    result->op_params[2] = K;
+    result->op_params[3] = r;
 
     return result;
 }
