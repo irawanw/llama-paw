@@ -2851,6 +2851,66 @@ static __global__ void paw_rt_gemv_u_kernel(
         scr_v[(int64_t) t*m + row] = acc;
     }
 }
+// fused rt_u + fp8-bank GEMV: the e5m2 twin of paw_rt_gemv_u_kernel. The
+// half-reading variant must not run against an fp8 cached bank, so when
+// GGML_PAW_RT_BANK_FP8=1 this kernel handles the fused path instead.
+static __global__ void paw_rt_gemv_u_fp8_kernel(
+        const uint8_t * GGML_CUDA_RESTRICT bank,  // [m, n] row-major e5m2
+        const float   * GGML_CUDA_RESTRICT su,    // [n]
+        const float   * GGML_CUDA_RESTRICT x,     // [nt, n] row-major
+        float         * GGML_CUDA_RESTRICT scr_v, // [nt, m] row-major
+        const int m, const int n, const int nt) {
+    __shared__ float sh[4096];
+    __shared__ float lut[256];
+
+    const int tid  = threadIdx.x;
+    if (tid < 256) {
+        lut[tid] = paw_e5m2_to_f32((uint8_t) tid);
+    }
+    __syncthreads();
+
+    const int row  = blockIdx.x*8 + (tid >> 5);
+    const int t    = blockIdx.z;
+    const int lane = tid & 31;
+
+    if (row >= m) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    for (int i = tid; i < n; i += 256) {
+        sh[i] = su[i] * x[(int64_t) t*n + i];
+    }
+    __syncthreads();
+    paw_fwht_block(sh, n, tid, 256);
+    const float sc = __fsqrt_rn((float) n);
+    for (int i = tid; i < n; i += 256) {
+        sh[i] = __fdiv_rn(sh[i], sc);
+    }
+    __syncthreads();
+
+    const uint8_t * W = bank + (int64_t) row*n;
+    const float4 * u4 = (const float4 *) sh;
+
+    float acc = 0.0f;
+    if (n % 4 == 0) {
+        const uint32_t * W4 = (const uint32_t *) W;
+        const int n4 = n/4;
+        for (int i = lane; i < n4; i += 32) {
+            const uint32_t w = W4[i];
+            const uint8_t * wb = (const uint8_t *) &w;
+            const float4 uu = u4[i];
+            acc += lut[wb[0]]*uu.x + lut[wb[1]]*uu.y + lut[wb[2]]*uu.z + lut[wb[3]]*uu.w;
+        }
+    } else {
+        for (int i = lane; i < n; i += 32) {
+            acc += lut[W[i]]*sh[i];
+        }
+    }
+    acc = warp_reduce_sum<32>(acc);
+    if (lane == 0) {
+        scr_v[(int64_t) t*m + row] = acc;
+    }
+}
 // bank GEMV. (1) u is staged in shared once per block, killing the 8x
 // redundant per-warp u re-reads that were inflating DRAM traffic past the
 // 32 MB bank. (2) the bank is read with __ldcs (evict-first streaming): it is
@@ -3190,7 +3250,8 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // computes u internally. Valid when the gemv geometry matches the kernel's
     // assumptions (n >= 256, n % 2 == 0, m % 8 == 0).
     static const bool rt_gemvu = paw_env_int("GGML_PAW_RT_GEMVU", 0) != 0;
-    const bool gemvu = k4 && !blocked && rt_gemvu && bank_cache && nt < dense_min_tok &&
+    const bool gemvu = k4 && !blocked && rt_gemvu && bank_cache && !paw_rt_bank_idx_on() &&
+                       nt < dense_min_tok &&
                        n >= 256 && n % 2 == 0 && m % 8 == 0;
 
     static const bool uout_noop = paw_env_int("GGML_PAW_UOUT_NOOP", 0) != 0;
@@ -3364,7 +3425,22 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         const half * dense_bank = idx ? paw_rt_idx_fp16_bank(bank, m, n) : (const half *) bank;
         static const bool rt_tc4     = paw_env_int("GGML_PAW_RT_TC", 8) == 4;
         static const bool rt_apply_mma = paw_env_int("GGML_PAW_RT_APPLY_MMA", 1) != 0;
-        if (idx && nt < dense_min_tok) {
+        if (gemvu) {
+            // fused rt_u + bank GEMV; the half-reading variant must not run
+            // against an fp8 cached bank, so pick the twin by bank format
+            paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
+            if (fp8) {
+                paw_launch(paw_rt_gemv_u_fp8_kernel,
+                    ggml_cuda_kernel_launch_params(dim3(m/8, 1, nt), dim3(256, 1, 1), 0, stream),
+                    (const uint8_t *) dense_bank, (const float *) su->data,
+                    (const float *) x->data, scr_v, m, n, nt);
+            } else {
+                paw_launch(paw_rt_gemv_u_kernel,
+                    ggml_cuda_kernel_launch_params(dim3(m/8, 1, nt), dim3(256, 1, 1), 0, stream),
+                    dense_bank, (const float *) su->data, (const float *) x->data, scr_v, m, n, nt);
+            }
+            });
+        } else if (idx && nt < dense_min_tok) {
             paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
             paw_launch(paw_rt_bank_gemv_idx80,
                 ggml_cuda_kernel_launch_params(dim3((m + 15)/16, 1, nt), dim3(512, 1, 1), 0, stream),
@@ -3386,11 +3462,7 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             // float4+shared variant: measured ~3.5 t/s gen gain on RTX 3060
             static const bool rt_gemv3 = paw_env_int("GGML_PAW_RT_GEMV3", 1) != 0;
             paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
-            if (gemvu) {
-                paw_launch(paw_rt_gemv_u_kernel,
-                    ggml_cuda_kernel_launch_params(dim3(m/8, 1, nt), dim3(256, 1, 1), 0, stream),
-                    dense_bank, (const float *) su->data, (const float *) x->data, scr_v, m, n, nt);
-            } else if (rt_gemv3 && n % 2 == 0) {
+            if (rt_gemv3 && n % 2 == 0) {
                 paw_launch(paw_rt_bank_gemv_v3,
                     ggml_cuda_kernel_launch_params(dim3((m + 15)/16, 1, nt), dim3(256, 1, 1), 0, stream),
                     dense_bank, (const float *) scr_u, scr_v, m, n, nt);
