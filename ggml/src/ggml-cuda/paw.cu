@@ -1742,13 +1742,13 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
 // so no shared-memory staging, no syncwarp in the loop, no cross-lane
 // exchange at all. Verified bit-exact against paw_rt_walk_qtip_rate_kernel
 // in an isolated probe before landing here.
-template <int WORDS>
+template <int WORDS, bool MT>
 static __global__ void paw_rt_walk_qtip_frag_kernel(
         const uint16_t * GGML_CUDA_RESTRICT trellis,
         const half     * GGML_CUDA_RESTRICT tlut,
-        const float    * GGML_CUDA_RESTRICT scr_u,
-        float          * GGML_CUDA_RESTRICT scr_v,
-        const int m, const int n) {
+        const float    * GGML_CUDA_RESTRICT scr_u,   // [nt, n]
+        float          * GGML_CUDA_RESTRICT scr_v,   // [nt, m]
+        const int m, const int n, const int nt) {
     constexpr int step = WORDS/8;
     const int wid  = threadIdx.x >> 5;
     const int tr   = blockIdx.x;
@@ -1772,10 +1772,26 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
 
     // B fragment: this K-step's (== this tile column's) 16 activation
     // values; the lane needs k in {tid4*2,+1, tid4*2+8,+9}
+    // The mma's B fragment is k16 x n8 and its column index IS groupID, so
+    // the eight columns can carry eight different tokens for one walk of the
+    // trellis. ncu says the walk is LSU-bound (l1tex 60.7%) with the tensor
+    // pipe idle at 9.1%: the gathers, not the MMA, are the cost, and the
+    // gather count per *token* is what multi-token divides. nt==1 keeps the
+    // old numerics exactly -- only column 0 is ever read out, and the other
+    // columns going to zero instead of a redundant copy cannot change it.
     auto load_b = [&](int ct, half2& h0, half2& h1) {
-        const float * ub = scr_u + ct*16;
-        h0 = __floats2half2_rn(ub[tid4*2 + 0], ub[tid4*2 + 1]);
-        h1 = __floats2half2_rn(ub[tid4*2 + 8], ub[tid4*2 + 9]);
+        if constexpr (!MT) {
+            const float * ub = scr_u + ct*16;
+            h0 = __floats2half2_rn(ub[tid4*2 + 0], ub[tid4*2 + 1]);
+            h1 = __floats2half2_rn(ub[tid4*2 + 8], ub[tid4*2 + 9]);
+        } else if (groupID < nt) {
+            const float * ub = scr_u + (int64_t) groupID*n + ct*16;
+            h0 = __floats2half2_rn(ub[tid4*2 + 0], ub[tid4*2 + 1]);
+            h1 = __floats2half2_rn(ub[tid4*2 + 8], ub[tid4*2 + 9]);
+        } else {
+            h0 = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
+            h1 = h0;
+        }
     };
     half2 hb0 = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
     half2 hb1 = hb0;
@@ -2009,9 +2025,24 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
             hb0 = nb0; hb1 = nb1;
         }
     }
-    if (tid4 == 0) {
-        atomicAdd(&scr_v[(size_t) tr*16 + groupID],      d0);
-        atomicAdd(&scr_v[(size_t) tr*16 + groupID + 8],  d2);
+    // D fragment m16n8: (row groupID, col 2*tid4) -> d0, (col 2*tid4+1) -> d1;
+    // rows groupID+8 -> d2/d3. Token t lives in column t, i.e. the lanes with
+    // tid4 == t>>1, taking the even/odd register of each row pair.
+    if constexpr (!MT) {
+        if (tid4 == 0) {
+            atomicAdd(&scr_v[(size_t) tr*16 + groupID],     d0);
+            atomicAdd(&scr_v[(size_t) tr*16 + groupID + 8], d2);
+        }
+    } else {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < nt && tid4 == (t >> 1)) {
+                const float vlo = (t & 1) ? d1 : d0;
+                const float vhi = (t & 1) ? d3 : d2;
+                atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID],     vlo);
+                atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID + 8], vhi);
+            }
+        }
     }
 }
 
@@ -2623,7 +2654,7 @@ static std::unordered_map<paw_bank_key, const void *, paw_bank_key_hash> paw_rt_
 template <int WORDS>
 static void paw_rt_walk_qtip_frag_dispatch(const uint16_t * trellis,
         const half * tlut, const float * scr_u, float * scr_v,
-        const int m, const int n, cudaStream_t stream) {
+        const int m, const int n, const int nt, cudaStream_t stream) {
     // enough blocks that no warp walks a long serial chain of tile columns
     // (measured neutral on PAW-27B -- small-m attention projections are not
     // on the critical path; kept for narrow-m payloads)
@@ -2637,11 +2668,17 @@ static void paw_rt_walk_qtip_frag_dispatch(const uint16_t * trellis,
         if (S < 1)         S = 1;
     }
     if (S > 1) {
-        CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) m*sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) nt*m*sizeof(float), stream));
     }
-    paw_launch(paw_rt_walk_qtip_frag_kernel<WORDS>,
-        ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
-        trellis, tlut, scr_u, scr_v, m, n);
+    if (nt <= 1) {
+        paw_launch((paw_rt_walk_qtip_frag_kernel<WORDS, false>),
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n, nt);
+    } else {
+        paw_launch((paw_rt_walk_qtip_frag_kernel<WORDS, true>),
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n, nt);
+    }
 }
 
 static void paw_rt_walk_qtip_rate_launch(const uint16_t * trellis,
@@ -3343,8 +3380,24 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // no cached-bank alternative at nt==1 (banking the whole dense FFN would
     // not fit VRAM), and the generic walk is ~10x slower per call
     static const bool rt_walk_qtip_dense = paw_env_int("GGML_PAW_RT_WALK_QTIP_DENSE", 1) != 0;
-    const bool use_qtip = nt == 1 && !debug_diff_on() &&
-                          (k4 ? rt_walk_qtip : rt_walk_qtip_dense);
+    // Multi-token walk: the frag kernel's eight mma B-columns can carry eight
+    // tokens for ONE walk of the trellis. The walk is 81% of a decode token
+    // and is LSU-gather bound (ncu: l1tex 60.7%, dram 16.0%, tensor 9.1%), so
+    // dividing the gathers across nt tokens is the only lever that scales --
+    // the gather:weight ratio is fixed by the codec at 1:2 and cannot be cut
+    // in place. Restricted to the dense frag path: the rate kernel is
+    // documented [nt=1, m] and the k4 payloads have their own bank cache.
+    // GGML_PAW_WALK_MT_MAX=1 disables and restores the nt==1-only behaviour.
+    static const int  walk_mt_max  = paw_env_int("GGML_PAW_WALK_MT_MAX", 8);
+    static const bool walk_frag_g  = paw_env_int("GGML_PAW_WALK_FRAG", 1) != 0;
+    static const bool walk_noop_g  = paw_env_int("GGML_PAW_WALK_NOOP", 0) != 0;
+    static const bool walk_skip_g  = paw_env_int("GGML_PAW_WALK_SKIP_M_ON", 0) != 0;
+    const bool qtip_mt = !k4 && rt_walk_qtip_dense && walk_frag_g &&
+                         !walk_noop_g && !walk_skip_g &&
+                         nt > 1 && nt <= walk_mt_max;
+    const bool use_qtip = (nt == 1 && (k4 ? rt_walk_qtip : rt_walk_qtip_dense) &&
+                           !debug_diff_on()) ||
+                          (qtip_mt && !debug_diff_on());
     if (use_qtip) {
         static int debug_calls = 0;
         static const bool debug_diff = paw_env_int("GGML_PAW_RT_WALK_QTIP_DEBUG", 0) != 0;
@@ -3412,11 +3465,11 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) m*sizeof(float), stream));
             switch (rt_words) {
                 case 24: paw_rt_walk_qtip_frag_dispatch<24>((const uint16_t *) trellis->data,
-                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, nt, stream); break;
                 case 32: paw_rt_walk_qtip_frag_dispatch<32>((const uint16_t *) trellis->data,
-                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, nt, stream); break;
                 default: paw_rt_walk_qtip_frag_dispatch<16>((const uint16_t *) trellis->data,
-                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, nt, stream); break;
             }
             #define PAW_FRAG_DBG(WG) \
                 switch (rt_words) { \
@@ -3457,20 +3510,20 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             if (seen.find(key) == std::string::npos) { seen += key; fprintf(stderr, "[walk-shape]%s\n", key.c_str()); }
         }
         if (!walk_noop && !walk_skip && walk_frag) {
-            CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) m*sizeof(float), stream));
+            CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) nt*m*sizeof(float), stream));
             switch (rt_words) {
                 case 16: paw_rt_walk_qtip_frag_dispatch<16>((const uint16_t *) trellis->data,
-                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, nt, stream); break;
                 case 24: paw_rt_walk_qtip_frag_dispatch<24>((const uint16_t *) trellis->data,
-                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, nt, stream); break;
                 case 32: paw_rt_walk_qtip_frag_dispatch<32>((const uint16_t *) trellis->data,
-                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, nt, stream); break;
                 case 40: paw_rt_walk_qtip_frag_dispatch<40>((const uint16_t *) trellis->data,
-                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, nt, stream); break;
                 case 56: paw_rt_walk_qtip_frag_dispatch<56>((const uint16_t *) trellis->data,
-                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, nt, stream); break;
                 case 64: paw_rt_walk_qtip_frag_dispatch<64>((const uint16_t *) trellis->data,
-                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, stream); break;
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, m, n, nt, stream); break;
                 default: GGML_ABORT("paw: unsupported trellis rate for frag walk");
             }
         } else if (!walk_noop && !walk_skip) paw_timed(stream, std::string("rt_walk_qtip") + shp, [&]() {
