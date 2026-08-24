@@ -2462,7 +2462,13 @@ static void paw_launch_rt_apply_mma(ggml_backend_cuda_context & ctx,
         return;
     }
     GGML_ASSERT(voff == 0 && "row-offset apply only supported on the cublas path");
-    if (m % 64 == 0) {
+    // The WS-mma kernel tiles tokens by 128; at DFlash verify sizes (nt ~ 8)
+    // nearly the whole tile is padding and the lane regresses ~45% versus the
+    // scalar apply (188.9 -> 105 tok/s code-lane, bisected to 05b8814). Keep
+    // mma for the large-batch shapes it wins; hand small ubatches to the
+    // scalar kernel<8> path. GGML_PAW_APPLY_MMA_MIN_TOK overrides the cutoff.
+    static const int mma_min_tok = paw_env_int("GGML_PAW_APPLY_MMA_MIN_TOK", 32);
+    if (m % 64 == 0 && nt >= mma_min_tok) {
         paw_launch(paw_rt_apply_kernel_mma,
             ggml_cuda_kernel_launch_params(dim3(m/64, 1, (nt + 127)/128), dim3(128, 1, 1), 0, stream),
             bank, scr_u, scr_v, m, n, nt);
