@@ -1742,7 +1742,50 @@ static __global__ void paw_rt_walk_qtip_rate_kernel(
 // so no shared-memory staging, no syncwarp in the loop, no cross-lane
 // exchange at all. Verified bit-exact against paw_rt_walk_qtip_rate_kernel
 // in an isolated probe before landing here.
+// The HYB codebook gather is what this kernel is bound on: ncu puts l1tex at
+// 60.7% with dram at 16.0% and the tensor pipe at 9.1%.  Reading `tlut` from
+// global memory is 32 divergent addresses into a 2 KiB table, which the
+// coalescer cannot merge -- ~25 distinct sectors, so the LSU replays the one
+// instruction that matters ~25 times, four times per lane per mma.
+//
+// QTIP's own kernel (Cornell-RelaxML/qtip, qtip-kernels/src/inference.cu:352)
+// duplicates the codebook 32x in shared memory, one private copy per lane:
+//     masked_idx = (idx & 0b0111111111000000) | (laneId << 1)
+// so the half2 index is (row << 5) | lane and the bank is
+// (row*32 + lane) % 32 == lane -- a distinct bank per lane for *every* row,
+// conflict-free by construction.  QTIP S4: "2KiB codebook, which fits in L1
+// cache even after duplication for bank conflicts (32x)".  The duplication is
+// free in instruction count: the `| lane` replaces the `>> 6`.
+//
+// Staging alone (one shared copy, no duplication) was measured earlier and is
+// a null -- it trades a global replay for a ~4-way bank replay.  Replication,
+// not relocation, is the fix.
+//
+// 64 KiB of shared forces one block per SM, so the block is widened from 8 to
+// 32 warps to hold occupancy, matching QTIP's BLOCK_SIZE 1024 with
+// __launch_bounds__(BLOCK_SIZE, 1).
+// Replication factor is a tradeoff, not a constant.  ncu on the 32x/1024-thread
+// build: shared bank conflicts 0 and global sectors/request 1.01 -- the gather
+// is exactly as clean as intended -- but l1tex only fell 60.68% -> 59.14% and
+// the time did not move, because 64 KiB of shared plus 40 regs/thread pins one
+// block per SM and warps_active fell 73.4% -> 62.6%.  The counters also show
+// why the ceiling was low: global loads outnumber shared loads 1,234,944 to
+// 491,520, so the codebook gather was only ~28% of LSU instructions and could
+// never have been the whole 81%.
+//
+// 16 copies at 512 threads restores full occupancy: 32 KiB and 40 regs both
+// allow 3 blocks/SM = 1536 threads = 48 warps, the SM 8.6 maximum.  Lanes l
+// and l+16 share a copy, so a conflict needs row_l == row_{l+16} (mod 2) --
+// ~1.5 wavefronts expected instead of 1.0, against a 1.5x occupancy gain.
+#define PAW_WALK_COPIES 16
+#define PAW_WALK_LOG2C  4
+#define PAW_WALK_WPB    16                             // warps per block
+#define PAW_WALK_NTHR   (32*PAW_WALK_WPB)              // 512 threads
+#define PAW_WALK_BPSM   3                              // blocks per SM
+#define PAW_WALK_CBSZ   ((size_t) 512*PAW_WALK_COPIES*sizeof(uint32_t))
+
 template <int WORDS, bool MT>
+__launch_bounds__(PAW_WALK_NTHR, PAW_WALK_BPSM)
 static __global__ void paw_rt_walk_qtip_frag_kernel(
         const uint16_t * GGML_CUDA_RESTRICT trellis,
         const half     * GGML_CUDA_RESTRICT tlut,
@@ -1754,6 +1797,23 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
     const int tr   = blockIdx.x;
     const int lane = threadIdx.x & 31;
     const int tiles_y = n / 16;
+
+    // 32 private lane-copies of the 512-entry half2 codebook.  The XOR
+    // swizzle on the write side keeps the fill itself conflict-free (all 32
+    // lanes would otherwise hit one bank at each c); permuting c is harmless
+    // because every c is written.
+    extern __shared__ uint32_t paw_smem_cb[];
+    {
+        const uint32_t * GGML_CUDA_RESTRICT cb = (const uint32_t *) tlut;
+        const int sw = lane & (PAW_WALK_COPIES - 1);
+        for (int r = threadIdx.x; r < 512; r += PAW_WALK_NTHR) {
+            const uint32_t v = cb[r];
+#pragma unroll
+            for (int c = 0; c < PAW_WALK_COPIES; ++c)
+                paw_smem_cb[(r << PAW_WALK_LOG2C) | (c ^ sw)] = v;
+        }
+    }
+    __syncthreads();
     const int groupID = lane >> 2;
     const int tid4    = lane & 3;
 
@@ -1780,14 +1840,18 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
     // old numerics exactly -- only column 0 is ever read out, and the other
     // columns going to zero instead of a redundant copy cannot change it.
     auto load_b = [&](int ct, half2& h0, half2& h1) {
+        // ub + tid4*2 and +8 are each two consecutive floats, 8-byte aligned
+        // (n is a multiple of 16), so one LDG.64 each replaces two LDG.32.
+        auto pack = [&](const float * ub, half2& a, half2& b) {
+            const float2 v0 = *(const float2 *)(const void *)(ub + tid4*2);
+            const float2 v1 = *(const float2 *)(const void *)(ub + tid4*2 + 8);
+            a = __floats2half2_rn(v0.x, v0.y);
+            b = __floats2half2_rn(v1.x, v1.y);
+        };
         if constexpr (!MT) {
-            const float * ub = scr_u + ct*16;
-            h0 = __floats2half2_rn(ub[tid4*2 + 0], ub[tid4*2 + 1]);
-            h1 = __floats2half2_rn(ub[tid4*2 + 8], ub[tid4*2 + 9]);
+            pack(scr_u + ct*16, h0, h1);
         } else if (groupID < nt) {
-            const float * ub = scr_u + (int64_t) groupID*n + ct*16;
-            h0 = __floats2half2_rn(ub[tid4*2 + 0], ub[tid4*2 + 1]);
-            h1 = __floats2half2_rn(ub[tid4*2 + 8], ub[tid4*2 + 9]);
+            pack(scr_u + (int64_t) groupID*n + ct*16, h0, h1);
         } else {
             h0 = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
             h1 = h0;
@@ -1817,9 +1881,11 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
         const uint32_t st = off == 0 ? lo
             : (((lo << off) | (hi >> (16 - off))) & 0xFFFFu);
         const uint32_t ph  = st*(st + 1u);
-        const uint32_t row = (ph >> 6) & 511u;
-        const uint32_t pair = *(const uint32_t*)(const void*)(tlut + 2*row);
-        return (ph & 0x8000u) ? (pair ^ 0x00008000u) : pair;
+        // ((ph >> 6) & 511) << LOG2C | (lane % COPIES), one shift + and + or
+        const uint32_t pair = paw_smem_cb[
+            ((ph >> (6 - PAW_WALK_LOG2C)) & (511u << PAW_WALK_LOG2C))
+            | (lane & (PAW_WALK_COPIES - 1))];
+        return pair ^ (ph & 0x8000u);   // == (ph & 0x8000) ? pair ^ 0x8000 : pair
     };
 
     auto load_at = [&](int64_t tw, uint32_t (&a)[2][2], uint32_t (&b)[2][2]) {
@@ -1835,19 +1901,19 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
     // strided subset of its columns (small-m matrices otherwise leave the
     // machine idle); partials fold through the atomicAdd epilogue
     float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
-    const int ct_first = wid + 8*(int) blockIdx.y;
+    const int ct_first = wid + PAW_WALK_WPB*(int) blockIdx.y;
 
     if constexpr (WORDS == 16) {
         uint32_t L0, H0, L8, H8, nL0, nH0, nL8, nH8;
         L0 = H0 = L8 = H8 = nL0 = nH0 = nL8 = nH8 = 0;
-        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8);
+        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + PAW_WALK_WPB - 1)/PAW_WALK_WPB);
         if (has) {
             const int64_t tw = (int64_t) tr*tiles_y*WORDS + ct_first*WORDS;
             fetch_pair(tw, groupID, L0, H0);
             fetch_pair(tw, (groupID + 8) % WORDS, L8, H8);
         }
-        for (int ct = ct_first; ct < tiles_y; ct += 8*gridDim.y) {
-            const int ctn = ct + 8*gridDim.y;
+        for (int ct = ct_first; ct < tiles_y; ct += PAW_WALK_WPB*gridDim.y) {
+            const int ctn = ct + PAW_WALK_WPB*gridDim.y;
             if (ctn < tiles_y) {
                 const int64_t twn = (int64_t) tr*tiles_y*WORDS + ctn*WORDS;
                 fetch_pair(twn, groupID, nL0, nH0);
@@ -1877,7 +1943,7 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
         uint32_t L0, H0, X0, L8, H8, X8, nL0, nH0, nX0, nL8, nH8, nX8;
         uint32_t o0[2], o2[2]; int u0[2], u2[2];
         L0=H0=X0=L8=H8=X8=nL0=nH0=nX0=nL8=nH8=nX8=0;
-        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8);
+        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + PAW_WALK_WPB - 1)/PAW_WALK_WPB);
 #pragma unroll
         for (int k = 0; k < 2; ++k) {
             const int bk = 3*(8*rrows[k] + tid4);
@@ -1895,8 +1961,8 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
             X8 = __ldg(trellis + tw + ((u0[1] + 2) % WORDS));
             (void) u2; (void) o2;
         }
-        for (int ct = ct_first; ct < tiles_y; ct += 8*gridDim.y) {
-            const int ctn = ct + 8*gridDim.y;
+        for (int ct = ct_first; ct < tiles_y; ct += PAW_WALK_WPB*gridDim.y) {
+            const int ctn = ct + PAW_WALK_WPB*gridDim.y;
             if (ctn < tiles_y) {
                 const int64_t twn = (int64_t) tr*tiles_y*WORDS + ctn*WORDS;
                 fetch_pair(twn, u0[0], nL0, nH0);
@@ -1937,7 +2003,7 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
         uint32_t L0, H0, X0, L8, H8, X8, nL0, nH0, nX0, nL8, nH8, nX8;
         uint32_t ov[2]; int uv[2];
         L0=H0=X0=L8=H8=X8=nL0=nH0=nX0=nL8=nH8=nX8=0;
-        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8);
+        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + PAW_WALK_WPB - 1)/PAW_WALK_WPB);
 #pragma unroll
         for (int k = 0; k < 2; ++k) {
             const int b = 4*(8*rrows[k] + tid4);
@@ -1951,8 +2017,8 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
             X0 = __ldg(trellis + tw + ((uv[0] + 2) % WORDS));
             X8 = __ldg(trellis + tw + ((uv[1] + 2) % WORDS));
         }
-        for (int ct = ct_first; ct < tiles_y; ct += 8*gridDim.y) {
-            const int ctn = ct + 8*gridDim.y;
+        for (int ct = ct_first; ct < tiles_y; ct += PAW_WALK_WPB*gridDim.y) {
+            const int ctn = ct + PAW_WALK_WPB*gridDim.y;
             if (ctn < tiles_y) {
                 const int64_t twn = (int64_t) tr*tiles_y*WORDS + ctn*WORDS;
                 fetch_pair(twn, uv[0], nL0, nH0);
@@ -1984,11 +2050,11 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
         }
     } else {
         uint32_t c0[2][2], c1[2][2];
-        if (wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + 7)/8))
+        if (wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + PAW_WALK_WPB - 1)/PAW_WALK_WPB))
             load_at((int64_t) tr*tiles_y*WORDS + ct_first*WORDS, c0, c1);
 
-        for (int ct = ct_first; ct < tiles_y; ct += 8*gridDim.y) {
-            const int ctn = ct + 8*gridDim.y;
+        for (int ct = ct_first; ct < tiles_y; ct += PAW_WALK_WPB*gridDim.y) {
+            const int ctn = ct + PAW_WALK_WPB*gridDim.y;
             uint32_t n0[2][2], n1[2][2];
             if (ctn < tiles_y) load_at((int64_t) tr*tiles_y*WORDS + ctn*WORDS, n0, n1);
             half2 nb0 = hb0, nb1 = hb1;
@@ -2670,13 +2736,31 @@ static void paw_rt_walk_qtip_frag_dispatch(const uint16_t * trellis,
     if (S > 1) {
         CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) nt*m*sizeof(float), stream));
     }
+    // 64 KiB of dynamic shared is above the 48 KiB default and has to be
+    // opted into per kernel (once per instantiation).
     if (nt <= 1) {
+        static bool set_f = false;
+        if (!set_f) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                (const void *) paw_rt_walk_qtip_frag_kernel<WORDS, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int) PAW_WALK_CBSZ));
+            set_f = true;
+        }
         paw_launch((paw_rt_walk_qtip_frag_kernel<WORDS, false>),
-            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1),
+                dim3(PAW_WALK_NTHR, 1, 1), PAW_WALK_CBSZ, stream),
             trellis, tlut, scr_u, scr_v, m, n, nt);
     } else {
+        static bool set_t = false;
+        if (!set_t) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                (const void *) paw_rt_walk_qtip_frag_kernel<WORDS, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int) PAW_WALK_CBSZ));
+            set_t = true;
+        }
         paw_launch((paw_rt_walk_qtip_frag_kernel<WORDS, true>),
-            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1),
+                dim3(PAW_WALK_NTHR, 1, 1), PAW_WALK_CBSZ, stream),
             trellis, tlut, scr_u, scr_v, m, n, nt);
     }
 }
