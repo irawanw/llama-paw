@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "paw.cuh"
+#include "cp-async.cuh"
 #include <cstring>
 #include <mma.h>
 #include <cooperative_groups.h>
@@ -2112,6 +2113,198 @@ static __global__ void paw_rt_walk_qtip_frag_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Staged walk: cp.async the trellis into shared, then walk out of shared.
+//
+// Why this kernel exists. ncu on the frag walk says global/L2 memory latency
+// is 36.8-54.1% of stalls while DRAM runs at ~20% of peak (6.435 GB/token in
+// 33.6 ms = 191 GB/s of 936). Those coexist because of bytes per load
+// instruction: at 1.0-1.26 sectors/request each LDG moves ~32 bytes for the
+// whole warp, since all 32 lanes are picking bits out of one 32-48 byte tile.
+// No instruction rate the SM can issue turns that into bandwidth. Four
+// attempts that did not address this were null or negative -- see
+// reports/paw27b_speed_baseline_20260824.md.
+//
+// For a fixed output row-block tr the tiles ct = 0..tiles_y-1 are CONTIGUOUS
+// in the payload (tr*tiles_y*WORDS + ct*WORDS), so a whole chunk of them can
+// be pulled in with 16-byte-per-thread cp.async: 512 threads x 16 B = 8 KiB
+// per issue, perfectly coalesced, instead of ~6-8 narrow LDG per tile. Every
+// shipped rate has a tile size divisible by 16 bytes (WORDS*2 = 32/48/64), so
+// both ends stay aligned for any tile count.
+//
+// The codebook drops to 8 copies (16 KiB) to leave room: bank conflicts on
+// that gather are worth ~1.8% of stalls, so trading a little of it for the
+// staging buffer is the right side of the trade.
+// Tile columns per chunk, picked per rate so the staging buffer stays ~7.5 KiB
+// (a tile is WORDS*2 bytes), and a multiple of the warp count so every warp
+// gets whole tiles. 16 KiB codebook + 2 x ~7.5 KiB still leaves 3 blocks/SM.
+template <int WORDS> struct paw_stage_tiles { static constexpr int v = 160; };
+template <> struct paw_stage_tiles<16> { static constexpr int v = 240; };  // 7680 B
+template <> struct paw_stage_tiles<24> { static constexpr int v = 160; };  // 7680 B
+template <> struct paw_stage_tiles<32> { static constexpr int v = 112; };  // 7168 B
+#define PAW_STAGE_COPIES 8
+#define PAW_STAGE_LOG2C  3
+
+static __device__ __forceinline__ void paw_cp_commit() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.commit_group;");
+#endif
+}
+template <int N>
+static __device__ __forceinline__ void paw_cp_wait_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.wait_group %0;" :: "n"(N));
+#endif
+}
+
+template <int WORDS, bool MT>
+__launch_bounds__(PAW_WALK_NTHR, PAW_WALK_BPSM)
+static __global__ void paw_rt_walk_qtip_stage_kernel(
+        const uint16_t * GGML_CUDA_RESTRICT trellis,
+        const half     * GGML_CUDA_RESTRICT tlut,
+        const float    * GGML_CUDA_RESTRICT scr_u,   // [nt, n]
+        float          * GGML_CUDA_RESTRICT scr_v,   // [nt, m]
+        const int m, const int n, const int nt) {
+    static_assert(WORDS == 16 || WORDS == 24 || WORDS == 32,
+                  "staged walk covers the shipped rates only");
+    const int wid     = threadIdx.x >> 5;
+    const int tr      = blockIdx.x;
+    const int lane    = threadIdx.x & 31;
+    const int tiles_y = n / 16;
+    const int groupID = lane >> 2;
+    const int tid4    = lane & 3;
+
+    constexpr int CB_U32  = 512*PAW_STAGE_COPIES;
+    constexpr int TILES   = paw_stage_tiles<WORDS>::v;
+    constexpr int CHUNK_W = TILES*WORDS;                // uint16 per buffer
+
+    extern __shared__ uint32_t paw_stage_smem[];
+    uint32_t * GGML_CUDA_RESTRICT cb  = paw_stage_smem;
+    uint16_t * GGML_CUDA_RESTRICT tsm = (uint16_t *)(paw_stage_smem + CB_U32);
+
+    {   // 8 lane-copies of the codebook, XOR-swizzled writes
+        const uint32_t * GGML_CUDA_RESTRICT src = (const uint32_t *) tlut;
+        const int sw = lane & (PAW_STAGE_COPIES - 1);
+        for (int r = threadIdx.x; r < 512; r += PAW_WALK_NTHR) {
+            const uint32_t v = src[r];
+#pragma unroll
+            for (int c = 0; c < PAW_STAGE_COPIES; ++c)
+                cb[(r << PAW_STAGE_LOG2C) | (c ^ sw)] = v;
+        }
+    }
+
+    // Same window math as the frag kernel: state (ri, j) starts at bit
+    // step*(8*ri + j) with step = WORDS/8, and the j+4 state starts
+    // 2*step*4 bits later. Only the wrap indices differ per rate.
+    constexpr int step = WORDS/8;
+    const int rrows[2] = {groupID, groupID + 8};
+    uint32_t o0[2], o2[2]; int u0[2], u1w[2], uxw[2];
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int bk = step*(8*rrows[k] + tid4);
+        u0[k]  = (bk >> 4) % WORDS;
+        o0[k]  = bk & 15u;
+        o2[k]  = (o0[k] + 4*step) & 15u;
+        u1w[k] = (u0[k] + 1) % WORDS;
+        uxw[k] = (u0[k] + 2) % WORDS;
+    }
+
+    auto dec_state = [&](uint32_t lo, uint32_t hi, int off) {
+        const uint32_t st = off == 0 ? lo
+            : (((lo << off) | (hi >> (16 - off))) & 0xFFFFu);
+        const uint32_t ph = st*(st + 1u);
+        const uint32_t pair = cb[((ph >> (6 - PAW_STAGE_LOG2C)) & (511u << PAW_STAGE_LOG2C))
+                                 | (lane & (PAW_STAGE_COPIES - 1))];
+        return pair ^ (ph & 0x8000u);
+    };
+    auto load_b = [&](int ct, half2& h0, half2& h1) {
+        auto pack = [&](const float * ub) {
+            const float2 v0 = *(const float2 *)(const void *)(ub + tid4*2);
+            const float2 v1 = *(const float2 *)(const void *)(ub + tid4*2 + 8);
+            h0 = __floats2half2_rn(v0.x, v0.y);
+            h1 = __floats2half2_rn(v1.x, v1.y);
+        };
+        if constexpr (!MT) {
+            pack(scr_u + ct*16);
+        } else if (groupID < nt) {
+            pack(scr_u + (int64_t) groupID*n + ct*16);
+        } else {
+            h0 = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
+            h1 = h0;
+        }
+    };
+
+    const uint16_t * GGML_CUDA_RESTRICT base = trellis + (int64_t) tr*tiles_y*WORDS;
+    auto issue = [&](int buf, int c0) {
+        const int tiles = (tiles_y - c0) < TILES ? (tiles_y - c0) : TILES;
+        if (tiles <= 0) return;
+        const int bytes = tiles*WORDS*2;                 // WORDS*2 == 48, a multiple of 16
+        char       * dstb = (char *)(tsm + buf*CHUNK_W);
+        const char * srcb = (const char *)(base + (int64_t) c0*WORDS);
+        for (int off = threadIdx.x*16; off < bytes; off += PAW_WALK_NTHR*16)
+            cp_async_cg_16<128>(ggml_cuda_cvta_generic_to_shared(dstb + off), srcb + off);
+    };
+
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+
+    issue(0, 0); paw_cp_commit();
+    int buf = 0;
+    for (int c0 = 0; c0 < tiles_y; c0 += TILES, buf ^= 1) {
+        const int nxt = c0 + TILES;
+        if (nxt < tiles_y) { issue(buf ^ 1, nxt); paw_cp_commit(); paw_cp_wait_group<1>(); }
+        else               { paw_cp_wait_group<0>(); }
+        __syncthreads();
+
+        const uint16_t * GGML_CUDA_RESTRICT sh = tsm + buf*CHUNK_W;
+        const int lim = (tiles_y - c0) < TILES ? (tiles_y - c0) : TILES;
+        for (int l = wid; l < lim; l += PAW_WALK_WPB) {
+            const uint16_t * GGML_CUDA_RESTRICT tw = sh + l*WORDS;
+            half2 hb0, hb1;
+            load_b(c0 + l, hb0, hb1);
+            const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+            uint32_t ra[4];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const uint32_t lo = tw[u0[k]], hi = tw[u1w[k]];
+                ra[k + 2*0] = dec_state(lo, hi, o0[k]);
+                if constexpr (WORDS == 16) {
+                    // step 2: both j and j+4 sit inside the same unit pair
+                    ra[k + 2*1] = dec_state(lo, hi, o2[k]);
+                } else {
+                    // step 3 and 4 can run past the pair into one more unit
+                    const uint32_t xx = tw[uxw[k]];
+                    ra[k + 2*1] = ((o0[k] + 4*step) >> 4)
+                        ? dec_state(hi, xx, o2[k])
+                        : dec_state(lo, hi, o2[k]);
+                }
+            }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+        }
+        __syncthreads();
+    }
+
+    if constexpr (!MT) {
+        if (tid4 == 0) {
+            atomicAdd(&scr_v[(size_t) tr*16 + groupID],     d0);
+            atomicAdd(&scr_v[(size_t) tr*16 + groupID + 8], d2);
+        }
+    } else {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < nt && tid4 == (t >> 1)) {
+                const float vlo = (t & 1) ? d1 : d0;
+                const float vhi = (t & 1) ? d3 : d2;
+                atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID],     vlo);
+                atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID + 8], vhi);
+            }
+        }
+    }
+}
+
 // dense prefill: decode the K4/V2 trellis ONCE into an fp16 bank [m, n] —
 // one thread per (tile, tile-row), same window/state math as rt_walk, same
 // pre-rounded tlut halves (sign flip is exact), then apply the bank with a
@@ -2735,6 +2928,37 @@ static void paw_rt_walk_qtip_frag_dispatch(const uint16_t * trellis,
     }
     if (S > 1) {
         CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) nt*m*sizeof(float), stream));
+    }
+    // Staged walk (cp.async the trellis into shared). w24 alone measured
+    // +12.0% on tg64 (23.88 -> 26.75) with byte-identical output, so it is
+    // extended to the other two shipped rates here.
+    static const bool stage_on = paw_env_int("GGML_PAW_WALK_STAGE", 1) != 0;
+    if constexpr (WORDS == 16 || WORDS == 24 || WORDS == 32) {
+        if (stage_on && S == 1) {
+            constexpr size_t stage_smem =
+                (size_t) 512*PAW_STAGE_COPIES*sizeof(uint32_t)
+                + (size_t) 2*paw_stage_tiles<WORDS>::v*WORDS*sizeof(uint16_t);
+            if (nt <= 1) {
+                static bool sf = false;
+                if (!sf) { CUDA_CHECK(cudaFuncSetAttribute(
+                    (const void *) paw_rt_walk_qtip_stage_kernel<WORDS, false>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int) stage_smem)); sf = true; }
+                paw_launch((paw_rt_walk_qtip_stage_kernel<WORDS, false>),
+                    ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1),
+                        dim3(PAW_WALK_NTHR, 1, 1), stage_smem, stream),
+                    trellis, tlut, scr_u, scr_v, m, n, nt);
+            } else {
+                static bool st = false;
+                if (!st) { CUDA_CHECK(cudaFuncSetAttribute(
+                    (const void *) paw_rt_walk_qtip_stage_kernel<WORDS, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int) stage_smem)); st = true; }
+                paw_launch((paw_rt_walk_qtip_stage_kernel<WORDS, true>),
+                    ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1),
+                        dim3(PAW_WALK_NTHR, 1, 1), stage_smem, stream),
+                    trellis, tlut, scr_u, scr_v, m, n, nt);
+            }
+            return;
+        }
     }
     // 64 KiB of dynamic shared is above the 48 KiB default and has to be
     // opted into per kernel (once per instantiation).
