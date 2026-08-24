@@ -3676,11 +3676,22 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         }
     }
 
-    // K=4 fused walk. Was off because it only matched the decode-to-bank +
-    // bank-GEMV path it replaces (76.95 vs 75.45 tg64 on PAW-35B). With the
-    // cp.async staged walk covering WORDS=64 it is 84.54, +12.0% over the
-    // bank path, and greedy output is identical.
-    static const bool rt_walk_qtip = paw_env_int("GGML_PAW_RT_WALK_QTIP", 1) != 0;
+    // K=4 fused walk, OFF by default -- and it must stay off.
+    //
+    // Measured +12.0% on PAW-35B (75.45 -> 84.54 tg64) and that number was an
+    // artifact of benchmarking without the model's own serving flags. PAW-35B
+    // ships every codec optimization opt-in and default-off (see
+    // PAW-weights/SERVING.md and artifacts/mach1_reverse/v14/serve_best.sh);
+    // with GGML_PAW_RT_BATCH and GGML_PAW_RT_BANK_IDX on, as they are meant to
+    // be, the decode-to-bank path this replaces is *faster*:
+    //
+    //   tuned config, AR, no drafter:   qtip=0  92.37   qtip=1  90.53
+    //   tuned config, dflash2 drafter:  qtip=0  84.81   qtip=1  84.80
+    //
+    // The staged WORDS=64 walk below is kept and still works, but it only ever
+    // runs at nt == 1, which the drafter bypasses, and it loses to a properly
+    // batched bank path. Turn it on only with a measurement to justify it.
+    static const bool rt_walk_qtip = paw_env_int("GGML_PAW_RT_WALK_QTIP", 0) != 0;
     const bool bank_cache = paw_bank_cache_on();
 
     // u-fused gemv: skip the separate rt_u launch entirely; the gemv kernel
