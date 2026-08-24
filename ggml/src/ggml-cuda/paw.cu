@@ -2142,6 +2142,7 @@ template <int WORDS> struct paw_stage_tiles { static constexpr int v = 160; };
 template <> struct paw_stage_tiles<16> { static constexpr int v = 240; };  // 7680 B
 template <> struct paw_stage_tiles<24> { static constexpr int v = 160; };  // 7680 B
 template <> struct paw_stage_tiles<32> { static constexpr int v = 112; };  // 7168 B
+template <> struct paw_stage_tiles<64> { static constexpr int v =  64; };  // 8192 B
 #define PAW_STAGE_COPIES 8
 #define PAW_STAGE_LOG2C  3
 
@@ -2165,7 +2166,7 @@ static __global__ void paw_rt_walk_qtip_stage_kernel(
         const float    * GGML_CUDA_RESTRICT scr_u,   // [nt, n]
         float          * GGML_CUDA_RESTRICT scr_v,   // [nt, m]
         const int m, const int n, const int nt) {
-    static_assert(WORDS == 16 || WORDS == 24 || WORDS == 32,
+    static_assert(WORDS == 16 || WORDS == 24 || WORDS == 32 || WORDS == 64,
                   "staged walk covers the shipped rates only");
     const int wid     = threadIdx.x >> 5;
     const int tr      = blockIdx.x;
@@ -2199,14 +2200,32 @@ static __global__ void paw_rt_walk_qtip_stage_kernel(
     constexpr int step = WORDS/8;
     const int rrows[2] = {groupID, groupID + 8};
     uint32_t o0[2], o2[2]; int u0[2], u1w[2], uxw[2];
+    int gw0[2][2], gw1[2][2]; uint32_t gof[2][2];
+    if constexpr (WORDS == 64) {
+        // generic window, one independent unit pair per (row-group, j-pair):
+        // at step 8 the j+4 state is two units on at the same offset, so the
+        // 16/24/32 shortcut (which reuses u+1,u+2) does not hold.
 #pragma unroll
-    for (int k = 0; k < 2; ++k) {
-        const int bk = step*(8*rrows[k] + tid4);
-        u0[k]  = (bk >> 4) % WORDS;
-        o0[k]  = bk & 15u;
-        o2[k]  = (o0[k] + 4*step) & 15u;
-        u1w[k] = (u0[k] + 1) % WORDS;
-        uxw[k] = (u0[k] + 2) % WORDS;
+        for (int k = 0; k < 2; ++k)
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const int b = step*(8*rrows[k] + (q ? tid4 + 4 : tid4));
+                gw0[k][q] = (b >> 4) % WORDS;
+                gof[k][q] = b & 15u;
+                gw1[k][q] = (gw0[k][q] + 1) % WORDS;
+            }
+        (void) o0; (void) o2; (void) u0; (void) u1w; (void) uxw;
+    } else {
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int bk = step*(8*rrows[k] + tid4);
+            u0[k]  = (bk >> 4) % WORDS;
+            o0[k]  = bk & 15u;
+            o2[k]  = (o0[k] + 4*step) & 15u;
+            u1w[k] = (u0[k] + 1) % WORDS;
+            uxw[k] = (u0[k] + 2) % WORDS;
+        }
+        (void) gw0; (void) gw1; (void) gof;
     }
 
     auto dec_state = [&](uint32_t lo, uint32_t hi, int off) {
@@ -2265,6 +2284,12 @@ static __global__ void paw_rt_walk_qtip_stage_kernel(
             uint32_t ra[4];
 #pragma unroll
             for (int k = 0; k < 2; ++k) {
+                if constexpr (WORDS == 64) {
+#pragma unroll
+                    for (int q = 0; q < 2; ++q)
+                        ra[k + 2*q] = dec_state(tw[gw0[k][q]], tw[gw1[k][q]], gof[k][q]);
+                    continue;
+                }
                 const uint32_t lo = tw[u0[k]], hi = tw[u1w[k]];
                 ra[k + 2*0] = dec_state(lo, hi, o0[k]);
                 if constexpr (WORDS == 16) {
@@ -2933,7 +2958,7 @@ static void paw_rt_walk_qtip_frag_dispatch(const uint16_t * trellis,
     // +12.0% on tg64 (23.88 -> 26.75) with byte-identical output, so it is
     // extended to the other two shipped rates here.
     static const bool stage_on = paw_env_int("GGML_PAW_WALK_STAGE", 1) != 0;
-    if constexpr (WORDS == 16 || WORDS == 24 || WORDS == 32) {
+    if constexpr (WORDS == 16 || WORDS == 24 || WORDS == 32 || WORDS == 64) {
         if (stage_on && S == 1) {
             constexpr size_t stage_smem =
                 (size_t) 512*PAW_STAGE_COPIES*sizeof(uint32_t)
@@ -3651,7 +3676,11 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         }
     }
 
-    static const bool rt_walk_qtip = paw_env_int("GGML_PAW_RT_WALK_QTIP", 0) != 0;
+    // K=4 fused walk. Was off because it only matched the decode-to-bank +
+    // bank-GEMV path it replaces (76.95 vs 75.45 tg64 on PAW-35B). With the
+    // cp.async staged walk covering WORDS=64 it is 84.54, +12.0% over the
+    // bank path, and greedy output is identical.
+    static const bool rt_walk_qtip = paw_env_int("GGML_PAW_RT_WALK_QTIP", 1) != 0;
     const bool bank_cache = paw_bank_cache_on();
 
     // u-fused gemv: skip the separate rt_u launch entirely; the gemv kernel
