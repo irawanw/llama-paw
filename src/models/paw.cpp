@@ -269,12 +269,12 @@ static bool paw_exp_batch2_on() {
 // projection's output transform. Decode-only; prompt graphs stay unchanged.
 static bool paw_shared_epilogue_on() {
     const char * v = paw_getenv("GGML_PAW_SHARED_EPILOGUE");
-    return v != nullptr && atoi(v) != 0;
+    return v == nullptr || atoi(v) != 0;
 }
 
 static bool paw_shared_gate_dot_on() {
     const char * v = paw_getenv("GGML_PAW_SHARED_GATE_DOT");
-    return v != nullptr && atoi(v) != 0;
+    return v == nullptr || atoi(v) != 0;
 }
 
 // Collapse the MoE aggregation's ggml_mul + (n_expert_used-1) ggml_add chain
