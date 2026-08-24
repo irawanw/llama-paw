@@ -4737,17 +4737,6 @@ static __global__ void paw_exp_active_groups_kernel(
 // pair-invariant, so they are hoisted out of the pair loop (for V2 the full
 // 128-step state precompute would cost ~64+ registers, so only the words are
 // hoisted there).
-// tlut row = 8 consecutive fp16 = one aligned 16B transaction; replaces the
-// 8 scattered 2B gathers per walked state (LSU-throughput bound on small GPUs)
-static __device__ __forceinline__ uint4 paw_tlut_row_vec(const void * tlut, const uint32_t row) {
-    return *(const uint4 *) ((const half *) tlut + 8*(int64_t) row);
-}
-
-static __device__ __forceinline__ float paw_tlut_val(const uint4 & tv, const int c) {
-    const __half2 pr = ((const __half2 *) &tv)[c >> 1];
-    return (c & 1) ? __high2float(pr) : __low2float(pr);
-}
-
 template <bool V8, bool P4>
 static __global__ void paw_exp_walk_kernel(
         const uint16_t * GGML_CUDA_RESTRICT kept,
@@ -4885,12 +4874,12 @@ static __global__ void paw_exp_walk_kernel(
                             dotp += (vv * gsc) * ub[ci + c];
                         }
                     } else {
-                        const uint4 tv = paw_tlut_row_vec(tlut, row);
+                        const half * tl = (const half *) tlut + 8*(int64_t) row;
 #pragma unroll
                         for (int c = 0; c < 8; ++c) {
                             // tlut is pre-rounded fp16; wave gamma then
                             // multiplies in fp32 (reference op order)
-                            float vv = paw_tlut_val(tv, c);
+                            float vv = __half2float(tl[c]);
                             if (c == 0 && (ph & 0x8000u)) {
                                 vv = -vv;                 // exact in fp16 (sign bit)
                             }
@@ -5040,10 +5029,10 @@ static __global__ void paw_exp_walk_v8_warp_kernel(
                         dotp += (vv * gsc) * ub[ci + c];
                     }
                 } else {
-                    const uint4 tv = paw_tlut_row_vec(tlut, row);
+                    const half * tl = (const half *) tlut + 8*(int64_t) row;
 #pragma unroll
                     for (int c = 0; c < 8; ++c) {
-                        float vv = paw_tlut_val(tv, c);
+                        float vv = __half2float(tl[c]);
                         if (c == 0 && (ph & 0x8000u)) {
                             vv = -vv;                 // exact in fp16 (sign bit)
                         }
@@ -5171,10 +5160,10 @@ static __global__ void __launch_bounds__(256, 8) paw_exp_dense_decode_kernel(
                     tmp[8*jj + c] = __float2half_rn(vv);
                 }
             } else {
-                const uint4 tv = paw_tlut_row_vec(tlut, row);
+                const half * tl = (const half *) tlut + 8*(int64_t) row;
 #pragma unroll
                 for (int c = 0; c < 8; ++c) {
-                    float vv = paw_tlut_val(tv, c);
+                    float vv = __half2float(tl[c]);
                     if (c == 0 && (ph & 0x8000u)) {
                         vv = -vv;                         // exact in fp16 (sign bit)
                     }
@@ -5305,10 +5294,10 @@ static __global__ void paw_exp_dense_decode_kernel_v2(
                 tmp16[jj*8 + c] = __float2half_rn(vv);
             }
         } else {
-            const uint4 tv = paw_tlut_row_vec(tlut, row);
+            const half * tl = (const half *) tlut + 8*(int64_t) row;
 #pragma unroll
             for (int c = 0; c < 8; ++c) {
-                float vv = paw_tlut_val(tv, c);
+                float vv = __half2float(tl[c]);
                 if (c == 0 && (ph & 0x8000u)) {
                     vv = -vv;
                 }
@@ -5384,10 +5373,10 @@ static __device__ __forceinline__ void paw_fused_decode_strip(
                     __float2half_rn(gv*__half2float(__float2half_rn(vv)));
             }
         } else {
-            const uint4 tv = paw_tlut_row_vec(tlut, lrow);
+            const half * tl = (const half *) tlut + 8*(int64_t) lrow;
 #pragma unroll
             for (int c = 0; c < 8; ++c) {
-                float vv = paw_tlut_val(tv, c);
+                float vv = __half2float(tl[c]);
                 if (c == 0 && (ph & 0x8000u)) {
                     vv = -vv;
                 }
@@ -6327,10 +6316,10 @@ static __global__ void paw_exp_slot_decode_kernel(
                 tmp[8*jj + c] = __float2half_rn(vv);
             }
         } else {
-            const uint4 tv = paw_tlut_row_vec(tlut, row);
+            const half * tl = (const half *) tlut + 8*(int64_t) row;
 #pragma unroll
             for (int c = 0; c < 8; ++c) {
-                float vv = paw_tlut_val(tv, c);
+                float vv = __half2float(tl[c]);
                 if (c == 0 && (ph & 0x8000u)) {
                     vv = -vv;
                 }
@@ -6626,10 +6615,10 @@ static __global__ void paw_exp_walk2_kernel(
                         dotp = fmaf(vv, ub[ci + c], dotp);
                     }
                 } else {
-                    const uint4 tv = paw_tlut_row_vec(tlut, row);
+                    const half * tl = (const half *) tlut + 8*(int64_t) row;
 #pragma unroll
                     for (int c = 0; c < 8; ++c) {
-                        float vv = paw_tlut_val(tv, c);
+                        float vv = __half2float(tl[c]);
                         if (c == 0 && (ph & 0x8000u)) {
                             vv = -vv;
                         }
