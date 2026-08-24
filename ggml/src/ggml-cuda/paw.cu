@@ -800,6 +800,69 @@ static __global__ void paw_rt_bank_gemv_fp8(
     }
 }
 
+// v3-pattern twin of paw_rt_bank_gemv_fp8: u staged in shared once per block
+// (kills the 2-row-per-warp redundant global re-reads), two rows per warp
+// with independent accumulators for FMA-chain ILP, uint4-width bank loads.
+// Grid (m/16, 1, nt), 256 threads. Requires n % 4 == 0.
+static __global__ void paw_rt_bank_gemv_fp8_v3(
+        const uint8_t * GGML_CUDA_RESTRICT bank,  // [m, n] row-major e5m2
+        const float   * GGML_CUDA_RESTRICT scr_u, // [nt, n] row-major
+        float         * GGML_CUDA_RESTRICT scr_v, // [nt, m] row-major
+        const int m, const int n, const int nt) {
+    constexpr int WARPS = 8;
+    __shared__ float lut[256];
+    __shared__ float u_sh[4096];
+
+    const int tid = threadIdx.x;
+    if (tid < 256) {
+        lut[tid] = paw_e5m2_to_f32((uint8_t) tid);
+    }
+    const int t    = blockIdx.z;
+    const int lane = tid & 31;
+    const int wid  = tid >> 5;
+
+    ggml_cuda_pdl_sync();
+    const float * u = scr_u + (int64_t) t*n;
+    for (int i = tid; i < n; i += 256) {
+        u_sh[i] = u[i];
+    }
+    __syncthreads();
+
+    const int n4 = n/4;
+    const float4 * u4 = (const float4 *) u_sh;
+
+    for (int r = wid; r < WARPS*2; r += WARPS) {
+        const int row = blockIdx.x*WARPS*2 + r;
+        if (row < m) {
+            const uint32_t * W4 = (const uint32_t *) (bank + (int64_t) row*n);
+            float acc0 = 0.0f;
+            float acc1 = 0.0f;
+            int i = lane;
+            for (; i + 32 < n4; i += 64) {
+                const uint32_t w0 = __ldcs(W4 + i);
+                const uint32_t w1 = __ldcs(W4 + i + 32);
+                const uint8_t * wb0 = (const uint8_t *) &w0;
+                const uint8_t * wb1 = (const uint8_t *) &w1;
+                const float4 x0 = u4[i];
+                const float4 x1 = u4[i + 32];
+                acc0 += lut[wb0[0]]*x0.x + lut[wb0[1]]*x0.y + lut[wb0[2]]*x0.z + lut[wb0[3]]*x0.w;
+                acc1 += lut[wb1[0]]*x1.x + lut[wb1[1]]*x1.y + lut[wb1[2]]*x1.z + lut[wb1[3]]*x1.w;
+            }
+            for (; i < n4; i += 32) {
+                const uint32_t w0 = __ldcs(W4 + i);
+                const uint8_t * wb0 = (const uint8_t *) &w0;
+                const float4 x0 = u4[i];
+                acc0 += lut[wb0[0]]*x0.x + lut[wb0[1]]*x0.y + lut[wb0[2]]*x0.z + lut[wb0[3]]*x0.w;
+            }
+            float acc = acc0 + acc1;
+            acc = warp_reduce_sum<32>(acc);
+            if (lane == 0) {
+                scr_v[(int64_t) t*m + row] = acc;
+            }
+        }
+    }
+}
+
 static __device__ __forceinline__ uint16_t paw_idx80_get(const uint32_t * W, const int i) {
     const int bit = 10*(i & 15);
     const int wi = bit >> 5;
@@ -3453,9 +3516,15 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             // never touches the stored bank, so the bank format is free to
             // differ per batch size.
             paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
-            paw_launch(paw_rt_bank_gemv_fp8,
-                ggml_cuda_kernel_launch_params(dim3((m + 7)/8, 1, nt), dim3(256, 1, 1), 0, stream),
-                (const uint8_t *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            if (n % 4 == 0) {
+                paw_launch(paw_rt_bank_gemv_fp8_v3,
+                    ggml_cuda_kernel_launch_params(dim3((m + 15)/16, 1, nt), dim3(256, 1, 1), 0, stream),
+                    (const uint8_t *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            } else {
+                paw_launch(paw_rt_bank_gemv_fp8,
+                    ggml_cuda_kernel_launch_params(dim3((m + 7)/8, 1, nt), dim3(256, 1, 1), 0, stream),
+                    (const uint8_t *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            }
             });
         } else if (nt < dense_min_tok) {
             static const bool rt_gemv2 = paw_env_int("GGML_PAW_RT_GEMV2", 0) != 0;
