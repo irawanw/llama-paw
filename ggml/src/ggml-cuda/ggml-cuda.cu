@@ -4208,6 +4208,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
+    // LLAMA_NO_GRAPHS=1: skip CUDA graph capture so per-op profiling
+    // (GGML_CUDA_OP_TIME / LLAMA_LAUNCH_TIME) sees individual node dispatches
+    static const bool graphs_disabled = getenv("LLAMA_NO_GRAPHS") != nullptr;
+    if (!graphs_disabled) {
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -4239,6 +4243,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
     }
 #endif // USE_CUDA_GRAPH
 

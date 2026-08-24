@@ -288,7 +288,7 @@ static __device__ __forceinline__ void paw_fwht_block_v2(float * sh, const int d
 
 // host gate + geometry for the register-chunk FWHT (GGML_PAW_FWHT_V2=1).
 static bool paw_fwht_v2_on() {
-    static const bool on = paw_env_int("GGML_PAW_FWHT_V2", 0) != 0;
+    static const bool on = paw_env_int("GGML_PAW_FWHT_V2", 1) != 0;
     return on;
 }
 static __host__ __device__ __forceinline__ bool paw_fwht_v2_ok(int d) {
@@ -648,7 +648,7 @@ static bool paw_rt_bank_fp8_on() {
 }
 
 static bool paw_head_bank_fp8_on() {
-    static const bool on = paw_env_int("GGML_PAW_HEAD_BANK_FP8", paw_bank_fp8_on() ? 1 : 0) != 0;
+    static const bool on = paw_env_int("GGML_PAW_HEAD_BANK_FP8", 1) != 0;
     return on;
 }
 
@@ -971,7 +971,7 @@ static __global__ void paw_head_packed_gemv_mt_kernel(
 }
 
 static bool paw_head_packed_mt_on() {
-    static const bool on = paw_env_int("GGML_PAW_HEAD_PACKED_MT", 0) != 0;
+    static const bool on = paw_env_int("GGML_PAW_HEAD_PACKED_MT", 1) != 0;
     return on;
 }
 
@@ -6607,7 +6607,7 @@ void ggml_cuda_op_paw_exp_mm_batch2(ggml_backend_cuda_context & ctx, ggml_tensor
     GGML_ASSERT(n_groups <= 512);
     GGML_ASSERT(n_tok == 1);   // caller-scoped: decode-only
 
-    static const bool walk_compact = paw_env_int("GGML_PAW_EXP_WALK_COMPACT", 0) != 0;
+    static const bool walk_compact = paw_env_int("GGML_PAW_EXP_WALK_COMPACT", 1) != 0;
     ggml_cuda_pool_alloc<int32_t> scr_i_alloc(ctx.pool(), (size_t) 4*n_groups + P + (walk_compact ? n_used : 0));
     ggml_cuda_pool_alloc<float>   scr_f_alloc(ctx.pool(), 2*((size_t) P*n + (size_t) P*m));
     int32_t * scr_i  = scr_i_alloc.get();
@@ -7152,7 +7152,7 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         });
         }
     } else {
-        static const bool walk_compact = paw_env_int("GGML_PAW_EXP_WALK_COMPACT", 0) != 0;
+        static const bool walk_compact = paw_env_int("GGML_PAW_EXP_WALK_COMPACT", 1) != 0;
         const bool do_compact = walk_compact && n_tok == 1;
         const bool walk_warp = v8 && n/16 <= 32 && m % 64 == 0;
         const bool fuse_warp_group = do_compact && walk_warp;

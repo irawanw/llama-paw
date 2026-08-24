@@ -262,7 +262,7 @@ static bool paw_rt_batch_site(int bit) {
 // runtime shape for routed experts.
 static bool paw_exp_batch2_on() {
     const char * v = paw_getenv("GGML_PAW_EXP_BATCH2");
-    return v != nullptr && atoi(v) != 0;
+    return v == nullptr || atoi(v) != 0;
 }
 
 // Fold the shared-expert sigmoid gate and residual add into the RT down
@@ -283,7 +283,7 @@ static bool paw_shared_gate_dot_on() {
 // overhead. Bit-exact: the fused kernel accumulates in the same slot order.
 static bool paw_moe_reduce_on() {
     const char * v = paw_getenv("GGML_PAW_MOE_REDUCE");
-    return v != nullptr && atoi(v) != 0;
+    return v == nullptr || atoi(v) != 0;
 }
 
 bool llama_model_paw::graph::rt_batch_site(int bit) {
