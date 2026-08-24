@@ -799,7 +799,9 @@ ggml_tensor * llama_model_paw::graph::build_layer_ffn(ggml_tensor * cur, const i
         ggml_tensor * probs = ggml_soft_max(ctx0, logits);
         cb(probs, "ffn_moe_probs", il);
 
-        ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, probs, n_expert_used); // [n_expert_used, n_tokens]
+        // partial top-k (GGML_OP_TOP_K) instead of a full 256-wide argsort:
+        // the routing only needs the n_expert_used best ids
+        ggml_tensor * selected_experts = ggml_top_k(ctx0, probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts, "ffn_moe_topk", il);
 
         ggml_tensor * weights = ggml_get_rows(ctx0,
