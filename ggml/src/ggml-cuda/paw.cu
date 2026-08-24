@@ -7432,6 +7432,63 @@ void ggml_cuda_op_paw_v_reorder(ggml_backend_cuda_context & ctx, ggml_tensor * d
         (const float *) y->data, (float *) dst->data, M, T, y_str, seg_off, hd, K, r);
 }
 
+// --- PAW_DUAL_MM ----------------------------------------------------------
+//
+// Two small [n_embd -> R] GEMVs sharing one input, fused into a single
+// launch (the mamba ssm_alpha/ssm_beta projections at decode: two launches
+// of ~10 us each for a few KB of arithmetic, 30 layers). One warp per
+// output row; x is staged in shared once per block.
+template <int WARPS>
+static __global__ void paw_dual_mm_kernel(
+        const float * GGML_CUDA_RESTRICT w0,  // [K, R]
+        const float * GGML_CUDA_RESTRICT w1,  // [K, R]
+        const float * GGML_CUDA_RESTRICT x,   // [K, T]
+        float       * GGML_CUDA_RESTRICT dst, // [2R, T]
+        const int K, const int R, const int T) {
+    __shared__ float sh[4096];
+    const int t    = blockIdx.z;
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    for (int i = threadIdx.x; i < K; i += WARPS*32) {
+        sh[i] = x[(int64_t) t*K + i];
+    }
+    __syncthreads();
+
+    for (int r = wid; r < WARPS*4; r += WARPS) {
+        const int row  = blockIdx.x*WARPS*4 + r;
+        if (row >= 2*R) {
+            return;
+        }
+        const float * w = (row < R ? w0 : w1) + (int64_t)(row % R)*K;
+        float acc = 0.0f;
+        for (int i = lane; i < K; i += 32) {
+            acc += w[i]*sh[i];
+        }
+        acc = warp_reduce_sum<32>(acc);
+        if (lane == 0) {
+            dst[(int64_t) t*(2*R) + row] = acc;
+        }
+    }
+}
+
+void ggml_cuda_op_paw_dual_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * w0 = dst->src[0];
+    const ggml_tensor * w1 = dst->src[1];
+    const ggml_tensor * x  = dst->src[2];
+    GGML_ASSERT(x->ne[0] <= 4096);
+
+    const int K = (int) w0->ne[0];
+    const int R = (int) w0->ne[1];
+    const int T = (int) x->ne[1];
+    constexpr int WARPS = 8;
+    paw_launch(paw_dual_mm_kernel<WARPS>,
+        ggml_cuda_kernel_launch_params(dim3((2*R + WARPS*4 - 1)/(WARPS*4), 1, T),
+                                       dim3(WARPS*32, 1, 1), 0, ctx.stream()),
+        (const float *) w0->data, (const float *) w1->data, (const float *) x->data,
+        (float *) dst->data, K, R, T);
+}
+
 bool ggml_cuda_paw_supported(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_PAW_EXP_MM:
@@ -7474,6 +7531,7 @@ bool ggml_cuda_paw_supported(const ggml_tensor * op) {
         case GGML_OP_PAW_EXP_MM_BATCH2:
         case GGML_OP_PAW_MOE_REDUCE:
         case GGML_OP_PAW_V_REORDER:
+        case GGML_OP_PAW_DUAL_MM:
             // shapes/types are enforced by the ggml builders
             return true;
         default:

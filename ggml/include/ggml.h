@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_PAW_EMBED_GATHER,
         GGML_OP_PAW_MOE_REDUCE,
         GGML_OP_PAW_V_REORDER,
+        GGML_OP_PAW_DUAL_MM,
 
         GGML_OP_UNARY,
 
@@ -2817,6 +2818,16 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * y,
             int seg_off, int hd, int K, int r);
+
+    // two [n_embd -> R] GEMVs sharing the input x in one launch:
+    // dst[[0..R), t]   = w0 * x[:, t]
+    // dst[[R..2R), t]  = w1 * x[:, t]
+    // w0/w1: [n_embd, R] f32; x: [n_embd, T] f32; dst: [2R, T] f32.
+    GGML_API struct ggml_tensor * ggml_paw_dual_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * w0,
+            struct ggml_tensor  * w1,
+            struct ggml_tensor  * x);
 
     // DSA lightning indexer
     //

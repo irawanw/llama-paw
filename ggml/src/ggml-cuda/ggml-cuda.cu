@@ -2384,6 +2384,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_PAW_V_REORDER:
             ggml_cuda_op_paw_v_reorder(ctx, dst);
             break;
+        case GGML_OP_PAW_DUAL_MM:
+            ggml_cuda_op_paw_dual_mm(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -3998,6 +4001,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            static const bool node_dump = getenv("LLAMA_NODE_DUMP") != nullptr;
+            if (node_dump) {
+                static int dumps_left = 1;
+                if (cgraph->n_nodes > 100 && dumps_left > 0) {
+                    dumps_left--;
+                    for (int i = 0; i < cgraph->n_nodes; i++) {
+                        const ggml_tensor * nd = cgraph->nodes[i];
+                        fprintf(stderr, "ND %4d %-14s %-40s [%lld,%lld,%lld,%lld] src0=%s src1=%s\n",
+                            i, ggml_op_name(nd->op), nd->name,
+                            (long long)nd->ne[0], (long long)nd->ne[1], (long long)nd->ne[2], (long long)nd->ne[3],
+                            nd->src[0] ? nd->src[0]->name : "-",
+                            nd->src[1] ? nd->src[1]->name : "-");
+                    }
+                    fflush(stderr);
+                }
+            }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -5290,6 +5309,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_PAW_EMBED_GATHER:
         case GGML_OP_PAW_MOE_REDUCE:
         case GGML_OP_PAW_V_REORDER:
+        case GGML_OP_PAW_DUAL_MM:
             return ggml_cuda_paw_supported(op);
 
         default:

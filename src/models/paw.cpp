@@ -652,15 +652,40 @@ ggml_tensor * llama_model_paw::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    // alpha and beta share the input and shape; one fused launch instead of
+    // two tiny GEMV launches per layer (60 -> 30 launches per decode token).
+    // The halves are addressed as strided views of the packed [2R, T] output
+    // (a plain view_2d slice would be non-contiguous in the row dimension).
+    // decode-only: the fused kernel stages x in shared per block, which does
+    // not pay off at prefill widths (measured pp regression)
+    // the fused kernel stages x in fixed shared arrays of 4096 floats and
+    // pays off only at decode widths (measured pp regression at prefill)
+    const bool dual_ab = model.layers[il].ssm_beta_s == nullptr &&
+                         model.layers[il].ssm_alpha_s == nullptr &&
+                         ggml_is_contiguous(cur) &&
+                         ubatch.n_tokens == 1 &&
+                         cur->ne[0] <= 4096;
+    ggml_tensor * alpha = nullptr;
+    ggml_tensor * beta  = nullptr;
+    if (dual_ab) {
+        ggml_tensor * ba = ggml_paw_dual_mm(ctx0,
+                model.layers[il].ssm_alpha, model.layers[il].ssm_beta, cur);
+        alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_seq_tokens, n_seqs,
+                             ba->nb[0], ba->nb[1], 0);
+        beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
+                             ba->nb[0], ba->nb[1], ba->nb[1]*cur->ne[1],
+                             num_v_heads*sizeof(float));
+    } else {
+        beta  = build_lora_mm(model.layers[il].ssm_beta,  cur, model.layers[il].ssm_beta_s);
+        beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+        alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+    }
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);

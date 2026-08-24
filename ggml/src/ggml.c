@@ -1094,6 +1094,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "PAW_EMBED_GATHER",
     "PAW_MOE_REDUCE",
     "PAW_V_REORDER",
+    "PAW_DUAL_MM",
 
     "UNARY",
 
@@ -1111,7 +1112,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 112");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1236,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 112");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6759,6 +6760,30 @@ struct ggml_tensor * ggml_paw_v_reorder(
     result->op_params[1] = hd;
     result->op_params[2] = K;
     result->op_params[3] = r;
+
+    return result;
+}
+
+// ggml_paw_dual_mm
+
+struct ggml_tensor * ggml_paw_dual_mm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w0,
+        struct ggml_tensor  * w1,
+        struct ggml_tensor  * x) {
+    GGML_ASSERT(w0->type == GGML_TYPE_F32 && w1->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(w0) && ggml_is_contiguous(w1));
+    GGML_ASSERT(w0->ne[0] == w1->ne[0] && w0->ne[1] == w1->ne[1]);
+    GGML_ASSERT(x->ne[0] == w0->ne[0]);
+
+    const int64_t ne[4] = { 2*w0->ne[1], x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op = GGML_OP_PAW_DUAL_MM;
+    result->src[0] = w0;
+    result->src[1] = w1;
+    result->src[2] = x;
 
     return result;
 }
