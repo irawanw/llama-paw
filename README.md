@@ -4,7 +4,7 @@ A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) that runs **PAW**
 models — checkpoints whose weights ship as packed trellis code streams and are
 decoded on the fly inside the compute kernels.
 
-Get the weights from [PAW-35B-A3B](https://huggingface.co/).
+Get the weights from [PAW-35B-A3B](https://huggingface.co/lackonendes/PAW-35B-A3B-GGUF).
 
 The PAW codec ops are implemented for **CPU, CUDA, and Vulkan**. There are no
 Metal kernels: on Apple Silicon this fork runs the codec on CPU.
