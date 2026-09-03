@@ -9633,6 +9633,14 @@ void exl3_gemv_int8_sq_kernel
     rows_per = rows_per < SQ_MINROWS ? SQ_MINROWS : rows_per;
     rows_per = rows_per > gemv_int8_sq_rows_max(M, residual) ? gemv_int8_sq_rows_max(M, residual) : rows_per;
     rows_per = rows_per > ((rows_total + 7) & ~7) ? ((rows_total + 7) & ~7) : rows_per;
+    if constexpr (M > 1) {
+        constexpr int smem_budget = 49152;
+        constexpr int stage = bits == 3 ? 8 * GEMV_STAGE_D * 16 * bits * 4 : 0;
+        int cap = (smem_budget - 1024 * M - stage) / (32 + 64 * M);
+        cap &= ~7;
+        if (cap < SQ_MINROWS) cap = SQ_MINROWS;
+        rows_per = rows_per > cap ? cap : rows_per;
+    }
     int ksplit = (rows_total + rows_per - 1) / rows_per;
     int units = nb256_total * ksplit;
     int slice_stride = rows_per * 16;
@@ -10183,7 +10191,9 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int n = (int) x->ne[0];
     const int m = (int) dst->ne[0];
     GGML_ASSERT((int64_t) trellis->ne[1] == (m / 16) * (n / 16));
-    const int nt = (int) x->ne[1];
+    const int64_t nt64 = x->ne[1] * x->ne[2] * x->ne[3];
+    GGML_ASSERT(nt64 <= INT_MAX);
+    const int nt = (int) nt64;
 
     static bool sms_init = false;
     if (!sms_init) {
@@ -10206,7 +10216,6 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         const char * e = getenv("GGML_PAW_X3_PREFILL_NT");
         return e ? atoi(e) : 9;
     }();
-
     if (nt >= x3_prefill_nt) {
         char shp[64];
         snprintf(shp, sizeof(shp), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
@@ -10237,11 +10246,11 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     // fixed-layout workspace: [counters | qsums | partials]. The counters must
     // be zero at kernel start; they self-reset before return (graph-safe).
-    // partials scale with the fused batch: ksplit slices x nt rows x n cols.
+    // partials scale with the fused batch: ksplit slices x nt rows x output cols.
     // qsums needs 4 floats per (slice, row): 4*ksplit*nt must fit the
     // reserved qsums region (4*SQ_KSPLIT_CAP*8 ints).
     GGML_ASSERT((size_t) 4 * plan.ksplit * nt <= (size_t) 4 * SQ_KSPLIT_CAP * 8);
-    ggml_cuda_pool_alloc<int> ws(ctx.pool(), SQ_WS_RESERVED + (size_t) plan.ksplit * nt * n);
+    ggml_cuda_pool_alloc<int> ws(ctx.pool(), SQ_WS_RESERVED + (size_t) plan.ksplit * nt * m);
 
     {
         char shp[64];
