@@ -580,6 +580,7 @@ extern "C" {
         GGML_OP_PAW_EXP_BASIS,
         GGML_OP_PAW_RT_MM,
         GGML_OP_PAW_RT_MM_BATCH,
+        GGML_OP_PAW_X3_MM,
         GGML_OP_PAW_EXP_MM_BATCH2,
         GGML_OP_PAW_HEAD_MM,
         GGML_OP_PAW_EMBED_GATHER,
@@ -2752,6 +2753,20 @@ extern "C" {
             struct ggml_tensor * tlut,
             struct ggml_tensor * x,
             int                  rht_blk);
+
+    // EXL3-compatible fused decode GEMV (mul1-v1 codec): one launch per
+    // matrix, decode-only (x->ne[1] == 1). trellis is I16 [16*K, ntiles]
+    // with ntiles == (m/16)*(n/16); K = trellis->ne[0]/16 in {2, 3}. suh/svh
+    // are F16 [n]/[m] Hadamard sign vectors; the H128 rotations and the
+    // per-slice int8 activation quantization happen inside the kernel, so
+    // unlike ggml_paw_rt_mm there is no input RHT launch, no tlut, and no
+    // global scratch round trip. Output is F32 [m, nt].
+    GGML_API struct ggml_tensor * ggml_paw_x3_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * suh,
+            struct ggml_tensor  * svh,
+            struct ggml_tensor  * x);
 
     // Batched form of ggml_paw_exp_mm for exactly two routed-expert
     // projections that share one input x and one routing decision (remap,

@@ -74,7 +74,8 @@ ggml_tensor * llama_model_paw_dense::graph::build_layer_ffn(ggml_tensor * cur, c
     ggml_tensor * g;
     ggml_tensor * u;
     if (rt_batch_site(2) && m1l.ffn_gate.rt_trellis && m1l.ffn_up.rt_trellis &&
-            m1l.ffn_gate.rt_sv->ne[0] == m1l.ffn_up.rt_sv->ne[0]) {
+            m1l.ffn_gate.rt_sv->ne[0] == m1l.ffn_up.rt_sv->ne[0] &&
+            !(m1l.ffn_gate.x3_trellis && m1l.ffn_up.x3_trellis)) {
         // gate and up share the input and the shape — one batched op instead
         // of two latency-bound launches (same fusion as the 35B shared expert)
         const m1_ne ws[2] = { m1l.ffn_gate, m1l.ffn_up };

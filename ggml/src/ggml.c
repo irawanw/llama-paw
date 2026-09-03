@@ -1089,6 +1089,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "PAW_EXP_BASIS",
     "PAW_RT_MM",
     "PAW_RT_MM_BATCH",
+    "PAW_X3_MM",
     "PAW_EXP_MM_BATCH2",
     "PAW_HEAD_MM",
     "PAW_EMBED_GATHER",
@@ -1112,7 +1113,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,6 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "paw_exp_basis(a, b, c, remap, ids, x[, acc])",
     "paw_rt_mm(trellis, su, sv, tlut, x)",
     "paw_rt_mm_batch(...)",
+    "paw_x3_mm(trellis, suh, svh, x)",
     "paw_exp_mm_batch2(...)",
     "paw_head_mm(qp, gscale, x)",
     "paw_embed_gather(codes, lut, ids)",
@@ -1237,7 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6631,6 +6633,49 @@ struct ggml_tensor * ggml_paw_rt_mm_batch(
     result->src[idx++] = tlut;
     result->src[idx++] = x;
     result->op_params[GGML_PAW_RHT_BLK_SLOT] = rht_blk;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_paw_x3_mm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * trellis,
+        struct ggml_tensor  * suh,
+        struct ggml_tensor  * svh,
+        struct ggml_tensor  * x) {
+    GGML_ASSERT(trellis->type == GGML_TYPE_I16);
+    GGML_ASSERT(suh->type     == GGML_TYPE_F16);
+    GGML_ASSERT(svh->type     == GGML_TYPE_F16);
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(trellis));
+    GGML_ASSERT(ggml_is_contiguous(suh));
+    GGML_ASSERT(ggml_is_contiguous(svh));
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_n_dims(trellis) == 2);
+
+    // words-per-tile = 16*K (mul1-v1: K fresh bits per value in a 16x16 tile)
+    const int64_t words = trellis->ne[0];
+    const int64_t k     = words / 16;
+    GGML_ASSERT(words % 16 == 0);
+    GGML_ASSERT(k == 2 || k == 3);   // Plan D rates; more later
+
+    const int64_t n = x->ne[0];
+    GGML_ASSERT(suh->ne[0] == n);
+    GGML_ASSERT(n % 16 == 0);
+
+    const int64_t ntiles = trellis->ne[1];
+    const int64_t m      = 16 * (ntiles / (n / 16));
+    GGML_ASSERT(ntiles % (n / 16) == 0);
+    GGML_ASSERT(svh->ne[0] == m);
+
+    const int64_t ne[4] = { m, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op = GGML_OP_PAW_X3_MM;
+    result->src[0] = trellis;
+    result->src[1] = suh;
+    result->src[2] = svh;
+    result->src[3] = x;
 
     return result;
 }

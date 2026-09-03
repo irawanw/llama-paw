@@ -2105,6 +2105,14 @@ struct llama_model_paw : public llama_model_qwen35moe {
         ggml_tensor * rt_trellis = nullptr;  // I16 [K*16, ntiles]
         ggml_tensor * rt_su      = nullptr;  // F32 [n]
         ggml_tensor * rt_sv      = nullptr;  // F32 [m] (Wscale folded)
+        // EXL3-compatible mul1-v1 codec (decode GEMV, fused H128): present on
+        // individual matrices when the GGUF ships an x3 rewrite alongside the
+        // original rt payload. ne_mm() dispatches to ggml_paw_x3_mm at
+        // nt == 1 when GGML_PAW_X3 is on; prefill and legacy runs keep the
+        // rt path, so the same file serves as its own A/B comparison.
+        ggml_tensor * x3_trellis = nullptr;  // I16 [16*K, ntiles]
+        ggml_tensor * x3_suh     = nullptr;  // F16 [n]
+        ggml_tensor * x3_svh     = nullptr;  // F16 [m]
     };
     // one routed-expert projection (QTIP trellis + RHT sides + low-rank basis)
     struct m1_exp {

@@ -2081,6 +2081,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_paw_rt_mm(params, tensor);
             } break;
         case GGML_OP_PAW_RT_MM_BATCH:
+        case GGML_OP_PAW_X3_MM:
             {
                 // CUDA-only op; the CPU backend never executes it.
                 GGML_ASSERT(false);
@@ -2303,6 +2304,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_PAW_EXP_BASIS:
         case GGML_OP_PAW_RT_MM:
         case GGML_OP_PAW_RT_MM_BATCH:
+        case GGML_OP_PAW_X3_MM:
         case GGML_OP_PAW_EXP_MM_BATCH2:
         case GGML_OP_PAW_HEAD_MM:
         case GGML_OP_PAW_EMBED_GATHER:
@@ -2948,6 +2950,14 @@ struct ggml_cplan ggml_graph_plan(
                         // shared W buffer
                         const int64_t n = node->src[1]->ne[0];                         // su
                         const int64_t m = node->src[2]->ne[0];                         // sv
+                        cur = sizeof(float)*m*n;
+                    } break;
+                case GGML_OP_PAW_X3_MM:
+                    {
+                        // CUDA-only; size the work buffer like RT_MM so the
+                        // scheduler never sees a zero-work node
+                        const int64_t n = node->src[1]->ne[0];                         // suh
+                        const int64_t m = node->src[2]->ne[0];                         // svh
                         cur = sizeof(float)*m*n;
                     } break;
                 case GGML_OP_PAW_RT_MM_BATCH:

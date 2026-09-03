@@ -2366,6 +2366,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_PAW_RT_MM:
             ggml_cuda_op_paw_rt_mm(ctx, dst);
             break;
+        case GGML_OP_PAW_X3_MM:
+            ggml_cuda_op_paw_x3_mm(ctx, dst);
+            break;
         case GGML_OP_PAW_RT_MM_BATCH:
             ggml_cuda_op_paw_rt_mm_batch(ctx, dst);
             break;
@@ -5304,6 +5307,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_PAW_EXP_BASIS:
         case GGML_OP_PAW_RT_MM:
         case GGML_OP_PAW_RT_MM_BATCH:
+        case GGML_OP_PAW_X3_MM:
         case GGML_OP_PAW_EXP_MM_BATCH2:
         case GGML_OP_PAW_HEAD_MM:
         case GGML_OP_PAW_EMBED_GATHER:

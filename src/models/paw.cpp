@@ -48,9 +48,22 @@ ggml_tensor * llama_model_paw::m1_create(llama_model_loader & ml, const LLM_TN_I
 llama_model_paw::m1_ne llama_model_paw::m1_create_ne(llama_model_loader & ml, llm_tensor base, int il) {
     m1_ne w;
     if (m1_version >= 3) {
-        w.rt_trellis = m1_create(ml, tn(base, "m1_rt_trellis", il), true);
-        w.rt_su      = m1_create(ml, tn(base, "m1_rt_su",      il), true);
-        w.rt_sv      = m1_create(ml, tn(base, "m1_rt_sv",      il), true);
+        // rt (rotated int-lattice) and x3 (mul1-v1 rewrite) are co-optional:
+        // a full x3 checkpoint ships only m3_*, the mixed A/B file ships both
+        w.rt_trellis = m1_create(ml, tn(base, "m1_rt_trellis", il), false);
+        if (w.rt_trellis) {
+            w.rt_su = m1_create(ml, tn(base, "m1_rt_su", il), true);
+            w.rt_sv = m1_create(ml, tn(base, "m1_rt_sv", il), true);
+        }
+        w.x3_trellis = m1_create(ml, tn(base, "m3_trellis", il), false);
+        if (w.x3_trellis) {
+            w.x3_suh = m1_create(ml, tn(base, "m3_suh", il), true);
+            w.x3_svh = m1_create(ml, tn(base, "m3_svh", il), true);
+        }
+        if (!w.rt_trellis && !w.x3_trellis) {
+            throw std::runtime_error("paw: missing required tensor '" +
+                                     tn(base, "m1_rt_trellis", il).str() + "'");
+        }
         return w;
     }
     w.packed = m1_create(ml, tn(base, "m1_packed", il), true);
@@ -210,9 +223,18 @@ std::unique_ptr<llm_graph_context> llama_model_paw::build_arch_graph(const llm_g
 // stay diffable.
 // ---------------------------------------------------------------------------
 
+// Route decode (nt == 1) matmuls of x3-rewritten matrices through the fused
+// mul1-v1 GEMV (defined below; used by ne_mm).
+static bool paw_x3_on();
+
 ggml_tensor * llama_model_paw::graph::ne_mm(const m1_ne & w, ggml_tensor * x) {
     if (!ggml_is_contiguous(x)) {
         x = ggml_cont(ctx0, x);
+    }
+    if (w.x3_trellis && paw_x3_on()) {
+        // fused mul1-v1 decode GEMV (H128 baked into the kernel); the sq
+        // kernel loops per token for nt > 1, so this handles prefill too
+        return ggml_paw_x3_mm(ctx0, w.x3_trellis, w.x3_suh, w.x3_svh, x);
     }
     if (w.rt_trellis) {   // payload v3: rotated int-lattice spine
         return ggml_paw_rt_mm(ctx0, w.rt_trellis, w.rt_su, w.rt_sv, model.m1_ne_tlut, x,
@@ -275,6 +297,23 @@ static bool paw_shared_epilogue_on() {
 static bool paw_shared_gate_dot_on() {
     const char * v = paw_getenv("GGML_PAW_SHARED_GATE_DOT");
     return v == nullptr || atoi(v) != 0;
+}
+
+// Route decode (nt == 1) matmuls of x3-rewritten matrices through the fused
+// mul1-v1 GEMV. On by default when the GGUF carries m3_* tensors; GGML_PAW_X3=0
+// keeps the whole graph on the legacy rt path (same weights, A/B switch).
+static bool paw_x3_on() {
+    const char * v = paw_getenv("GGML_PAW_X3");
+    return v == nullptr || atoi(v) != 0;
+}
+
+// The legacy rt codec emits GDN V rows grouped by K head and needs the
+// grouped->tiled conversion.  The x3 payload is encoded from the parent GGUF
+// matrix whose outputs are already in PAW's tiled order, so active x3 must not
+// be converted again.  The environment override exists only for diagnosis.
+static bool paw_x3_v_reorder_on() {
+    const char * v = paw_getenv("GGML_PAW_X3_V_REORDER");
+    return v != nullptr && atoi(v) != 0;
 }
 
 // Collapse the MoE aggregation's ggml_mul + (n_expert_used-1) ggml_add chain
@@ -471,7 +510,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_paw::graph::build_qkvz(
     ggml_tensor * z;
     bool rt_rows_mapped = false;
     if (paw_rt_batch_site(0) &&
-            model.m1_layers[il].wqkv.rt_trellis && model.m1_layers[il].wqkv_gate.rt_trellis) {
+            model.m1_layers[il].wqkv.rt_trellis && model.m1_layers[il].wqkv_gate.rt_trellis &&
+            !(model.m1_layers[il].wqkv.x3_trellis && model.m1_layers[il].wqkv_gate.x3_trellis)) {
         const m1_ne ws[2] = { model.m1_layers[il].wqkv, model.m1_layers[il].wqkv_gate };
         ggml_tensor * cat = ne_mm_batch(ws, 2, input);
         cat->op_params[8]  = 1;
@@ -493,9 +533,13 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_paw::graph::build_qkvz(
         qkv_mixed = ne_mm(model.m1_layers[il].wqkv, input);
         z         = ne_mm(model.m1_layers[il].wqkv_gate, input);
     }
-    if (model.m1_layers[il].wqkv.rt_trellis && !rt_rows_mapped) {
+    const bool qkv_x3_active = model.m1_layers[il].wqkv.x3_trellis && paw_x3_on();
+    const bool qkv_rt_active = model.m1_layers[il].wqkv.rt_trellis && !qkv_x3_active;
+    if ((qkv_rt_active || (qkv_x3_active && paw_x3_v_reorder_on())) &&
+            !rt_rows_mapped) {
         // v3: the grouped->tiled V-row reorder is not baked into the rotated
-        // codec, so permute the V segment of the output activations here.
+        // codec (nor the x3 mul1 rewrite), so permute the V segment of the
+        // output activations here.
         // One fused row-permutation launch replaces the old
         // cont + cont + permute + concat chain (the head rows copy through).
         const int64_t key_dim = hparams.ssm_d_state * hparams.ssm_n_group;
@@ -511,7 +555,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_paw::graph::build_qkvz(
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
-    if (model.m1_layers[il].wqkv_gate.rt_trellis && !rt_rows_mapped) {
+    const bool z_x3_active = model.m1_layers[il].wqkv_gate.x3_trellis && paw_x3_on();
+    const bool z_rt_active = model.m1_layers[il].wqkv_gate.rt_trellis && !z_x3_active;
+    if ((z_rt_active || (z_x3_active && paw_x3_v_reorder_on())) &&
+            !rt_rows_mapped) {
         z = ggml_paw_v_reorder(ctx0, z, 0,
                 (int) hparams.ssm_d_state, (int) hparams.ssm_n_group,
                 (int)(hparams.ssm_dt_rank / hparams.ssm_n_group));   // v3: same reorder on the z gate rows
@@ -547,7 +594,10 @@ ggml_tensor * llama_model_paw::graph::build_layer_attn(
     if (paw_rt_batch_site(1) &&
             model.m1_layers[il].wq.rt_trellis &&
             model.m1_layers[il].wk.rt_trellis &&
-            model.m1_layers[il].wv.rt_trellis) {
+            model.m1_layers[il].wv.rt_trellis &&
+            !(model.m1_layers[il].wq.x3_trellis &&
+              model.m1_layers[il].wk.x3_trellis &&
+              model.m1_layers[il].wv.x3_trellis)) {
         const m1_ne ws[3] = { model.m1_layers[il].wq, model.m1_layers[il].wk, model.m1_layers[il].wv };
         ggml_tensor * cat = ne_mm_batch(ws, 3, cur);
         ggml_build_forward_expand(gf, cat);
@@ -764,13 +814,15 @@ ggml_tensor * llama_model_paw::graph::build_layer_attn_linear(
 
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    // The packed ssm_out stream keeps the HF column order, where V heads are
-    // GROUPED by K head; the graph runs in ggml's TILED order (the exporter
-    // row-reorders every other v-indexed tensor). A trellis stream's columns
-    // cannot be permuted at export, so convert the activations tiled->grouped
-    // here: heads [hd, r*K (k fastest)] -> [hd, K*r (v fastest)].
+    // The legacy rt ssm_out stream keeps the HF input-column order, where V
+    // heads are GROUPED by K head, while the graph runs internally TILED.
+    // The x3/mul1 rewrite has already moved those input channels into PAW's
+    // tiled basis (verified by the reconstructed-weight permutation audit),
+    // so applying this conversion to an active x3 stream would permute it a
+    // second time and corrupt the recurrent residual.
     ggml_tensor * final_output;
-    if (num_k_heads != num_v_heads) {
+    const bool out_x3_active = model.m1_layers[il].ssm_out.x3_trellis && paw_x3_on();
+    if (num_k_heads != num_v_heads && !out_x3_active) {
         const int64_t r = num_v_heads / num_k_heads;
         ggml_tensor * t = ggml_reshape_4d(ctx0, attn_out_norm, head_v_dim, num_k_heads, r, n_seq_tokens*n_seqs);
         t = ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3));   // [hd, r, K, T]
@@ -963,7 +1015,8 @@ ggml_tensor * llama_model_paw::graph::build_layer_ffn(ggml_tensor * cur, const i
     }
     ggml_tensor * shared_inp = ggml_mul(ctx0, ggml_silu(ctx0, g), u);
     if (paw_shared_epilogue_on() && n_tokens == 1 &&
-            model.m1_layers[il].down_shexp.rt_trellis) {
+            model.m1_layers[il].down_shexp.rt_trellis &&
+            !model.m1_layers[il].down_shexp.x3_trellis) {
         const m1_ne & w = model.m1_layers[il].down_shexp;
         if (paw_shared_gate_dot_on()) {
             cur = ggml_paw_rt_mm_epilogue_dot(ctx0, w.rt_trellis, w.rt_su, w.rt_sv,
