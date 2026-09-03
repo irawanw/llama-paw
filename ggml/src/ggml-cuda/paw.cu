@@ -9780,6 +9780,326 @@ static int x3_num_sms()
     return n_sms;
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// EXL3 reconstruct_had_slice device port (x3 prefill path: trellis -> ORIGINAL-basis fp16 W).
+// Verbatim logic from exllamav3_ext (ref 63b32f0)
+//   quant/reconstruct.cu (reconstruct_had_kernel), quant/exl3_dq.cuh (dq8, dq8_aligned_2bits),
+//   quant/codebook.cuh (decode fns, unions), quant/hadamard_inner.cuh (shuffle_had_h2x32).
+// Only torch host wrappers are omitted; K is restricted to {2,3} and cb to mul1 (2).
+// Already-defined paw_x3 names are reused, not redefined: fshift, FSHF_IMM, BFE16_IMM, half4.
+
+union half2_uint32 { half2 as_half2; uint32_t as_uint32; };
+union half_uint16 { half as_half; uint16_t as_uint16; __device__ half_uint16(uint16_t x) : as_uint16(x) {} };
+
+struct FragB { half2 v[2]; __device__ half2 & operator[](int i) { return v[i]; } };
+
+// Decode two mul1 codebook entries from precomputed products x0 = idx0 * 0x83DCD12D,
+// x1 = idx1 * 0x83DCD12D
+__device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
+{
+    const uint32_t acc = 0x6400u;
+    uint32_t sum0 = __dp4a(x0, 0x01010101u, acc);
+    uint32_t sum1 = __dp4a(x1, 0x01010101u, acc);
+    half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));  //  0.00677 = 1/147.7
+    half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));  // -10.39
+    half_uint16 h0((uint16_t) sum0);
+    half_uint16 h1((uint16_t) sum1);
+    return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+}
+
+template <int cb>
+__device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
+{
+    static_assert(cb == 2, "x3 reconstruct supports mul1 only");
+    x0 *= 0x83DCD12Du;
+    x1 *= 0x83DCD12Du;
+    return decode_mul1_product_2(x0, x1);
+}
+
+template <int bits, int cb, int align>
+__device__ __forceinline__ void dq8(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+{
+    int b1 = (t_offset + 257) * bits;
+    int b0 = b1 - 16;
+    int b2 = b1 + bits * 7;
+    int i0 = b0 / 32;
+    int i2 = (b2 - 1) / 32;
+    int s2 = (i2 + 1) * 32 - b2;
+
+    uint32_t a = ptr[i0 % (bits * 256 / 32)];
+    uint32_t b = ptr[i2 % (bits * 256 / 32)];
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    if constexpr (align == 1)
+    {
+        w7 = fshift(b, a, s2);
+        w6 = fshift(b, a, s2 + bits);
+        w5 = fshift(b, a, s2 + bits * 2);
+        w4 = fshift(b, a, s2 + bits * 3);
+        w3 = fshift(b, a, s2 + bits * 4);
+        w2 = fshift(b, a, s2 + bits * 5);
+        w1 = fshift(b, a, s2 + bits * 6);
+        w0 = fshift(b, a, s2 + bits * 7);
+    }
+    if constexpr (align == 2)
+    {
+        w7 = fshift(b, a, s2);
+        w6 = w7 >> bits;
+        w5 = fshift(b, a, s2 + bits * 2);
+        w4 = w5 >> bits;
+        w3 = fshift(b, a, s2 + bits * 4);
+        w2 = w3 >> bits;
+        w1 = fshift(b, a, s2 + bits * 6);
+        w0 = w1 >> bits;
+    }
+    if constexpr (align == 4)
+    {
+        w7 = fshift(b, a, s2);
+        w6 = w7 >> bits;
+        w5 = w6 >> bits;
+        w4 = w5 >> bits;
+        w3 = fshift(b, a, s2 + bits * 4);
+        w2 = w3 >> bits;
+        w1 = w2 >> bits;
+        w0 = w1 >> bits;
+    }
+    if constexpr (align == 8)
+    {
+        w7 = fshift(b, a, s2);
+        w6 = w7 >> bits;
+        w5 = w6 >> bits;
+        w4 = w5 >> bits;
+        w3 = w4 >> bits;
+        w2 = w3 >> bits;
+        w1 = w2 >> bits;
+        w0 = w1 >> bits;
+    }
+    half2 d0d1 = decode_3inst_2<cb>(w0 & 0xffff, w1 & 0xffff);
+    half2 d2d3 = decode_3inst_2<cb>(w2 & 0xffff, w3 & 0xffff);
+    half2 d4d5 = decode_3inst_2<cb>(w4 & 0xffff, w5 & 0xffff);
+    half2 d6d7 = decode_3inst_2<cb>(w6 & 0xffff, w7 & 0xffff);
+    frag0[0] = d0d1;
+    frag0[1] = d2d3;
+    frag1[0] = d4d5;
+    frag1[1] = d6d7;
+}
+
+template <int cb>
+__device__ __forceinline__ void dq8_aligned_2bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+{
+    uint32_t i0, i1, a, b, w0, w1, w2, w3, w4, w5, w6, w7;
+    i1 = t_offset >> 4;
+    i0 = (i1 + 15) & 15;
+    a = ptr[i0];
+    b = ptr[i1];
+    b = fshift(b, a, ((~t_offset) & 8) << 1);
+    w7 = b & 0xffff;
+    BFE16_IMM(w6, b, 2);
+    BFE16_IMM(w5, b, 4);
+    BFE16_IMM(w4, b, 6);
+    BFE16_IMM(w3, b, 8);
+    BFE16_IMM(w2, b, 10);
+    BFE16_IMM(w1, b, 12);
+    BFE16_IMM(w0, b, 14);
+    frag0[0] = decode_3inst_2<cb>(w0, w1);
+    frag0[1] = decode_3inst_2<cb>(w2, w3);
+    frag1[0] = decode_3inst_2<cb>(w4, w5);
+    frag1[1] = decode_3inst_2<cb>(w6, w7);
+}
+
+template <int bits, int cb>
+__device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB& frag0, FragB& frag1)
+{
+    static_assert((bits == 2 || bits == 3) && cb == 2, "x3 reconstruct supports K=2,3 mul1 only");
+    if constexpr (bits == 2)
+    {
+        dq8_aligned_2bits<cb>(ptr, idx, frag0, frag1);
+    }
+    else
+    {
+        dq8<bits, cb, 4>(ptr, idx, frag0, frag1);
+    }
+}
+
+__device__ inline half2 shuffle_had_h2x32(half2 v, int lane_id)
+{
+    for (int i = 1; i < 32; i <<= 1)
+    {
+        half2 pv = __shfl_xor_sync(0xffffffff, v, i);
+        uint32_t* vi = reinterpret_cast<uint32_t*>(&v);
+        int32_t sfm = -static_cast<int16_t>(lane_id & i) >> 31;
+        *vi ^= (sfm & 0x80008000);
+        v = __hadd2(v, pv);
+    }
+    return v;
+}
+
+// Fused reconstruct + both-side Hadamard: emits W = diag(suh) . H128 . W_hat . H128 . diag(svh)
+// (per 128x128 tile, 1/sqrt(128) per side), i.e. ORIGINAL-basis weights. See reconstruct.cu.
+#define RH_THREADS 256
+
+template <int K, int cb>
+__global__ __launch_bounds__(RH_THREADS)
+void reconstruct_had_kernel
+(
+    half* __restrict__ g_unpacked,
+    const uint16_t* __restrict__ g_packed,
+    const half* __restrict__ suh,
+    const half* __restrict__ svh,
+    int packed_blocks_n,
+    int packed_n_offset
+)
+{
+    constexpr int packed_size = 256 * K / 16;
+    constexpr float r_scale = 0.08838834764831845f;
+
+    int t = threadIdx.x;
+    int lane_id = t % 32;
+    int warp_id = t / 32;
+    int kb = blockIdx.y;
+    int nb = blockIdx.x;
+    int n = nb * 8;
+    int row_len = gridDim.x * 128;
+
+    __shared__ uint32_t s_packed[8][8][packed_size / 2];
+    __shared__ half2 stile[128 * 64];
+
+    auto tix = [&] (int R, int q, int p)
+    {
+        return R * 64 + (q ^ ((R >> 2) & 31)) * 2 + p;
+    };
+
+    constexpr int j_int4 = packed_size / 8;
+    for (int u = t; u < 8 * 8 * j_int4; u += RH_THREADS)
+    {
+        int j = u / (8 * j_int4);
+        int r = u % (8 * j_int4);
+        const uint16_t* gp = g_packed +
+            ((size_t) ((kb * 8 + j) * packed_blocks_n + packed_n_offset + n)) * packed_size;
+        ((int4*) s_packed[j])[r] = ((const int4*) gp)[r];
+    }
+    __syncthreads();
+
+    for (int jj = 0; jj < 8 * 8 / (RH_THREADS / 32); ++jj)
+    {
+        int j = (warp_id / 8) * (8 / (RH_THREADS / 256)) + jj;
+        int wn = warp_id % 8;
+        register FragB frag[2];
+        dq_dispatch<K, cb>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
+
+        half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
+        half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
+        half2 n2 = __shfl_down_sync(0xFFFFFFFF, frag[1][0], 4, 32);
+        half2 n3 = __shfl_down_sync(0xFFFFFFFF, frag[1][1], 4, 32);
+
+        if (!(lane_id & 4))
+        {
+            half2 m0 = __halves2half2(__low2half(frag[0][0]), __low2half(n0));
+            half2 m1 = __halves2half2(__high2half(frag[0][0]), __high2half(n0));
+            half2 m2 = __halves2half2(__low2half(frag[0][1]), __low2half(n1));
+            half2 m3 = __halves2half2(__high2half(frag[0][1]), __high2half(n1));
+            half2 m4 = __halves2half2(__low2half(frag[1][0]), __low2half(n2));
+            half2 m5 = __halves2half2(__high2half(frag[1][0]), __high2half(n2));
+            half2 m6 = __halves2half2(__low2half(frag[1][1]), __low2half(n3));
+            half2 m7 = __halves2half2(__high2half(frag[1][1]), __high2half(n3));
+            int r0 = j * 16 + (lane_id % 4) * 2;
+            int r1 = r0 + 1;
+            int r2 = r0 + 8;
+            int r3 = r0 + 9;
+            int c0 = lane_id / 8;
+            int q0 = (wn * 8 + c0) >> 1, p0 = c0 & 1;
+            int q1 = (wn * 8 + c0 + 4) >> 1, p1 = c0 & 1;
+            stile[tix(r0, q0, p0)] = m0;
+            stile[tix(r1, q0, p0)] = m1;
+            stile[tix(r2, q0, p0)] = m2;
+            stile[tix(r3, q0, p0)] = m3;
+            stile[tix(r0, q1, p1)] = m4;
+            stile[tix(r1, q1, p1)] = m5;
+            stile[tix(r2, q1, p1)] = m6;
+            stile[tix(r3, q1, p1)] = m7;
+        }
+    }
+    __syncthreads();
+
+    const half2 rs2 = __float2half2_rn(r_scale);
+    constexpr int CHUNKS_PW = 32 / (RH_THREADS / 32);
+    #pragma unroll
+    for (int qq = 0; qq < CHUNKS_PW; ++qq)
+    {
+        int q = warp_id * CHUNKS_PW + qq;
+        int qs = q ^ lane_id;
+        half2 a[4], b[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            half4 v = *((const half4*) (stile + (lane_id * 4 + i) * 64 + qs * 2));
+            a[i] = v.x;
+            b[i] = v.y;
+        }
+        #pragma unroll
+        for (int x = 0; x < 2; ++x)
+        {
+            half2* v = x == 0 ? a : b;
+            half2 s0 = __hadd2(v[0], v[1]), d0 = __hsub2(v[0], v[1]);
+            half2 s1 = __hadd2(v[2], v[3]), d1 = __hsub2(v[2], v[3]);
+            v[0] = __hmul2(__hadd2(s0, s1), rs2);
+            v[1] = __hmul2(__hadd2(d0, d1), rs2);
+            v[2] = __hmul2(__hsub2(s0, s1), rs2);
+            v[3] = __hmul2(__hsub2(d0, d1), rs2);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                v[i] = shuffle_had_h2x32(v[i], lane_id);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            half4 v;
+            v.x = a[i];
+            v.y = b[i];
+            *((half4*) (stile + (lane_id * 4 + i) * 64 + qs * 2)) = v;
+        }
+    }
+    __syncthreads();
+
+    constexpr int ROWS_PW = 128 / (RH_THREADS / 32);
+    const half4 sv4 = ((const half4*) svh)[nb * 32 + lane_id];
+    #pragma unroll
+    for (int rr = 0; rr < ROWS_PW; ++rr)
+    {
+        int R = warp_id * ROWS_PW + rr;
+        int base = R * 64 + (lane_id ^ ((R >> 2) & 31)) * 2;
+        half2 v01 = stile[base];
+        half2 v23 = stile[base + 1];
+        float v0 = __low2float(v01), v1 = __high2float(v01);
+        float v2 = __low2float(v23), v3 = __high2float(v23);
+        float s0 = v0 + v1, d0 = v0 - v1;
+        float s1 = v2 + v3, d1 = v2 - v3;
+        half2 h01 = __hmul2(__floats2half2_rn(s0 + s1, d0 + d1), rs2);
+        half2 h23 = __hmul2(__floats2half2_rn(s0 - s1, d0 - d1), rs2);
+        h01 = shuffle_had_h2x32(h01, lane_id);
+        h23 = shuffle_had_h2x32(h23, lane_id);
+        half2 su2 = __half2half2(suh[kb * 128 + R]);
+        half4 v;
+        v.x = __hmul2(__hmul2(h01, su2), sv4.x);
+        v.y = __hmul2(__hmul2(h23, su2), sv4.y);
+        *((half4*) (g_unpacked + (size_t) (kb * 128 + R) * row_len + nb * 128 + lane_id * 4)) = v;
+    }
+}
+
+// Host launcher: W is (n, m) row-major fp16 (ORIGINAL basis); T is the
+// (n//16, m//16, 16*bits) trellis; n and m must be multiples of 128.
+static void x3r_reconstruct_ws(half * W, const uint16_t * T,
+                               const half * suh, const half * svh,
+                               int n, int m, int bits, cudaStream_t stream)
+{
+    GGML_ASSERT(n % 128 == 0 && m % 128 == 0);
+    dim3 grid((m + 127) / 128, (n + 127) / 128);
+    if (bits == 2) {
+        reconstruct_had_kernel<2, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
+    } else {
+        reconstruct_had_kernel<3, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
+    }
+}
+
 } // namespace paw_x3
 
 void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -9819,6 +10139,38 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     x3_cast_f32_f16_kernel<<<((size_t) n * nt + 255) / 256, 256, 0, stream>>>(
         (half *) xh.get(), (const float *) x->data, (int) ((size_t) n * nt));
 
+    // EXL3-style prefill switch: at nt >= GGML_PAW_X3_PREFILL_NT (default 16)
+    // reconstruct W once and run one batched hgemm instead of looping the
+    // single-row kernel per token. W is emitted in ORIGINAL basis (both
+    // Hadamards + suh/svh folded), so the hgemm runs on the raw rows.
+    static const int x3_prefill_nt = []() {
+        const char * e = getenv("GGML_PAW_X3_PREFILL_NT");
+        return e ? atoi(e) : 16;
+    }();
+
+    if (nt >= x3_prefill_nt) {
+        char shp[64];
+        snprintf(shp, sizeof(shp), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
+        paw_timed(stream, std::string("x3_hgemm") + shp, [&]() {
+            ggml_cuda_pool_alloc<half> wmat(ctx.pool(), (size_t) n * m);
+            x3r_reconstruct_ws(wmat.get(), (const uint16_t *) trellis->data,
+                               (const half *) suh->data, (const half *) svh->data,
+                               n, m, bits, stream);
+            // Y(nt,m) = X(nt,n) @ W(n,m), all row-major: column-major view is
+            // Y_col(m,nt) = W_col(m,n) @ X_col(n,nt) with identical bytes.
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasHandle_t h = ctx.cublas_handle();
+            CUBLAS_CHECK(cublasSetStream(h, stream));
+            cublasGemmAlgo_t algo = (m % 8 == 0 && n % 8 == 0 && nt % 8 == 0)
+                ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
+            CUBLAS_CHECK(cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                                      m, nt, n, &alpha,
+                                      wmat.get(), CUDA_R_16F, m,
+                                      xh.get(), CUDA_R_16F, n,
+                                      &beta, (float *) dst->data, CUDA_R_32F, m,
+                                      CUBLAS_COMPUTE_32F, algo));
+        });
+    } else {
     const SqPlan & plan = plan_sq(bits, n, m);
 
     // fixed-layout workspace: [counters | qsums | partials]. The counters must
@@ -9830,8 +10182,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         snprintf(shp, sizeof(shp), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
         paw_timed(stream, std::string("x3_sq") + shp, [&]() {
             // the sq kernel is a single-row GEMV: nt == 1 is one fused launch;
-            // nt > 1 loops it per token (correctness path; the M > 1 kernel is
-            // a later phase)
+            // nt > 1 loops it per token (correctness path for small nt)
             for (int t = 0; t < nt; ++t) {
                 CUDA_CHECK(cudaMemsetAsync(ws.get(), 0, SQ_COUNTERS_CAP * sizeof(int), stream));
                 launch_sq(plan, bits,
@@ -9843,6 +10194,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                           ws.get(), stream);
             }
         });
+    }
     }
 
     // debug: dump the I/O of the first calls for offline verification against
