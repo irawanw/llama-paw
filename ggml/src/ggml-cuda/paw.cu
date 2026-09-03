@@ -8918,7 +8918,11 @@ namespace paw_x3 {
 #define SQ_MINROWS 16
 #define SQ_ROWS_MAX 512
 #define SQ_COUNTERS_CAP 4096
-#define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP * 4)
+// qsums holds 4 floats per (slice, row): 4*ksplit*M with ksplit <=
+// SQ_KSPLIT_CAP and M <= 8, i.e. 4*64*8 ints. The old *4 (1024 ints)
+// overflowed into partials whenever ksplit*M > 256 (e.g. ksplit=34 at
+// M=8 gives 272), corrupting slice-0/row-0 outputs of the call.
+#define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP * 8)
 
 // ---------------------------------------------------------------------------------------------------------
 // ptx.cuh primitives
@@ -9212,7 +9216,11 @@ __device__ __forceinline__ void ext8w
 #define SQ_MINROWS 16
 #define SQ_ROWS_MAX 512
 #define SQ_COUNTERS_CAP 4096
-#define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP * 4)
+// qsums holds 4 floats per (slice, row): 4*ksplit*M with ksplit <=
+// SQ_KSPLIT_CAP and M <= 8, i.e. 4*64*8 ints. The old *4 (1024 ints)
+// overflowed into partials whenever ksplit*M > 256 (e.g. ksplit=34 at
+// M=8 gives 272), corrupting slice-0/row-0 outputs of the call.
+#define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP * 8)
 
 __host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
 {
@@ -9544,43 +9552,55 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
 {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    int row = warp >> 1;
-    if (warp >= 2 * M || row >= size_m) return;
     float k_inv  = __half2float(__ushort_as_half(0x1eee));
     float k_bias = __half2float(__ushort_as_half(0xc931));
     float aff = 1024.0f * k_inv + k_bias;
 
-    int base = nb256 * 256 + (warp & 1) * 128;
     float* tmp = sh_tmp + warp * 128;
-    float acc[4] = {};
-    float corr = 0.0f;
-    for (int sl = 0; sl < ksplit; ++sl)
+    // Cross-block inputs: partials/qsums are written by other CTAs (and the
+    // pool lines may sit stale in this SM's L1 from a previous call), so read
+    // them volatile (L1-bypass, L2-coherent with the contributors' fences).
+    // Plain/__ldcg loads here intermittently fed last-layer's data to M > 1
+    // decode batches (solo nt == 1 usually reuses its own lines: coherent).
+    volatile const int* vpar = (volatile const int*) partials;
+    volatile const float* vqs = (volatile const float*) qsums;
+    volatile const int* vqsi = (volatile const int*) qsums;
+    // 8 warps cover 2 rows each; stride the (row, span) pairs when M > 4
+    // (single-shot warp>=2*M left rows >= 4 unwritten at M = 5..8).
+    for (int p = warp; p < 2 * size_m; p += (NUM_THREADS >> 5))
     {
-        int idx = sl * M + row;
-        float q_s = qsums[4 * idx];
-        float suma = q_s * (float) ((const int*) qsums)[4 * idx + 1];
-        const int* p = partials + (size_t) idx * pstride + base;
-        #pragma unroll
-        for (int i = 0; i < 4; ++i)
-            acc[i] += q_s * (float) __ldcg(p + lane * 4 + i);
-        if constexpr (residual)
+        int row = p >> 1;
+        int base = nb256 * 256 + (p & 1) * 128;
+        float acc[4] = {};
+        float corr = 0.0f;
+        for (int sl = 0; sl < ksplit; ++sl)
         {
-            float q2_s = q_s * (1.0f / 254.0f);
-            suma += q2_s * (float) ((const int*) qsums)[4 * idx + 2];
+            int idx = sl * M + row;
+            float q_s = vqs[4 * idx];
+            float suma = q_s * (float) vqsi[4 * idx + 1];
+            volatile const int* q = vpar + (size_t) idx * pstride + base;
             #pragma unroll
             for (int i = 0; i < 4; ++i)
-                acc[i] += q2_s * (float) __ldcg(p + size_n + lane * 4 + i);
+                acc[i] += q_s * (float) q[lane * 4 + i];
+            if constexpr (residual)
+            {
+                float q2_s = q_s * (1.0f / 254.0f);
+                suma += q2_s * (float) vqsi[4 * idx + 2];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    acc[i] += q2_s * (float) q[size_n + lane * 4 + i];
+            }
+            corr += aff * suma;
         }
-        corr += aff * suma;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            tmp[lane * 4 + i] = k_inv * acc[i] + corr;
+        __syncwarp();
+        if constexpr (c_fp32)
+            had_ff_r_128_inner<false, true>(tmp, ((float*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
+        else
+            had_fh_r_128_inner<false, true>(tmp, ((half*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
     }
-    #pragma unroll
-    for (int i = 0; i < 4; ++i)
-        tmp[lane * 4 + i] = k_inv * acc[i] + corr;
-    __syncwarp();
-    if constexpr (c_fp32)
-        had_ff_r_128_inner<false, true>(tmp, ((float*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
-    else
-        had_fh_r_128_inner<false, true>(tmp, ((half*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -9671,15 +9691,14 @@ static int g_num_sms = 82;
 
 // --- adapted host side: plan cache + pool workspace (exl3_gemv_int8.cu) ---
 
-template <int bits, bool c_fp32>
+template <int bits, int M, bool c_fp32>
 static cudaFunction_t sq_kernel_fn()
 {
-    return (cudaFunction_t) exl3_gemv_int8_sq_kernel<bits, 1, c_fp32, false>;
+    return (cudaFunction_t) exl3_gemv_int8_sq_kernel<bits, M, c_fp32, false>;
 }
 
-static size_t smem_for(int bits, int rows_per)
+static size_t smem_for(int bits, int rows_per, int M)
 {
-    constexpr int M = 1;
     constexpr bool residual = false;
     size_t stage = gemv_int8_stage_smem(bits) ? (size_t) 8 * GEMV_STAGE_D * 16 * bits * 4 : 0;
     return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * M * (residual ? 2 : 1)
@@ -9694,18 +9713,23 @@ struct SqPlan
 };
 
 // deterministic launch plan per matrix shape; occupancy query once
-static const SqPlan & plan_sq(int bits, int size_k, int size_n)
+// M = batch rows (nt). M == 1 is the decode path; 2..SQ_M_MAX share one
+// launch with the trellis read once. Cache key includes M (rows_max/smem
+// are M-dependent); M > 1 clamps rows_per to the 48 KB smem budget.
+#define SQ_M_MAX 8
+#define SQ_SMEM_BUDGET 49152
+
+static const SqPlan & plan_sq(int bits, int size_k, int size_n, int M)
 {
-    static std::map<std::tuple<int, int, int>, SqPlan> cache;
+    static std::map<std::tuple<int, int, int, int>, SqPlan> cache;
     static std::mutex mtx;
     std::lock_guard<std::mutex> lock(mtx);
-    auto key = std::make_tuple(bits, size_k, size_n);
+    auto key = std::make_tuple(bits, size_k, size_n, M);
     auto it = cache.find(key);
     if (it != cache.end()) {
         return it->second;
     }
 
-    constexpr int M = 1;
     constexpr bool residual = false;
     int rows_max = gemv_int8_sq_rows_max(M, residual);
     int rows_total = size_k / 16;
@@ -9719,22 +9743,57 @@ static const SqPlan & plan_sq(int bits, int size_k, int size_n)
         rows_per = rows_per < SQ_MINROWS ? SQ_MINROWS : rows_per;
         rows_per = rows_per > rows_max ? rows_max : rows_per;
         rows_per = rows_per > ((rows_total + 7) & ~7) ? ((rows_total + 7) & ~7) : rows_per;
+        if (M > 1) {
+            // clamp to the 48 KB smem budget (M == 1 keeps legacy behavior)
+            size_t stage = gemv_int8_stage_smem(bits) ? (size_t) 8 * GEMV_STAGE_D * 16 * bits * 4 : 0;
+            int cap = (int)((SQ_SMEM_BUDGET - 1024 * M - stage) / (32 + 64 * M));
+            cap &= ~7;
+            if (cap < SQ_MINROWS) cap = SQ_MINROWS;
+            rows_per = rows_per > cap ? cap : rows_per;
+        }
         ksplit = (rows_total + rows_per - 1) / rows_per;
     };
 
     SqPlan plan;
     if (bits == 2) {
-        plan.fn = sq_kernel_fn<2, true>();
+        switch (M) {
+            case 1: plan.fn = sq_kernel_fn<2, 1, true>(); break;
+            case 2: plan.fn = sq_kernel_fn<2, 2, true>(); break;
+            case 3: plan.fn = sq_kernel_fn<2, 3, true>(); break;
+            case 4: plan.fn = sq_kernel_fn<2, 4, true>(); break;
+            case 5: plan.fn = sq_kernel_fn<2, 5, true>(); break;
+            case 6: plan.fn = sq_kernel_fn<2, 6, true>(); break;
+            case 7: plan.fn = sq_kernel_fn<2, 7, true>(); break;
+            default: plan.fn = sq_kernel_fn<2, 8, true>(); break;
+        }
     } else {
-        plan.fn = sq_kernel_fn<3, true>();
+        switch (M) {
+            case 1: plan.fn = sq_kernel_fn<3, 1, true>(); break;
+            case 2: plan.fn = sq_kernel_fn<3, 2, true>(); break;
+            case 3: plan.fn = sq_kernel_fn<3, 3, true>(); break;
+            case 4: plan.fn = sq_kernel_fn<3, 4, true>(); break;
+            case 5: plan.fn = sq_kernel_fn<3, 5, true>(); break;
+            case 6: plan.fn = sq_kernel_fn<3, 6, true>(); break;
+            case 7: plan.fn = sq_kernel_fn<3, 7, true>(); break;
+            default: plan.fn = sq_kernel_fn<3, 8, true>(); break;
+        }
     }
     decomp(6 * g_num_sms, plan.ksplit, plan.rows_per);
-    size_t smem_guess = smem_for(bits, plan.rows_per);
+    size_t smem_guess = smem_for(bits, plan.rows_per, M);
     int maxb;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, plan.fn, NUM_THREADS, smem_guess));
     plan.grid = (maxb * g_num_sms) < 1024 ? (maxb * g_num_sms) : 1024;
     decomp(plan.grid, plan.ksplit, plan.rows_per);
-    plan.smem = smem_for(bits, plan.rows_per);
+    // debug: clamp the launch grid (GGML_PAW_SQ_GRID_MAX=1 serializes all
+    // units through one CTA: no cross-block partials/counters traffic)
+    {
+        const char * e = getenv("GGML_PAW_SQ_GRID_MAX");
+        if (e && atoi(e) > 0 && plan.grid > atoi(e)) {
+            plan.grid = atoi(e);
+            decomp(plan.grid, plan.ksplit, plan.rows_per);
+        }
+    }
+    plan.smem = smem_for(bits, plan.rows_per, M);
     GGML_ASSERT(plan.ksplit <= SQ_KSPLIT_CAP);
     GGML_ASSERT(nb256 <= SQ_COUNTERS_CAP);
 
@@ -9742,13 +9801,13 @@ static const SqPlan & plan_sq(int bits, int size_k, int size_n)
     return res.first->second;
 }
 
-static void launch_sq(const SqPlan & plan, int bits,
+static void launch_sq(const SqPlan & plan, int bits, int M,
                       const half * A, const uint16_t * B, float * C,
                       int size_k, int size_n,
                       const half * suh, const half * svh,
                       int * locks, cudaStream_t stream)
 {
-    static const int g_size_m = 1;         // sq path is m == 1
+    int g_size_m = M;                      // fused batch rows (was hardcoded 1)
     static half * const g_null_a_had = nullptr;  // residual-only operand
     void * args[] =
     {
@@ -10145,7 +10204,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // Hadamards + suh/svh folded), so the hgemm runs on the raw rows.
     static const int x3_prefill_nt = []() {
         const char * e = getenv("GGML_PAW_X3_PREFILL_NT");
-        return e ? atoi(e) : 16;
+        return e ? atoi(e) : 9;
     }();
 
     if (nt >= x3_prefill_nt) {
@@ -10171,28 +10230,31 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                                       CUBLAS_COMPUTE_32F, algo));
         });
     } else {
-    const SqPlan & plan = plan_sq(bits, n, m);
+    // small-nt fused path: one launch over all nt rows (trellis read once).
+    // nt == 1 keeps the exact legacy single-row behavior.
+    GGML_ASSERT(nt <= SQ_M_MAX);
+    const SqPlan & plan = plan_sq(bits, n, m, nt);
 
     // fixed-layout workspace: [counters | qsums | partials]. The counters must
     // be zero at kernel start; they self-reset before return (graph-safe).
-    ggml_cuda_pool_alloc<int> ws(ctx.pool(), SQ_WS_RESERVED + (size_t) plan.ksplit * n);
+    // partials scale with the fused batch: ksplit slices x nt rows x n cols.
+    // qsums needs 4 floats per (slice, row): 4*ksplit*nt must fit the
+    // reserved qsums region (4*SQ_KSPLIT_CAP*8 ints).
+    GGML_ASSERT((size_t) 4 * plan.ksplit * nt <= (size_t) 4 * SQ_KSPLIT_CAP * 8);
+    ggml_cuda_pool_alloc<int> ws(ctx.pool(), SQ_WS_RESERVED + (size_t) plan.ksplit * nt * n);
 
     {
         char shp[64];
         snprintf(shp, sizeof(shp), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
         paw_timed(stream, std::string("x3_sq") + shp, [&]() {
-            // the sq kernel is a single-row GEMV: nt == 1 is one fused launch;
-            // nt > 1 loops it per token (correctness path for small nt)
-            for (int t = 0; t < nt; ++t) {
-                CUDA_CHECK(cudaMemsetAsync(ws.get(), 0, SQ_COUNTERS_CAP * sizeof(int), stream));
-                launch_sq(plan, bits,
-                          (const half *) xh.get() + (size_t) t * n,
-                          (const uint16_t *) trellis->data,
-                          (float *) dst->data + (size_t) t * m,
-                          n, m,
-                          (const half *) suh->data, (const half *) svh->data,
-                          ws.get(), stream);
-            }
+            CUDA_CHECK(cudaMemsetAsync(ws.get(), 0, SQ_COUNTERS_CAP * sizeof(int), stream));
+            launch_sq(plan, bits, nt,
+                      (const half *) xh.get(),
+                      (const uint16_t *) trellis->data,
+                      (float *) dst->data,
+                      n, m,
+                      (const half *) suh->data, (const half *) svh->data,
+                      ws.get(), stream);
         });
     }
     }
@@ -10201,15 +10263,26 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // the Phase-1 oracle (GGML_PAW_X3_DUMP=<dir>)
     if (const char * dump_dir = getenv("GGML_PAW_X3_DUMP")) {
         static int dump_count = 0;
-        if (dump_count < 64) {
+        static const int dump_skip = []() {
+            const char * e = getenv("GGML_PAW_X3_DUMP_SKIP");
+            return e ? atoi(e) : 0;
+        }();
+        static const int dump_cap = []() {
+            const char * e = getenv("GGML_PAW_X3_DUMP_CAP");
+            return e ? atoi(e) : 64;
+        }();
+        if (dump_count >= dump_skip && dump_count < dump_skip + dump_cap) {
             CUDA_CHECK(cudaStreamSynchronize(stream));
             char path[512];
-            snprintf(path, sizeof(path), "%s/dump%02d", dump_dir, dump_count);
+            snprintf(path, sizeof(path), "%s/dump%02d", dump_dir, dump_count - dump_skip);
             FILE * fmeta = fopen((std::string(path) + "_meta.txt").c_str(), "w");
             fprintf(fmeta, "n %d m %d K %d nt %d\n", n, m, bits, nt);
             fclose(fmeta);
             const size_t tbytes = (size_t) trellis->ne[0] * trellis->ne[1] * 2;
-            std::vector<char> host(max((size_t) m * nt * sizeof(float), tbytes));
+            size_t hneed = (size_t) m * nt * sizeof(float);
+            if ((size_t) n * nt * sizeof(float) > hneed) hneed = (size_t) n * nt * sizeof(float);
+            if (tbytes > hneed) hneed = tbytes;
+            std::vector<char> host(hneed);
             auto dump_dev = [&] (const std::string & suffix, const void * dev, size_t bytes) {
                 CUDA_CHECK(cudaMemcpy(host.data(), dev, bytes, cudaMemcpyDeviceToHost));
                 FILE * f = fopen((std::string(path) + suffix).c_str(), "wb");
@@ -10222,8 +10295,8 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             dump_dev("_suh.u16", suh->data, (size_t) n * 2);
             dump_dev("_svh.u16", svh->data, (size_t) m * 2);
             dump_dev("_y.f32", dst->data, (size_t) m * nt * sizeof(float));
-            ++dump_count;
         }
+        ++dump_count;
     }
 }
 

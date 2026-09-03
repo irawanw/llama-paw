@@ -688,6 +688,28 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     used = std::count_if(cells.begin(), cells.end(),
         [](const mem_cell & cell){ return !cell.is_empty(); });
 
+    // temporary debug: trace state-cell assignment for multi-seq ubatches
+    // (PAW batched-inference investigation, env PAW_DBG_RS=1)
+    {
+        static const bool dbg = getenv("PAW_DBG_RS") != nullptr;
+        if (dbg && n_seqs > 1) {
+            fprintf(stderr, "PAW_DBG_RS find_slot: n_seqs=%u n_seq_tokens=%u min=%d max=%d rs_z=%d",
+                n_seqs, n_seq_tokens, min, max, rs_z);
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                const uint32_t i = s*n_seq_tokens;
+                const int cidx = s + min;
+                // note: read cells[].src0 directly; do NOT call s_copy() here
+                // (it resets rollback idx as a side effect)
+                fprintf(stderr, " [s%u seq=%d pos0=%d tail=%d src=%d src0=%d]",
+                    s, (int) ubatch.seq_id[i][0], (int) ubatch.pos[i],
+                    cells[ubatch.seq_id[i][0]].tail,
+                    cells[cidx].src, cells[cidx].src0);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
+
     // sanity check
     return n >= n_seqs;
 }
