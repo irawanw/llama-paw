@@ -12146,6 +12146,15 @@ static void paw_fwht_f32(float * v, const int64_t d) {
     }
 }
 
+// Block-diagonal form: diag(H_blk, ..., H_blk) applied in place over d
+// elements. blk == d reproduces paw_fwht_f32 exactly, so a legacy (power-of-
+// two, unblocked) payload takes the identical arithmetic path.
+static void paw_fwht_blk_f32(float * v, const int64_t d, const int64_t blk) {
+    for (int64_t off = 0; off < d; off += blk) {
+        paw_fwht_f32(v + off, blk);
+    }
+}
+
 void ggml_compute_forward_paw_exp_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     const struct ggml_tensor * kept  = dst->src[0];
     const struct ggml_tensor * dem   = dst->src[1];
@@ -12454,13 +12463,19 @@ void ggml_compute_forward_paw_rt_mm(const struct ggml_compute_params * params, s
 
     const int64_t n       = su->ne[0];
     const int64_t m       = sv->ne[0];
+    // 0 = one Hadamard over the whole dimension (power-of-two payloads);
+    // otherwise diag(H_blk, ...), which is what non-power-of-two dense
+    // checkpoints carry.
+    const int64_t rht_blk = dst->op_params[GGML_PAW_RHT_BLK_SLOT];
+    const int64_t bn      = rht_blk ? rht_blk : n;
+    const int64_t bm      = rht_blk ? rht_blk : m;
     const int64_t words   = trellis->ne[0];
     const int     step    = (int)(words*2/16);      // K*V fresh bits per step (V = 2)
     const int64_t tiles_y = n/16;
     const int64_t ntiles  = (m/16)*tiles_y;
     const int64_t nt      = x->ne[1]*x->ne[2]*x->ne[3];
 
-    GGML_ASSERT(m <= 8192);   // column scratch bound (GDN qkv is 8192)
+    GGML_ASSERT(bm <= 8192);  // column scratch bound; blocked payloads stage one block
 
     const uint16_t    * trd = (const uint16_t    *) trellis->data;
     const float       * sud = (const float       *) su->data;
@@ -12482,17 +12497,23 @@ void ggml_compute_forward_paw_rt_mm(const struct ggml_compute_params * params, s
     // here, so state j is exactly the big-endian u16 at BYTE offset j:
     // word[j/2] for even j, (word[j/2] << 8 | word[j/2+1] >> 8) for odd j.
     // No serial dependency between steps.
-    GGML_ASSERT(step == 8);
+    // step is K*V fresh bits per state, so K = step/2 at V = 2: 8 -> K=4,
+    // 4 -> K=2, 2 -> K=1. The window is byte-aligned only at step 8, hence the
+    // general shift below rather than the byte shortcut this used to take.
+    GGML_ASSERT(step >= 2 && step <= 8);   // K = step/V, V = 2: 1, 1.5, 2, 2.5, ... 4
     for (int64_t tid = ith; tid < ntiles; tid += nth) {
         const uint16_t * tw = trd + tid*words;
         float * wt = wbuf + (tid/tiles_y)*16*n + (tid % tiles_y)*16;
 
         for (int i = 0; i < 128; ++i) {
-            const int      wi = i >> 1;
-            const uint32_t hi = tw[wi];
-            const uint32_t reg = (i & 1) == 0
+            const int      b   = step*i;              // bit offset, MSB-first
+            const int      wi  = b >> 4;
+            const int      off = b & 15;
+            const uint32_t hi  = tw[wi];
+            const uint32_t reg = off == 0
                 ? hi
-                : ((hi << 8) | (tw[wi + 1 < words ? wi + 1 : 0] >> 8)) & 0xFFFFu;
+                : (((hi << off) | (tw[wi + 1 < words ? wi + 1 : 0] >> (16 - off)))
+                   & 0xFFFFu);
 
             const uint32_t p   = reg*(reg + 1);
             const uint32_t row = (p >> 6) & 511;
@@ -12512,7 +12533,7 @@ void ggml_compute_forward_paw_rt_mm(const struct ggml_compute_params * params, s
     // phase B: FWHT each row over n, scale by su
     for (int64_t i = ith; i < m; i += nth) {
         float * row = wbuf + i*n;
-        paw_fwht_f32(row, n);
+        paw_fwht_blk_f32(row, n, bn);
         for (int64_t j = 0; j < n; ++j) {
             row[j] *= sud[j];
         }
@@ -12522,12 +12543,14 @@ void ggml_compute_forward_paw_rt_mm(const struct ggml_compute_params * params, s
     // phase C: FWHT each column over m, scale by sv
     for (int64_t j = ith; j < n; j += nth) {
         float col[8192];
-        for (int64_t i = 0; i < m; ++i) {
-            col[i] = wbuf[i*n + j];
-        }
-        paw_fwht_f32(col, m);
-        for (int64_t i = 0; i < m; ++i) {
-            wbuf[i*n + j] = col[i]*svd[i];
+        for (int64_t off = 0; off < m; off += bm) {
+            for (int64_t i = 0; i < bm; ++i) {
+                col[i] = wbuf[(off + i)*n + j];
+            }
+            paw_fwht_f32(col, bm);
+            for (int64_t i = 0; i < bm; ++i) {
+                wbuf[(off + i)*n + j] = col[i]*svd[off + i];
+            }
         }
     }
     ggml_barrier(params->threadpool);
@@ -12652,7 +12675,8 @@ void ggml_compute_forward_paw_embed_gather(const struct ggml_compute_params * pa
 
     const int64_t n_embd = dst->ne[0];
     const int64_t nt     = ids->ne[0];
-    const int64_t ng     = n_embd/64;
+    const int64_t ng     = lut->ne[1] / codes->ne[1];      // LUT groups per row
+    const int64_t group  = n_embd / ng;                    // 64 on the 35B, 256 on paw-dense
 
     const uint8_t  * cd = (const uint8_t  *) codes->data;
     const uint16_t * ld = (const uint16_t *) lut->data;   // bf16 bit patterns
@@ -12666,7 +12690,7 @@ void ggml_compute_forward_paw_embed_gather(const struct ggml_compute_params * pa
         float * out = yd + t*n_embd;
         for (int64_t j = 0; j < n_embd; ++j) {
             const uint32_t q = (j & 1) ? (crow[j >> 1] >> 4) : (crow[j >> 1] & 0x0F);
-            const uint32_t bits = (uint32_t) ld[(r*ng + (j >> 6))*16 + q] << 16;
+            const uint32_t bits = (uint32_t) ld[(r*ng + j/group)*16 + q] << 16;
             float w;
             memcpy(&w, &bits, sizeof(w));
             out[j] = w;

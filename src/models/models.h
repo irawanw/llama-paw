@@ -2105,6 +2105,14 @@ struct llama_model_paw : public llama_model_qwen35moe {
         ggml_tensor * rt_trellis = nullptr;  // I16 [K*16, ntiles]
         ggml_tensor * rt_su      = nullptr;  // F32 [n]
         ggml_tensor * rt_sv      = nullptr;  // F32 [m] (Wscale folded)
+        // EXL3-compatible mul1-v1 codec (decode GEMV, fused H128): present on
+        // individual matrices when the GGUF ships an x3 rewrite alongside the
+        // original rt payload. ne_mm() dispatches to ggml_paw_x3_mm at
+        // nt == 1 when GGML_PAW_X3 is on; prefill and legacy runs keep the
+        // rt path, so the same file serves as its own A/B comparison.
+        ggml_tensor * x3_trellis = nullptr;  // I16 [16*K, ntiles]
+        ggml_tensor * x3_suh     = nullptr;  // F16 [n]
+        ggml_tensor * x3_svh     = nullptr;  // F16 [m]
     };
     // one routed-expert projection (QTIP trellis + RHT sides + low-rank basis)
     struct m1_exp {
@@ -2121,6 +2129,7 @@ struct llama_model_paw : public llama_model_qwen35moe {
         m1_ne wq, wk, wv, wo;                   // full-attention layers
         m1_ne wqkv, wqkv_gate, ssm_out;         // GDN layers
         m1_ne gate_shexp, up_shexp, down_shexp; // shared expert (all layers)
+        m1_ne ffn_gate, ffn_up, ffn_down;       // dense FFN (paw-dense only)
         ggml_tensor * remap = nullptr;          // I32 [256]
         m1_exp exps[3];                         // gate, up, down
     };
@@ -2134,6 +2143,11 @@ struct llama_model_paw : public llama_model_qwen35moe {
 
     // payload v3 (additive: format_version 3) extra tiers
     uint32_t      m1_version       = 2;
+    // Rotation block size for the NE spine. 0 = one Hadamard per dimension
+    // (every shipped 35B payload; requires power-of-two shapes). A dense
+    // checkpoint whose dimensions are not powers of two carries a positive
+    // block size here and rotates within blk-wide groups instead.
+    uint32_t      m1_rht_blk       = 0;
     ggml_tensor * m1_ne_tlut       = nullptr;   // F32 [2, 512] (rotated NE tier)
     ggml_tensor * m1_head_qp      = nullptr;    // I8  [n/8*5, vocab]
     ggml_tensor * m1_head_gscale  = nullptr;    // F16 [n/64, vocab]
@@ -2144,9 +2158,45 @@ struct llama_model_paw : public llama_model_qwen35moe {
     // instead of the packed expert tier (P2 hybrid bring-up artifacts)
     bool m1_stock_experts = false;
 
+protected:
+    // tensor-loading helpers shared with paw-dense. m1_create takes the shape
+    // from the GGUF metadata (payload shapes are not derivable from hparams);
+    // m1_create_ne picks the v2 or v3 NE-tier tensor set off m1_version.
+    ggml_tensor * m1_create(llama_model_loader & ml, const LLM_TN_IMPL & tnv, bool required);
+    m1_ne         m1_create_ne(llama_model_loader & ml, llm_tensor base, int il);
+    // per-layer FFN tier — routed experts + shared expert here, three dense
+    // rt matrices in paw-dense
+    virtual void  load_arch_ffn_tensors(llama_model_loader & ml, int il);
+
+    // Which of the 35B's global codecs a checkpoint actually carries. A dense
+    // port has no expert tier at all, and ships embed/head as stock k-quants
+    // (measured: q4_K/q5_K beat both PAW tiers on bits and error), so it
+    // overrides all three and uses the ordinary tok_embd/output tensors.
+    virtual bool  uses_paw_experts() const { return true; }
+    virtual bool  uses_paw_embed()   const { return true; }
+    virtual bool  uses_paw_head()    const { return true; }
+public:
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model_paw & model, const llm_graph_params & params);
-    private:
+        virtual ~graph() = default;
+
+    protected:
+        // Derived arches (paw-dense) reuse the whole stack and swap only the
+        // FFN. build() is split out of the ctor because the FFN hook is
+        // virtual and virtual dispatch does not work from a base ctor body.
+        struct defer_build_t {};
+        graph(const llama_model_paw & model, const llm_graph_params & params, defer_build_t);
+        void build();
+
+        // GGML_PAW_RT_BATCH_MASK site gate (bit2 = the gate+up pair); the
+        // env parsing lives in paw.cpp
+        static bool rt_batch_site(int bit);
+
+        virtual ggml_tensor * build_layer_ffn(
+                    ggml_tensor * cur,
+                            int   il);
+
         ggml_tensor * ne_mm(const m1_ne & w, ggml_tensor * x);
         ggml_tensor * ne_mm_batch(const m1_ne * ws, int n_matrices, ggml_tensor * x);
         ggml_tensor * v_tiled(ggml_tensor * y);
@@ -2161,9 +2211,6 @@ struct llama_model_paw : public llama_model_qwen35moe {
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,
                             int   il);
-        ggml_tensor * build_layer_ffn(
-                    ggml_tensor * cur,
-                            int   il);
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,
                     ggml_tensor * weights,
@@ -2174,6 +2221,30 @@ struct llama_model_paw : public llama_model_qwen35moe {
                             int   il);
 
         const llama_model_paw & model;
+    };
+};
+
+
+// PAW-27B: the same codec on the dense qwen35 topology. Attention, GDN,
+// embedding and lm_head are byte-identical to llama_model_paw; only the FFN
+// changes -- three rt matrices per layer instead of the routed-expert tier
+// and the shared expert. A separate arch string is required because
+// llama_model_create dispatches on arch alone, before hparams exist.
+struct llama_model_paw_dense : public llama_model_paw {
+    llama_model_paw_dense(const struct llama_model_params & params) : llama_model_paw(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    void load_arch_ffn_tensors(llama_model_loader & ml, int il) override;
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    // dense: no expert tier, stock q4_K embedding, stock q5_K head
+    bool uses_paw_experts() const override { return false; }
+    bool uses_paw_embed()   const override { return false; }
+    bool uses_paw_head()    const override { return false; }
+    struct graph : public llama_model_paw::graph {
+        graph(const llama_model_paw_dense & model, const llm_graph_params & params);
+    protected:
+        ggml_tensor * build_layer_ffn(ggml_tensor * cur, int il) override;
     };
 };
 

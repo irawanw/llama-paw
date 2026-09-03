@@ -1315,10 +1315,21 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    static const bool ctx_time_on0 = getenv("LLAMA_CTX_TIME") != nullptr;
+    int64_t t_ap0 = ctx_time_on0 ? -ggml_time_us() : 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+    if (ctx_time_on0) {
+        static int64_t acc_ap = 0; static int n_ap = 0;
+        acc_ap += ggml_time_us() + t_ap0;
+        if (++n_ap % 8 == 0) {
+            fprintf(stderr, "ctx-time: memory-apply=%.1f ms cum (last=%.2f)\n",
+                acc_ap/1e6, (ggml_time_us() + t_ap0)/1e3);
+            fflush(stderr);
+        }
     }
 
     auto * res = gf_res_prev.get();
@@ -1364,17 +1375,38 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    // phase wall clock per ubatch (LLAMA_CTX_TIME=1): memory apply, graph
+    // reuse decision, input staging, compute
+    static const bool ctx_time_on = getenv("LLAMA_CTX_TIME") != nullptr;
+    int64_t t_apply = 0, t_reuse = 0, t_inputs = 0, t_comp = 0;
+    if (ctx_time_on) { t_apply = -ggml_time_us(); }
+    if (ctx_time_on && mctx) { /* apply already done above */ }
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
 
+        if (ctx_time_on) { t_reuse = ggml_time_us(); }
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+        if (ctx_time_on) { t_inputs = ggml_time_us() - t_reuse; }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (ctx_time_on) { t_comp = -ggml_time_us(); }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (ctx_time_on) {
+        t_comp += ggml_time_us();
+        static int64_t acc[4] = {0, 0, 0, 0};
+        static int n_ub = 0;
+        acc[0] += t_inputs; acc[1] += t_comp;
+        if (++n_ub % 8 == 0) {
+            fprintf(stderr, "ctx-time: inputs=%.1f ms compute=%.1f ms (last ubatch: in=%.2f comp=%.2f)\n",
+                acc[0]/1e6, acc[1]/1e6, t_inputs/1e3, t_comp/1e3);
+            fflush(stderr);
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2338,7 +2370,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
-        (model.arch == LLM_ARCH_PAW || model.arch == LLM_ARCH_MACH1) ||
+        (model.arch == LLM_ARCH_PAW || model.arch == LLM_ARCH_MACH1 || model.arch == LLM_ARCH_PAW_DENSE) ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());

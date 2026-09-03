@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "paw.cuh"
+#include "cp-async.cuh"
 #include <cstring>
 #include <mma.h>
 #include <cooperative_groups.h>
@@ -79,6 +80,11 @@ static bool paw_debug_on() {
     return on;
 }
 
+static bool debug_diff_on() {
+    static const bool on = paw_env_int("GGML_PAW_RT_WALK_QTIP_DEBUG", 0) != 0;
+    return on;
+}
+
 struct paw_time_table {
     std::mutex mtx;
     std::map<std::string, std::pair<long long, double>> acc;   // key -> (calls, total us)
@@ -101,9 +107,28 @@ static paw_time_table & paw_times() {
     return t;
 }
 
+// secondary stream for decoding expert slabs concurrently with the cuBLAS
+// GEMMs of the previous slab (created once, never captured by graphs)
+static cudaStream_t paw_aux_stream() {
+    static cudaStream_t s = nullptr;
+    if (!s) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    }
+    return s;
+}
+
 template <typename F>
 static void paw_timed(cudaStream_t stream, const std::string & key, F && launch) {
     if (!paw_time_on()) {
+        launch();
+        return;
+    }
+    // timing syncs are illegal inside a graph capture (the dense path
+    // captures where the 35B blas path did not); time only the replay-free
+    // eager launches and let captured work run unprofiled
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap);
+    if (cap != cudaStreamCaptureStatusNone) {
         launch();
         return;
     }
@@ -264,7 +289,7 @@ static __device__ __forceinline__ void paw_fwht_block_v2(float * sh, const int d
 
 // host gate + geometry for the register-chunk FWHT (GGML_PAW_FWHT_V2=1).
 static bool paw_fwht_v2_on() {
-    static const bool on = paw_env_int("GGML_PAW_FWHT_V2", 0) != 0;
+    static const bool on = paw_env_int("GGML_PAW_FWHT_V2", 1) != 0;
     return on;
 }
 static __host__ __device__ __forceinline__ bool paw_fwht_v2_ok(int d) {
@@ -324,7 +349,7 @@ static __global__ void paw_embed_gather_kernel(
         const uint16_t * GGML_CUDA_RESTRICT lut,    // bf16 bit patterns
         const int32_t  * GGML_CUDA_RESTRICT ids,
         float          * GGML_CUDA_RESTRICT dst,
-        const int n_embd, const int64_t total) {
+        const int n_embd, const int gsh, const int64_t total) {
     const int64_t gid = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (gid >= total) {
         return;
@@ -333,11 +358,11 @@ static __global__ void paw_embed_gather_kernel(
     const int64_t tok = gid / n_embd;
     const int     j   = (int)(gid % n_embd);
     const int64_t r   = ids[tok];
-    const int     ng  = n_embd / 64;
+    const int     ng  = n_embd >> gsh;
 
     const uint32_t by = codes[r*(n_embd/2) + (j >> 1)];
     const uint32_t q  = (j & 1) ? (by >> 4) : (by & 0x0Fu);
-    const uint32_t bits = (uint32_t) lut[(r*ng + (j >> 6))*16 + q] << 16;
+    const uint32_t bits = (uint32_t) lut[(r*ng + (j >> gsh))*16 + q] << 16;
     dst[gid] = __uint_as_float(bits);
 }
 
@@ -359,6 +384,16 @@ void ggml_cuda_op_paw_embed_gather(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int64_t nt     = ids->ne[0];
     const int64_t total  = nt*n_embd;
 
+    // group size comes from the LUT shape (64 on every shipped 35B payload,
+    // 256 on paw-dense); it is a power of two, so index by shift
+    const int64_t ng = lut->ne[1] / codes->ne[1];
+    const int64_t group = n_embd / ng;
+    GGML_ASSERT(group*ng == n_embd && (group & (group - 1)) == 0);
+    int gsh = 0;
+    while ((1 << gsh) < group) {
+        ++gsh;
+    }
+
     const dim3 grid((unsigned)((total + 255)/256), 1, 1);
     paw_launch(paw_embed_gather_kernel,
         ggml_cuda_kernel_launch_params(grid, dim3(256, 1, 1), 0, ctx.stream()),
@@ -366,7 +401,7 @@ void ggml_cuda_op_paw_embed_gather(ggml_backend_cuda_context & ctx, ggml_tensor 
         (const uint16_t *) lut->data,
         (const int32_t  *) ids->data,
         (float          *) dst->data,
-        n_embd, total);
+        n_embd, gsh, total);
 }
 
 //
@@ -614,7 +649,7 @@ static bool paw_rt_bank_fp8_on() {
 }
 
 static bool paw_head_bank_fp8_on() {
-    static const bool on = paw_env_int("GGML_PAW_HEAD_BANK_FP8", paw_bank_fp8_on() ? 1 : 0) != 0;
+    static const bool on = paw_env_int("GGML_PAW_HEAD_BANK_FP8", 1) != 0;
     return on;
 }
 
@@ -766,6 +801,69 @@ static __global__ void paw_rt_bank_gemv_fp8(
     }
 }
 
+// v3-pattern twin of paw_rt_bank_gemv_fp8: u staged in shared once per block
+// (kills the 2-row-per-warp redundant global re-reads), two rows per warp
+// with independent accumulators for FMA-chain ILP, uint4-width bank loads.
+// Grid (m/16, 1, nt), 256 threads. Requires n % 4 == 0.
+static __global__ void paw_rt_bank_gemv_fp8_v3(
+        const uint8_t * GGML_CUDA_RESTRICT bank,  // [m, n] row-major e5m2
+        const float   * GGML_CUDA_RESTRICT scr_u, // [nt, n] row-major
+        float         * GGML_CUDA_RESTRICT scr_v, // [nt, m] row-major
+        const int m, const int n, const int nt) {
+    constexpr int WARPS = 8;
+    __shared__ float lut[256];
+    __shared__ float u_sh[4096];
+
+    const int tid = threadIdx.x;
+    if (tid < 256) {
+        lut[tid] = paw_e5m2_to_f32((uint8_t) tid);
+    }
+    const int t    = blockIdx.z;
+    const int lane = tid & 31;
+    const int wid  = tid >> 5;
+
+    ggml_cuda_pdl_sync();
+    const float * u = scr_u + (int64_t) t*n;
+    for (int i = tid; i < n; i += 256) {
+        u_sh[i] = u[i];
+    }
+    __syncthreads();
+
+    const int n4 = n/4;
+    const float4 * u4 = (const float4 *) u_sh;
+
+    for (int r = wid; r < WARPS*2; r += WARPS) {
+        const int row = blockIdx.x*WARPS*2 + r;
+        if (row < m) {
+            const uint32_t * W4 = (const uint32_t *) (bank + (int64_t) row*n);
+            float acc0 = 0.0f;
+            float acc1 = 0.0f;
+            int i = lane;
+            for (; i + 32 < n4; i += 64) {
+                const uint32_t w0 = __ldcs(W4 + i);
+                const uint32_t w1 = __ldcs(W4 + i + 32);
+                const uint8_t * wb0 = (const uint8_t *) &w0;
+                const uint8_t * wb1 = (const uint8_t *) &w1;
+                const float4 x0 = u4[i];
+                const float4 x1 = u4[i + 32];
+                acc0 += lut[wb0[0]]*x0.x + lut[wb0[1]]*x0.y + lut[wb0[2]]*x0.z + lut[wb0[3]]*x0.w;
+                acc1 += lut[wb1[0]]*x1.x + lut[wb1[1]]*x1.y + lut[wb1[2]]*x1.z + lut[wb1[3]]*x1.w;
+            }
+            for (; i < n4; i += 32) {
+                const uint32_t w0 = __ldcs(W4 + i);
+                const uint8_t * wb0 = (const uint8_t *) &w0;
+                const float4 x0 = u4[i];
+                acc0 += lut[wb0[0]]*x0.x + lut[wb0[1]]*x0.y + lut[wb0[2]]*x0.z + lut[wb0[3]]*x0.w;
+            }
+            float acc = acc0 + acc1;
+            acc = warp_reduce_sum<32>(acc);
+            if (lane == 0) {
+                scr_v[(int64_t) t*m + row] = acc;
+            }
+        }
+    }
+}
+
 static __device__ __forceinline__ uint16_t paw_idx80_get(const uint32_t * W, const int i) {
     const int bit = 10*(i & 15);
     const int wi = bit >> 5;
@@ -822,7 +920,8 @@ static __global__ void paw_rt_bank_gemv_idx80(
 }
 
 static bool paw_head_packed_on() {
-    static const bool on = paw_env_int("GGML_PAW_HEAD_PACKED", 0) != 0;
+    // measured 2.4x faster than the I16-code gemv on RTX 3060 decode
+    static const bool on = paw_env_int("GGML_PAW_HEAD_PACKED", 1) != 0;
     return on;
 }
 
@@ -936,7 +1035,7 @@ static __global__ void paw_head_packed_gemv_mt_kernel(
 }
 
 static bool paw_head_packed_mt_on() {
-    static const bool on = paw_env_int("GGML_PAW_HEAD_PACKED_MT", 0) != 0;
+    static const bool on = paw_env_int("GGML_PAW_HEAD_PACKED_MT", 1) != 0;
     return on;
 }
 
@@ -1272,33 +1371,50 @@ static __global__ void paw_rt_u_kernel(
         const float * GGML_CUDA_RESTRICT su,
         const float * GGML_CUDA_RESTRICT x,
         float       * GGML_CUDA_RESTRICT scr_u,
-        const int n) {
+        const int n,
+        const int blk) {
+    // blk == n is the legacy single-Hadamard path: the loop runs once with
+    // off == 0 and the arithmetic is identical to before blocking existed.
+    // blockIdx.y selects the rotation chunk so chunks run on separate SMs
+    // instead of serializing inside one block (per-chunk math is unchanged).
     __shared__ float sh[4096];
 
     const int t   = blockIdx.x;
+    const int off = blockIdx.y * blk;
     const int tid = threadIdx.x;
 
     ggml_cuda_pdl_sync();
-    for (int i = tid; i < n; i += WG) {
-        sh[i] = su[i] * x[(int64_t) t*n + i];
-    }
-    __syncthreads();
-    if (WG == n/16 && paw_fwht_v2_ok(n)) {
-        paw_fwht_block_v2(sh, n, tid, WG);
-    } else {
-        paw_fwht_block(sh, n, tid, WG);
-    }
-    const float sc     = __fsqrt_rn((float) n);
+    const float sc     = __fsqrt_rn((float) blk);
     const float inv_sc = __frcp_rn(sc);
-    for (int i = tid; i < n; i += WG) {
-        scr_u[(int64_t) t*n + i] = sh[i] * inv_sc;
+    {
+        for (int i = tid; i < blk; i += WG) {
+            sh[i] = su[off + i] * x[(int64_t) t*n + off + i];
+        }
+        __syncthreads();
+        if (WG == blk/16 && paw_fwht_v2_ok(blk)) {
+            paw_fwht_block_v2(sh, blk, tid, WG);
+        } else {
+            paw_fwht_block(sh, blk, tid, WG);
+        }
+        for (int i = tid; i < blk; i += WG) {
+            scr_u[(int64_t) t*n + off + i] = sh[i] * inv_sc;
+        }
     }
 }
 
 // WG covers one thread per column tile (tid < tiles_y walk); WG=128 avoids
 // launching idle warps when tiles_y <= 128 (n <= 2048). The dropped warps
 // only ever contributed exact zeros to the cross-warp reduction.
-template <int WG>
+// WORDS is the trellis rate in int16 words per 16x16 tile: bits-per-tile is
+// WORDS*16 over 128 states, so step = WORDS/8 fresh bits per state and the rate
+// is K = step/V = WORDS/16 at V=2. 64 -> K=4 (the shipped 35B payload),
+// 48 -> K=3, 32 -> K=2, 24 -> K=1.5, 16 -> K=1.
+//
+// Only WORDS=64 gives byte-aligned state windows, and only 16/32/64 give
+// word-aligned tile rows, so the window is extracted by global bit offset
+// rather than from a per-row register cache. At WORDS=64 that folds back to
+// exactly the hand-unrolled arithmetic this replaced.
+template <int WG, int WORDS>
 static __global__ void paw_rt_walk_kernel(
         const uint16_t * GGML_CUDA_RESTRICT trellis,
         const half     * GGML_CUDA_RESTRICT tlut,     // pre-rounded fp16
@@ -1314,9 +1430,10 @@ static __global__ void paw_rt_walk_kernel(
     const int tr  = blockIdx.x;
     const int tid = threadIdx.x;
 
-    constexpr int words = 64;      // K = 4: 64 int16 words per 16x16 tile
+    static_assert(WORDS % 8 == 0 && WORDS >= 16 && WORDS <= 64, "unsupported trellis rate");
+    constexpr int step  = WORDS/8;   // K*V fresh bits per state, V = 2
+    constexpr int words = WORDS;     // int16 words per 16x16 tile
     const int tiles_y = n / 16;
-    const bool have   = tid < tiles_y;
 
     ggml_cuda_pdl_sync();
 
@@ -1333,9 +1450,14 @@ static __global__ void paw_rt_walk_kernel(
         partial[i] = 0.0f;
     }
 
-    if (have) {
-        const int64_t tw = ((int64_t) tr*tiles_y + tid)*words;
-        const float * ub = scr_u + (int64_t) t*n + tid*16;
+    // One thread per tile column, strided so n is not capped at WG*16. This
+    // used to be a bare `if (tid < tiles_y)`, which silently dropped every
+    // column past 4096 -- invisible until now because K=4 takes the bank path
+    // and the walk only ran on the narrow GDN projections. For tiles_y <= WG
+    // the loop runs exactly once at c == tid, so the arithmetic is unchanged.
+    for (int c = tid; c < tiles_y; c += WG) {
+        const int64_t tw = ((int64_t) tr*tiles_y + c)*words;
+        const float * ub = scr_u + (int64_t) t*n + c*16;
 
         // the tile column's 16 u values are shared by all 16 tile rows
         float uu[16];
@@ -1345,19 +1467,18 @@ static __global__ void paw_rt_walk_kernel(
         }
 
         for (int ri = 0; ri < 16; ++ri) {
-            // row ri covers stream bytes [8*ri, 8*ri+8] -> words [4*ri, 4*ri+4]
-            uint32_t w[5];
-#pragma unroll
-            for (int q = 0; q < 5; ++q) {
-                w[q] = trellis[tw + ((4*ri + q) & 63)];   // only q=4,ri=15 wraps
-            }
-            // 8 independent byte-aligned direct-window states
+            // 8 states per tile row, each a 16-bit window starting at bit
+            // step*(8*ri + j) of the tile's MSB-first stream, wrapping at the end
             uint32_t ph[8];
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                const uint32_t hi = w[j >> 1];
-                const uint32_t st = (j & 1) == 0 ? hi
-                    : (((hi << 8) | (w[(j >> 1) + 1] >> 8)) & 0xFFFFu);
+                const int b   = step*(8*ri + j);
+                const int wi  = (b >> 4) % words;
+                const int off = b & 15;
+                const uint32_t w0 = trellis[tw + wi];
+                const uint32_t st = off == 0 ? w0
+                    : (((w0 << off) | (trellis[tw + (wi + 1) % words] >> (16 - off)))
+                       & 0xFFFFu);
                 ph[j] = st*(st + 1u);
             }
             // same accumulation order as the serial walk: per state, w0 then w1
@@ -1372,7 +1493,7 @@ static __global__ void paw_rt_walk_kernel(
                 }
                 acc += a0*uu[2*j] + a1*uu[2*j + 1];
             }
-            partial[ri] = acc;
+            partial[ri] += acc;
         }
     }
 
@@ -1433,68 +1554,127 @@ static __global__ void paw_rt_walk_kernel(
 // decode and mma. One block = one warp = one 16-row output tile; grid.x =
 // m/16 (matches rt_bank_gemv's block count, avoiding the v1 occupancy
 // mistake from the rt_apply attempts).
-static __global__ void paw_rt_walk_qtip_kernel(
+// rate-templated twin of paw_rt_walk_qtip_kernel: same mma.sync epilogue,
+// but the per-row state windows come from the generic bit-stream math
+// (paw_rt_walk_kernel) instead of the K4-only (4*ri+q)&63 wrap, so the
+// dense payload's K1/K1.5 rates get the register-walk fast path too.
+template <int WORDS>
+static __global__ void paw_rt_walk_qtip_rate_kernel(
         const uint16_t * GGML_CUDA_RESTRICT trellis,
         const half     * GGML_CUDA_RESTRICT tlut,     // pre-rounded fp16, [2,512]
         const float    * GGML_CUDA_RESTRICT scr_u,    // [nt=1, n]
         float          * GGML_CUDA_RESTRICT scr_v,    // [nt=1, m]
         const int m, const int n) {
-    __shared__ float  slut[1024];
-    __shared__ half   tile16[16][16];
-    __shared__ half   bcol[16];   // this K-step's 16 activation values (col 0 real, rest 0)
+    // stride-3 padding: a packed [512][2] float table makes every warp's
+    // random row gather land on even banks only (2+ way conflicts); with a
+    // stride of 3 the bank index (3*row)%32 covers all 32 banks uniformly
+    __shared__ float  slut[512*3];
+    // per-warp decode scratch: each warp owns an independent output tile
+    __shared__ half   tile16[8][16][16];
+    __shared__ half   bcol[8][16];   // this K-step's 16 activation values (col 0 real, rest 0)
 
+    constexpr int step  = WORDS/8;   // fresh bits per state, V = 2
+    // one BLOCK per output tile; four warps SPLIT the tile-column range so
+    // small-m matrices (down proj: only m/16 tiles) still fill the machine
+    // -- the walk is latency-bound, memory-level parallelism is everything
+    const int wid  = threadIdx.x >> 5;
     const int tr   = blockIdx.x;
-    const int lane = threadIdx.x;
+    const int lane = threadIdx.x & 31;
 
-    constexpr int words   = 64;
     const int tiles_y = n / 16;
 
     ggml_cuda_pdl_sync();
 
-    for (int i = lane; i < 1024; i += 32) {
-        slut[i] = __half2float(tlut[i]);
+    for (int i = threadIdx.x; i < 512; i += 256) {
+        slut[3*i + 0] = __half2float(tlut[2*i + 0]);
+        slut[3*i + 1] = __half2float(tlut[2*i + 1]);
     }
-    __syncwarp();
+    __syncthreads();   // all four warps share this table
 
     const int groupID = lane >> 2;
     const int tid4     = lane & 3;
     float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
 
-    for (int ct = 0; ct < tiles_y; ++ct) {
-        // --- decode this (tr, ct) 16x16 tile: lanes 0-15 each decode one
-        // full row (16 columns), verbatim rt_walk math ---
+    // the per-lane state windows (bit offsets into the tile's stream) do not
+    // depend on ct -- only the tile base word moves -- so the trellis loads
+    // are software-pipelined one ct iteration ahead: issue iteration ct+8's
+    // loads before consuming iteration ct's, giving them a full MMA-plus-
+    // decode of latency slack instead of stalling the loop every step
+    const int ri = lane >> 1;
+    const int jb = (lane & 1)*4;
+    int      wi0[4], wi1[4], offv[4];
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+        const int b = step*(8*ri + jb + jj);
+        wi0[jj]  = (b >> 4) % WORDS;
+        offv[jj] = b & 15;
+        wi1[jj]  = (wi0[jj] + 1) % WORDS;
+    }
+    uint32_t c0[4], c1[4];
+    float    ucur = 0.f;
+    {
+        const int64_t tw = ((int64_t) tr*tiles_y + wid)*WORDS;
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) {
+            c0[jj] = trellis[tw + wi0[jj]];
+            c1[jj] = offv[jj] != 0 ? trellis[tw + wi1[jj]] : 0u;
+        }
         if (lane < 16) {
-            const int ri = lane;
-            const int64_t tw = ((int64_t) tr*tiles_y + ct)*words;
-            uint32_t w[5];
+            ucur = scr_u[wid*16 + lane];
+        }
+    }
+
+    // gridDim.y > 1: several blocks SHARE one output tile, each walking a
+    // strided subset of the tile columns (the serial chain per warp shrinks
+    // by gridDim.y); partials are atomic-added into scr_v
+    for (int ct = wid + 8*blockIdx.y; ct < tiles_y; ct += 8*gridDim.y) {
+        // --- prefetch this lane's windows for the NEXT ct this warp owns ---
+        const int ctn = ct + 8*gridDim.y;
+        uint32_t n0[4], n1[4];
+        float    unext = 0.f;
+        if (ctn < tiles_y) {
+            const int64_t twn = ((int64_t) tr*tiles_y + ctn)*WORDS;
 #pragma unroll
-            for (int q = 0; q < 5; ++q) {
-                w[q] = trellis[tw + ((4*ri + q) & 63)];
+            for (int jj = 0; jj < 4; ++jj) {
+                n0[jj] = trellis[twn + wi0[jj]];
+                n1[jj] = offv[jj] != 0 ? trellis[twn + wi1[jj]] : 0u;
             }
+            if (lane < 16) {
+                unext = scr_u[ctn*16 + lane];
+            }
+        }
+        // --- decode this (tr, ct) 16x16 tile: lanes 0-15 each decode one
+        // full row (16 columns), generic rate-aware window math ---
+        {
+            // all 32 lanes decode: two lanes per row, four states each --
+            // halves the serial chain vs one lane doing the whole row
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const uint32_t hi = w[j >> 1];
-                const uint32_t st = (j & 1) == 0 ? hi
-                    : (((hi << 8) | (w[(j >> 1) + 1] >> 8)) & 0xFFFFu);
+            for (int jj = 0; jj < 4; ++jj) {
+                const int j   = jb + jj;
+                const int off = offv[jj];
+                const uint32_t w0 = c0[jj];
+                const uint32_t st = off == 0 ? w0
+                    : (((w0 << off) | (c1[jj] >> (16 - off)))
+                       & 0xFFFFu);
                 const uint32_t ph = st*(st + 1u);
                 const uint32_t row = (ph >> 6) & 511u;
-                float a0 = slut[2*row + 0];
-                const float a1 = slut[2*row + 1];
+                float a0 = slut[3*row + 0];
+                const float a1 = slut[3*row + 1];
                 if (ph & 0x8000u) {
                     a0 = -a0;
                 }
-                tile16[ri][2*j + 0] = __float2half_rn(a0);
-                tile16[ri][2*j + 1] = __float2half_rn(a1);
+                tile16[wid][ri][2*j + 0] = __float2half_rn(a0);
+                tile16[wid][ri][2*j + 1] = __float2half_rn(a1);
             }
         }
         // --- stage this K-step's 16 activation values (nt==1: col 0 real) ---
         if (lane < 16) {
-            bcol[lane] = __float2half_rn(scr_u[ct*16 + lane]);
+            bcol[wid][lane] = __float2half_rn(ucur);   // nt==1: one shared u vector
         }
         __syncwarp();
 
         // --- build A/B fragments per the validated m16n8k16 layout ---
-        auto Aat = [&](int r, int c) -> half { return tile16[r][c]; };
+        auto Aat = [&](int r, int c) -> half { return tile16[wid][r][c]; };
         half2 a01 = __halves2half2(Aat(groupID,   tid4*2+0), Aat(groupID,   tid4*2+1));
         half2 a23 = __halves2half2(Aat(groupID+8, tid4*2+0), Aat(groupID+8, tid4*2+1));
         half2 a45 = __halves2half2(Aat(groupID,   tid4*2+8), Aat(groupID,   tid4*2+9));
@@ -1511,8 +1691,8 @@ static __global__ void paw_rt_walk_qtip_kernel(
         // (tid4==0 below) is a valid read of the real result. Wasteful
         // (computes the same dot product 8x redundantly across tid4) but
         // not incorrect, and simpler than truly zero-padding 7 columns.
-        half2 b01 = __halves2half2(bcol[tid4*2+0], bcol[tid4*2+1]);
-        half2 b23 = __halves2half2(bcol[tid4*2+8], bcol[tid4*2+9]);
+        half2 b01 = __halves2half2(bcol[wid][tid4*2+0], bcol[wid][tid4*2+1]);
+        half2 b23 = __halves2half2(bcol[wid][tid4*2+8], bcol[wid][tid4*2+9]);
         uint32_t rb0 = *(uint32_t*)&b01;
         uint32_t rb1 = *(uint32_t*)&b23;
 
@@ -1523,13 +1703,1145 @@ static __global__ void paw_rt_walk_qtip_kernel(
             : "r"(ra0), "r"(ra1), "r"(ra2), "r"(ra3), "r"(rb0), "r"(rb1)
         );
         __syncwarp();   // tile16/bcol reused by the next ct
+
+        // slide the prefetched windows down for the next iteration
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) {
+            c0[jj] = n0[jj];
+            c1[jj] = n1[jj];
+        }
+        ucur = unext;
     }
 
     // only tid4==0 (groupID's col 0 slot) is the real token; d0 -> row
     // groupID, d2 -> row groupID+8 (per the validated D-fragment layout).
+    // eight warps covered disjoint ct subsets -- reduce through shared
+    __shared__ float xred[8][16];
     if (tid4 == 0) {
-        scr_v[tr*16 + groupID]     = d0;
-        scr_v[tr*16 + groupID + 8] = d2;
+        xred[wid][groupID]     = d0;
+        xred[wid][groupID + 8] = d2;
+    }
+    __syncthreads();
+    if (wid == 0 && tid4 == 0) {
+        #pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            const float sum = xred[0][r] + xred[1][r] + xred[2][r] + xred[3][r]
+                            + xred[4][r] + xred[5][r] + xred[6][r] + xred[7][r];
+            if (gridDim.y == 1) {
+                scr_v[(int64_t) blockIdx.z*m + tr*16 + r] = sum;
+            } else {
+                atomicAdd(&scr_v[(int64_t) blockIdx.z*m + tr*16 + r], sum);
+            }
+        }
+    }
+}
+
+
+// fragment-direct qtip walk: each lane decodes EXACTLY its own mma.sync
+// fragment elements straight out of the trellis stream -- the four states a
+// lane needs are fixed by the m16n8k16 layout ((row=g,g+8) x (j=tid4,tid4+4)),
+// so no shared-memory staging, no syncwarp in the loop, no cross-lane
+// exchange at all. Verified bit-exact against paw_rt_walk_qtip_rate_kernel
+// in an isolated probe before landing here.
+// The HYB codebook gather is what this kernel is bound on: ncu puts l1tex at
+// 60.7% with dram at 16.0% and the tensor pipe at 9.1%.  Reading `tlut` from
+// global memory is 32 divergent addresses into a 2 KiB table, which the
+// coalescer cannot merge -- ~25 distinct sectors, so the LSU replays the one
+// instruction that matters ~25 times, four times per lane per mma.
+//
+// QTIP's own kernel (Cornell-RelaxML/qtip, qtip-kernels/src/inference.cu:352)
+// duplicates the codebook 32x in shared memory, one private copy per lane:
+//     masked_idx = (idx & 0b0111111111000000) | (laneId << 1)
+// so the half2 index is (row << 5) | lane and the bank is
+// (row*32 + lane) % 32 == lane -- a distinct bank per lane for *every* row,
+// conflict-free by construction.  QTIP S4: "2KiB codebook, which fits in L1
+// cache even after duplication for bank conflicts (32x)".  The duplication is
+// free in instruction count: the `| lane` replaces the `>> 6`.
+//
+// Staging alone (one shared copy, no duplication) was measured earlier and is
+// a null -- it trades a global replay for a ~4-way bank replay.  Replication,
+// not relocation, is the fix.
+//
+// 64 KiB of shared forces one block per SM, so the block is widened from 8 to
+// 32 warps to hold occupancy, matching QTIP's BLOCK_SIZE 1024 with
+// __launch_bounds__(BLOCK_SIZE, 1).
+// Replication factor is a tradeoff, not a constant.  ncu on the 32x/1024-thread
+// build: shared bank conflicts 0 and global sectors/request 1.01 -- the gather
+// is exactly as clean as intended -- but l1tex only fell 60.68% -> 59.14% and
+// the time did not move, because 64 KiB of shared plus 40 regs/thread pins one
+// block per SM and warps_active fell 73.4% -> 62.6%.  The counters also show
+// why the ceiling was low: global loads outnumber shared loads 1,234,944 to
+// 491,520, so the codebook gather was only ~28% of LSU instructions and could
+// never have been the whole 81%.
+//
+// 16 copies at 512 threads restores full occupancy: 32 KiB and 40 regs both
+// allow 3 blocks/SM = 1536 threads = 48 warps, the SM 8.6 maximum.  Lanes l
+// and l+16 share a copy, so a conflict needs row_l == row_{l+16} (mod 2) --
+// ~1.5 wavefronts expected instead of 1.0, against a 1.5x occupancy gain.
+#define PAW_WALK_COPIES 16
+#define PAW_WALK_LOG2C  4
+#define PAW_WALK_WPB    16                             // warps per block
+#define PAW_WALK_NTHR   (32*PAW_WALK_WPB)              // 512 threads
+#define PAW_WALK_BPSM   3                              // blocks per SM
+#define PAW_WALK_CBSZ   ((size_t) 512*PAW_WALK_COPIES*sizeof(uint32_t))
+
+template <int WORDS, bool MT, bool COMPUTED = false>
+__launch_bounds__(PAW_WALK_NTHR, PAW_WALK_BPSM)
+static __global__ void paw_rt_walk_qtip_frag_kernel(
+        const uint16_t * GGML_CUDA_RESTRICT trellis,
+        const half     * GGML_CUDA_RESTRICT tlut,
+        const float    * GGML_CUDA_RESTRICT scr_u,   // [nt, n]
+        float          * GGML_CUDA_RESTRICT scr_v,   // [nt, m]
+        const int m, const int n, const int nt) {
+    constexpr int step = WORDS/8;
+    const int wid  = threadIdx.x >> 5;
+    const int tr   = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int tiles_y = n / 16;
+
+    // 32 private lane-copies of the 512-entry half2 codebook.  The XOR
+    // swizzle on the write side keeps the fill itself conflict-free (all 32
+    // lanes would otherwise hit one bank at each c); permuting c is harmless
+    // because every c is written.
+    // COMPUTED variant: no codebook at all -- the emission is a short integer
+    // chain (see dec_state), so shared stays empty and occupancy rises.
+    extern __shared__ uint32_t paw_smem_cb[];
+    if constexpr (!COMPUTED) {
+        const uint32_t * GGML_CUDA_RESTRICT cb = (const uint32_t *) tlut;
+        const int sw = lane & (PAW_WALK_COPIES - 1);
+        for (int r = threadIdx.x; r < 512; r += PAW_WALK_NTHR) {
+            const uint32_t v = cb[r];
+    #pragma unroll
+            for (int c = 0; c < PAW_WALK_COPIES; ++c)
+                paw_smem_cb[(r << PAW_WALK_LOG2C) | (c ^ sw)] = v;
+        }
+        __syncthreads();
+    }
+    const int groupID = lane >> 2;
+    const int tid4    = lane & 3;
+
+    const int rrows[2] = {groupID, groupID + 8};
+    const int rjs[2]   = {tid4, tid4 + 4};
+    int wi0[2][2], wi1[2][2], offv[2][2];
+#pragma unroll
+    for (int k = 0; k < 2; ++k)
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const int b = step*(8*rrows[k] + rjs[q]);
+            wi0[k][q]  = (b >> 4) % WORDS;
+            offv[k][q] = b & 15;
+            wi1[k][q]  = (wi0[k][q] + 1) % WORDS;
+        }
+
+    // B fragment: this K-step's (== this tile column's) 16 activation
+    // values; the lane needs k in {tid4*2,+1, tid4*2+8,+9}
+    // The mma's B fragment is k16 x n8 and its column index IS groupID, so
+    // the eight columns can carry eight different tokens for one walk of the
+    // trellis. ncu says the walk is LSU-bound (l1tex 60.7%) with the tensor
+    // pipe idle at 9.1%: the gathers, not the MMA, are the cost, and the
+    // gather count per *token* is what multi-token divides. nt==1 keeps the
+    // old numerics exactly -- only column 0 is ever read out, and the other
+    // columns going to zero instead of a redundant copy cannot change it.
+    auto load_b = [&](int ct, half2& h0, half2& h1) {
+        // ub + tid4*2 and +8 are each two consecutive floats, 8-byte aligned
+        // (n is a multiple of 16), so one LDG.64 each replaces two LDG.32.
+        auto pack = [&](const float * ub, half2& a, half2& b) {
+            const float2 v0 = *(const float2 *)(const void *)(ub + tid4*2);
+            const float2 v1 = *(const float2 *)(const void *)(ub + tid4*2 + 8);
+            a = __floats2half2_rn(v0.x, v0.y);
+            b = __floats2half2_rn(v1.x, v1.y);
+        };
+        if constexpr (!MT) {
+            pack(scr_u + ct*16, h0, h1);
+        } else if (groupID < nt) {
+            pack(scr_u + (int64_t) groupID*n + ct*16, h0, h1);
+        } else {
+            h0 = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
+            h1 = h0;
+        }
+    };
+    half2 hb0 = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
+    half2 hb1 = hb0;
+    if (wid < tiles_y) load_b(wid, hb0, hb1);
+    const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+
+    // WORDS==16 packed path: a lane's four states live in just two unit
+    // pairs ((ri,ri+1) for ri = g and g+8), so each pair is fetched once
+    // per column -- one aligned u32 load when the pair does not wrap --
+    // instead of eight separate u16 gathers.
+    auto fetch_pair = [&](int64_t tw, int u, uint32_t& lo_u, uint32_t& hi_u) {
+        const int v = (u + 1) % WORDS;
+        if ((u & 1) == 0 && v == u + 1) {
+            const uint32_t W = *(const uint32_t*)(const void*)(trellis + tw + u);
+            lo_u = W & 0xFFFFu;
+            hi_u = W >> 16;
+        } else {
+            lo_u = __ldg(trellis + tw + u);
+            hi_u = __ldg(trellis + tw + v);
+        }
+    };
+    auto dec_state = [&](uint32_t lo, uint32_t hi, int off) {
+        const uint32_t st = off == 0 ? lo
+            : (((lo << off) | (hi >> (16 - off))) & 0xFFFFu);
+        if constexpr (COMPUTED) {
+            // Lookup-free emission prototype (Track B timing probe): the
+            // table gather is replaced by an integer mixing chain on the
+            // ALU pipe -- zero LSU traffic, zero shared memory, no bank
+            // conflicts, and the 2 KiB codebook disappears from the kernel
+            // entirely. Values are NOT the codec's (encoder not re-run);
+            // this exists to measure the speed of the gather-free walk.
+            const uint32_t x  = st * 2246822519u;   // 1 IMAD
+            const uint32_t s  = (x >> 4) & 0x8000u; // a0 sign
+            const uint32_t a0 = 0x3400u | ((x >> 5) & 0x3FFu);
+            const uint32_t a1 = 0x3400u | ((x >> 9) & 0x3FFu);
+            return (a1 << 16) | s | a0;
+        } else {
+            const uint32_t ph  = st*(st + 1u);
+            // ((ph >> 6) & 511) << LOG2C | (lane % COPIES), one shift + and + or
+            const uint32_t pair = paw_smem_cb[
+                ((ph >> (6 - PAW_WALK_LOG2C)) & (511u << PAW_WALK_LOG2C))
+                | (lane & (PAW_WALK_COPIES - 1))];
+            return pair ^ (ph & 0x8000u);   // == (ph & 0x8000) ? pair ^ 0x8000 : pair
+        }
+    };
+
+    auto load_at = [&](int64_t tw, uint32_t (&a)[2][2], uint32_t (&b)[2][2]) {
+#pragma unroll
+        for (int k = 0; k < 2; ++k)
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                a[k][q] = __ldg(trellis + tw + wi0[k][q]);
+                b[k][q] = offv[k][q] ? __ldg(trellis + tw + wi1[k][q]) : 0u;
+            }
+    };
+    // gridDim.y > 1: several blocks share an output tile, each walking a
+    // strided subset of its columns (small-m matrices otherwise leave the
+    // machine idle); partials fold through the atomicAdd epilogue
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+    const int ct_first = wid + PAW_WALK_WPB*(int) blockIdx.y;
+
+    if constexpr (WORDS == 16) {
+        uint32_t L0, H0, L8, H8, nL0, nH0, nL8, nH8;
+        L0 = H0 = L8 = H8 = nL0 = nH0 = nL8 = nH8 = 0;
+        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + PAW_WALK_WPB - 1)/PAW_WALK_WPB);
+        if (has) {
+            const int64_t tw = (int64_t) tr*tiles_y*WORDS + ct_first*WORDS;
+            fetch_pair(tw, groupID, L0, H0);
+            fetch_pair(tw, (groupID + 8) % WORDS, L8, H8);
+        }
+        for (int ct = ct_first; ct < tiles_y; ct += PAW_WALK_WPB*gridDim.y) {
+            const int ctn = ct + PAW_WALK_WPB*gridDim.y;
+            if (ctn < tiles_y) {
+                const int64_t twn = (int64_t) tr*tiles_y*WORDS + ctn*WORDS;
+                fetch_pair(twn, groupID, nL0, nH0);
+                fetch_pair(twn, (groupID + 8) % WORDS, nL8, nH8);
+            }
+            half2 nb0 = hb0, nb1 = hb1;
+            if (ctn < tiles_y) load_b(ctn, nb0, nb1);
+            const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+            // ra order: [k + 2*q]; k=row-group (g,g+8), q=j-pair (t,t+4)
+            const uint32_t ra0 = dec_state(L0, H0, offv[0][0]);
+            const uint32_t ra1 = dec_state(L8, H8, offv[1][0]);
+            const uint32_t ra2 = dec_state(L0, H0, offv[0][1]);
+            const uint32_t ra3 = dec_state(L8, H8, offv[1][1]);
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(ra0), "r"(ra1), "r"(ra2), "r"(ra3), "r"(rb0), "r"(rb1));
+            if (ctn < tiles_y) { L0=nL0; H0=nH0; L8=nL8; H8=nH8; }
+            hb0 = nb0; hb1 = nb1;
+        }
+    } else if constexpr (WORDS == 24) {
+        // w24: state (ri, j=t) starts at bit 24*ri + 3t; the j=t+4 state
+        // starts 12 bits later -- same unit pair unless that crosses into
+        // the next unit (then one extra unit covers it). Two fetch_pairs
+        // plus occasional single units replace eight per-state gathers.
+        uint32_t L0, H0, X0, L8, H8, X8, nL0, nH0, nX0, nL8, nH8, nX8;
+        uint32_t o0[2], o2[2]; int u0[2], u2[2];
+        L0=H0=X0=L8=H8=X8=nL0=nH0=nX0=nL8=nH8=nX8=0;
+        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + PAW_WALK_WPB - 1)/PAW_WALK_WPB);
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int bk = 3*(8*rrows[k] + tid4);
+            u0[k]  = (bk >> 4) % WORDS;
+            o0[k]  = bk & 15u;
+            const int cross = (o0[k] + 12) >> 4;   // 0 or 1
+            u2[k]  = (u0[k] + cross) % WORDS;
+            o2[k]  = (o0[k] + 12) & 15u;
+        }
+        if (has) {
+            const int64_t tw = (int64_t) tr*tiles_y*WORDS + ct_first*WORDS;
+            fetch_pair(tw, u0[0], L0, H0);
+            fetch_pair(tw, u0[1], L8, H8);
+            X0 = __ldg(trellis + tw + ((u0[0] + 2) % WORDS));
+            X8 = __ldg(trellis + tw + ((u0[1] + 2) % WORDS));
+            (void) u2; (void) o2;
+        }
+        for (int ct = ct_first; ct < tiles_y; ct += PAW_WALK_WPB*gridDim.y) {
+            const int ctn = ct + PAW_WALK_WPB*gridDim.y;
+            if (ctn < tiles_y) {
+                const int64_t twn = (int64_t) tr*tiles_y*WORDS + ctn*WORDS;
+                fetch_pair(twn, u0[0], nL0, nH0);
+                fetch_pair(twn, u0[1], nL8, nH8);
+                nX0 = __ldg(trellis + twn + ((u0[0] + 2) % WORDS));
+                nX8 = __ldg(trellis + twn + ((u0[1] + 2) % WORDS));
+            }
+            half2 nb0 = hb0, nb1 = hb1;
+            if (ctn < tiles_y) load_b(ctn, nb0, nb1);
+            const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+            uint32_t ra[4];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const uint32_t lo = k ? L8 : L0, hi = k ? H8 : H0;
+                const uint32_t xx = k ? X8 : X0;
+                // j=t state: units (lo,hi) at offset o0[k]
+                ra[k + 2*0] = dec_state(lo, hi, o0[k]);
+                // j=t+4 state: starts 12 bits later
+                ra[k + 2*1] = ((o0[k] + 12) >> 4)
+                    ? dec_state(hi, xx, o2[k])     // crossed into next unit
+                    : dec_state(lo, hi, o2[k]);    // still inside the pair
+            }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+            if (ctn < tiles_y) {
+                L0=nL0; H0=nH0; X0=nX0; L8=nL8; H8=nH8; X8=nX8;
+            }
+            hb0 = nb0; hb1 = nb1;
+        }
+    } else if constexpr (WORDS == 32) {
+        // w32: state (ri, j) starts at bit 32*ri + 4*j -> unit
+        // 2*ri + j/4, offset 4*(j&3). The j=t+4 state lives one unit
+        // later at the SAME offset, so each row-group needs units
+        // {u, u+1, u+2}: one fetch_pair plus a single extra unit.
+        uint32_t L0, H0, X0, L8, H8, X8, nL0, nH0, nX0, nL8, nH8, nX8;
+        uint32_t ov[2]; int uv[2];
+        L0=H0=X0=L8=H8=X8=nL0=nH0=nX0=nL8=nH8=nX8=0;
+        const bool has = wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + PAW_WALK_WPB - 1)/PAW_WALK_WPB);
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int b = 4*(8*rrows[k] + tid4);
+            uv[k] = (b >> 4) % WORDS;
+            ov[k] = b & 15u;
+        }
+        if (has) {
+            const int64_t tw = (int64_t) tr*tiles_y*WORDS + ct_first*WORDS;
+            fetch_pair(tw, uv[0], L0, H0);
+            fetch_pair(tw, uv[1], L8, H8);
+            X0 = __ldg(trellis + tw + ((uv[0] + 2) % WORDS));
+            X8 = __ldg(trellis + tw + ((uv[1] + 2) % WORDS));
+        }
+        for (int ct = ct_first; ct < tiles_y; ct += PAW_WALK_WPB*gridDim.y) {
+            const int ctn = ct + PAW_WALK_WPB*gridDim.y;
+            if (ctn < tiles_y) {
+                const int64_t twn = (int64_t) tr*tiles_y*WORDS + ctn*WORDS;
+                fetch_pair(twn, uv[0], nL0, nH0);
+                fetch_pair(twn, uv[1], nL8, nH8);
+                nX0 = __ldg(trellis + twn + ((uv[0] + 2) % WORDS));
+                nX8 = __ldg(trellis + twn + ((uv[1] + 2) % WORDS));
+            }
+            half2 nb0 = hb0, nb1 = hb1;
+            if (ctn < tiles_y) load_b(ctn, nb0, nb1);
+            const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+            uint32_t ra[4];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const uint32_t lo = k ? L8 : L0, hi = k ? H8 : H0;
+                const uint32_t xx = k ? X8 : X0;
+                // j=t state from units (lo,hi); j=t+4 from (hi,x) -- same offset
+                ra[k + 2*0] = dec_state(lo, hi, ov[k]);
+                ra[k + 2*1] = dec_state(hi, xx, ov[k]);
+            }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+            if (ctn < tiles_y) {
+                L0=nL0; H0=nH0; X0=nX0; L8=nL8; H8=nH8; X8=nX8;
+            }
+            hb0 = nb0; hb1 = nb1;
+        }
+    } else {
+        uint32_t c0[2][2], c1[2][2];
+        if (wid < tiles_y && blockIdx.y < (unsigned)((tiles_y + PAW_WALK_WPB - 1)/PAW_WALK_WPB))
+            load_at((int64_t) tr*tiles_y*WORDS + ct_first*WORDS, c0, c1);
+
+        for (int ct = ct_first; ct < tiles_y; ct += PAW_WALK_WPB*gridDim.y) {
+            const int ctn = ct + PAW_WALK_WPB*gridDim.y;
+            uint32_t n0[2][2], n1[2][2];
+            if (ctn < tiles_y) load_at((int64_t) tr*tiles_y*WORDS + ctn*WORDS, n0, n1);
+            half2 nb0 = hb0, nb1 = hb1;
+            if (ctn < tiles_y) load_b(ctn, nb0, nb1);
+            const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+            uint32_t ra[4];
+#pragma unroll
+            for (int k = 0; k < 2; ++k)
+#pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    const int off = offv[k][q];
+                    const uint32_t w0 = c0[k][q];
+                    const uint32_t st = off == 0 ? w0
+                        : (((w0 << off) | (c1[k][q] >> (16 - off))) & 0xFFFFu);
+                    const uint32_t ph  = st*(st + 1u);
+                    const uint32_t row = (ph >> 6) & 511u;
+                        // packed u32 tlut access: lo half = a0 (sign-flippable by
+                        // xor on the fp16 sign bit), hi half = a1
+                    const uint32_t pair = *(const uint32_t*)(const void*)(tlut + 2*row);
+                    const uint32_t a0h  = (ph & 0x8000u) ? (pair ^ 0x00008000u) : pair;
+                    half2 h = __halves2half2(__ushort_as_half((unsigned short) a0h),
+                                             __ushort_as_half((unsigned short)(pair >> 16)));
+                    ra[k + 2*q] = *(uint32_t*)&h;   // (row-group, j-pair): q is the outer axis
+                }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+#pragma unroll
+            for (int k = 0; k < 2; ++k)
+#pragma unroll
+                for (int q = 0; q < 2; ++q) { c0[k][q] = n0[k][q]; c1[k][q] = n1[k][q]; }
+            hb0 = nb0; hb1 = nb1;
+        }
+    }
+    // D fragment m16n8: (row groupID, col 2*tid4) -> d0, (col 2*tid4+1) -> d1;
+    // rows groupID+8 -> d2/d3. Token t lives in column t, i.e. the lanes with
+    // tid4 == t>>1, taking the even/odd register of each row pair.
+    if constexpr (!MT) {
+        if (tid4 == 0) {
+            atomicAdd(&scr_v[(size_t) tr*16 + groupID],     d0);
+            atomicAdd(&scr_v[(size_t) tr*16 + groupID + 8], d2);
+        }
+    } else {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < nt && tid4 == (t >> 1)) {
+                const float vlo = (t & 1) ? d1 : d0;
+                const float vhi = (t & 1) ? d3 : d2;
+                atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID],     vlo);
+                atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID + 8], vhi);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Staged walk: cp.async the trellis into shared, then walk out of shared.
+//
+// Why this kernel exists. ncu on the frag walk says global/L2 memory latency
+// is 36.8-54.1% of stalls while DRAM runs at ~20% of peak (6.435 GB/token in
+// 33.6 ms = 191 GB/s of 936). Those coexist because of bytes per load
+// instruction: at 1.0-1.26 sectors/request each LDG moves ~32 bytes for the
+// whole warp, since all 32 lanes are picking bits out of one 32-48 byte tile.
+// No instruction rate the SM can issue turns that into bandwidth. Four
+// attempts that did not address this were null or negative -- see
+// reports/paw27b_speed_baseline_20260824.md.
+//
+// For a fixed output row-block tr the tiles ct = 0..tiles_y-1 are CONTIGUOUS
+// in the payload (tr*tiles_y*WORDS + ct*WORDS), so a whole chunk of them can
+// be pulled in with 16-byte-per-thread cp.async: 512 threads x 16 B = 8 KiB
+// per issue, perfectly coalesced, instead of ~6-8 narrow LDG per tile. Every
+// shipped rate has a tile size divisible by 16 bytes (WORDS*2 = 32/48/64), so
+// both ends stay aligned for any tile count.
+//
+// The codebook drops to 8 copies (16 KiB) to leave room: bank conflicts on
+// that gather are worth ~1.8% of stalls, so trading a little of it for the
+// staging buffer is the right side of the trade.
+// Tile columns per chunk, picked per rate so the staging buffer stays ~7.5 KiB
+// (a tile is WORDS*2 bytes), and a multiple of the warp count so every warp
+// gets whole tiles. 16 KiB codebook + 2 x ~7.5 KiB still leaves 3 blocks/SM.
+template <int WORDS> struct paw_stage_tiles { static constexpr int v = 160; };
+template <> struct paw_stage_tiles<16> { static constexpr int v = 240; };  // 7680 B
+template <> struct paw_stage_tiles<24> { static constexpr int v = 160; };  // 7680 B
+template <> struct paw_stage_tiles<32> { static constexpr int v = 112; };  // 7168 B
+template <> struct paw_stage_tiles<64> { static constexpr int v =  64; };  // 8192 B
+#define PAW_STAGE_COPIES 8
+#define PAW_STAGE_LOG2C  3
+
+static __device__ __forceinline__ void paw_cp_commit() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.commit_group;");
+#endif
+}
+template <int N>
+static __device__ __forceinline__ void paw_cp_wait_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.wait_group %0;" :: "n"(N));
+#endif
+}
+
+template <int WORDS, bool MT, bool COMPUTED = false, bool ALIGNED = false, bool REGRES = false>
+__launch_bounds__(PAW_WALK_NTHR, PAW_WALK_BPSM)
+static __global__ void paw_rt_walk_qtip_stage_kernel(
+        const uint16_t * GGML_CUDA_RESTRICT trellis,
+        const half     * GGML_CUDA_RESTRICT tlut,
+        const float    * GGML_CUDA_RESTRICT scr_u,   // [nt, n]
+        float          * GGML_CUDA_RESTRICT scr_v,   // [nt, m]
+        const int m, const int n, const int nt) {
+    static_assert(WORDS == 16 || WORDS == 24 || WORDS == 32 || WORDS == 64,
+                  "staged walk covers the shipped rates only");
+    const int wid     = threadIdx.x >> 5;
+    const int tr      = blockIdx.x;
+    const int lane    = threadIdx.x & 31;
+    const int tiles_y = n / 16;
+    const int groupID = lane >> 2;
+    const int tid4    = lane & 3;
+
+    constexpr int CB_U32  = 512*PAW_STAGE_COPIES;
+    constexpr int TILES   = paw_stage_tiles<WORDS>::v;
+    constexpr int CHUNK_W = TILES*WORDS;                // uint16 per buffer
+
+    extern __shared__ uint32_t paw_stage_smem[];
+    uint32_t * GGML_CUDA_RESTRICT cb  = paw_stage_smem;
+    uint16_t * GGML_CUDA_RESTRICT tsm = (uint16_t *)(paw_stage_smem + CB_U32);
+
+    if constexpr (!COMPUTED) {   // 8 lane-copies of the codebook, XOR-swizzled writes
+        const uint32_t * GGML_CUDA_RESTRICT src = (const uint32_t *) tlut;
+        const int sw = lane & (PAW_STAGE_COPIES - 1);
+        for (int r = threadIdx.x; r < 512; r += PAW_WALK_NTHR) {
+            const uint32_t v = src[r];
+#pragma unroll
+            for (int c = 0; c < PAW_STAGE_COPIES; ++c)
+                cb[(r << PAW_STAGE_LOG2C) | (c ^ sw)] = v;
+        }
+    }
+
+    // Same window math as the frag kernel: state (ri, j) starts at bit
+    // step*(8*ri + j) with step = WORDS/8, and the j+4 state starts
+    // 2*step*4 bits later. Only the wrap indices differ per rate.
+    constexpr int step = WORDS/8;
+    const int rrows[2] = {groupID, groupID + 8};
+    uint32_t o0[2], o2[2]; int u0[2], u1w[2], uxw[2];
+    int gw0[2][2], gw1[2][2]; uint32_t gof[2][2];
+    if constexpr (WORDS == 64) {
+        // generic window, one independent unit pair per (row-group, j-pair):
+        // at step 8 the j+4 state is two units on at the same offset, so the
+        // 16/24/32 shortcut (which reuses u+1,u+2) does not hold.
+#pragma unroll
+        for (int k = 0; k < 2; ++k)
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const int b = step*(8*rrows[k] + (q ? tid4 + 4 : tid4));
+                gw0[k][q] = (b >> 4) % WORDS;
+                gof[k][q] = b & 15u;
+                gw1[k][q] = (gw0[k][q] + 1) % WORDS;
+            }
+        (void) o0; (void) o2; (void) u0; (void) u1w; (void) uxw;
+    } else {
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int bk = step*(8*rrows[k] + tid4);
+            u0[k]  = (bk >> 4) % WORDS;
+            o0[k]  = bk & 15u;
+            o2[k]  = (o0[k] + 4*step) & 15u;
+            u1w[k] = (u0[k] + 1) % WORDS;
+            uxw[k] = (u0[k] + 2) % WORDS;
+        }
+        (void) gw0; (void) gw1; (void) gof;
+    }
+
+    auto dec_state = [&](uint32_t lo, uint32_t hi, int off) {
+        const uint32_t st = off == 0 ? lo
+            : (((lo << off) | (hi >> (16 - off))) & 0xFFFFu);
+        if constexpr (COMPUTED) {
+            // Gather-free emission (timing probe): removes the codebook LDS op
+            // from the staged walk, which ncu shows L1TEX-bound at 84%.
+            // Values are NOT the codec's -- this measures the gather's cost.
+            const uint32_t x  = st * 2246822519u;
+            const uint32_t sg = (x >> 4) & 0x8000u;
+            const uint32_t a0 = 0x3400u | ((x >> 5) & 0x3FFu);
+            const uint32_t a1 = 0x3400u | ((x >> 9) & 0x3FFu);
+            return (a1 << 16) | sg | a0;
+        } else {
+            const uint32_t ph = st*(st + 1u);
+            const uint32_t pair = cb[((ph >> (6 - PAW_STAGE_LOG2C)) & (511u << PAW_STAGE_LOG2C))
+                                     | (lane & (PAW_STAGE_COPIES - 1))];
+            return pair ^ (ph & 0x8000u);
+        }
+    };
+    auto load_b = [&](int ct, half2& h0, half2& h1) {
+        auto pack = [&](const float * ub) {
+            const float2 v0 = *(const float2 *)(const void *)(ub + tid4*2);
+            const float2 v1 = *(const float2 *)(const void *)(ub + tid4*2 + 8);
+            h0 = __floats2half2_rn(v0.x, v0.y);
+            h1 = __floats2half2_rn(v1.x, v1.y);
+        };
+        if constexpr (!MT) {
+            pack(scr_u + ct*16);
+        } else if (groupID < nt) {
+            pack(scr_u + (int64_t) groupID*n + ct*16);
+        } else {
+            h0 = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
+            h1 = h0;
+        }
+    };
+
+    // ---- Stage 1: register-resident walk (EXL3 dq8_regs_* shape) ----------
+    // K=2 gives step 4, so state (ri, j) starts at bit 4*(8*ri + j): unit
+    // u0 = 2*ri (always EVEN) at offset 4*tid4, and the j+4 state is 16 bits
+    // on, i.e. units u0+1, u0+2.  Both pairs therefore live inside the two
+    // ALIGNED uint32 at indices ri and ri+1 -- so the lane can load them
+    // straight to registers with no shared staging and no barrier, which is
+    // exactly what exllamav3 does and what our staged walk never tried.
+    if constexpr (REGRES && WORDS == 32) {
+        __syncthreads();                       // cb fill above must be visible
+        const uint16_t * GGML_CUDA_RESTRICT tb = trellis + (int64_t) tr*tiles_y*WORDS;
+        float r0 = 0.f, r1 = 0.f, r2 = 0.f, r3 = 0.f;
+        for (int ct = wid; ct < tiles_y; ct += PAW_WALK_WPB) {
+            half2 hb0, hb1;
+            load_b(ct, hb0, hb1);
+            const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+            const uint32_t * GGML_CUDA_RESTRICT g32 =
+                (const uint32_t * GGML_CUDA_RESTRICT)(tb + (int64_t) ct*WORDS);
+            uint32_t ra[4];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int bi = groupID + 8*k;              // uint32 index, u0/2
+                const uint32_t A = __ldg(g32 + bi);        // units u0, u0+1
+                const uint32_t B = __ldg(g32 + ((bi + 1) & 15));  // units u0+2, u0+3
+                ra[k + 2*0] = dec_state(A & 0xFFFFu, A >> 16,      o0[k]);
+                ra[k + 2*1] = dec_state(A >> 16,     B & 0xFFFFu,  o2[k]);
+            }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(r0), "+f"(r1), "+f"(r2), "+f"(r3)
+                : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+        }
+        if constexpr (!MT) {
+            if (tid4 == 0) {
+                atomicAdd(&scr_v[(size_t) tr*16 + groupID],     r0);
+                atomicAdd(&scr_v[(size_t) tr*16 + groupID + 8], r2);
+            }
+        } else {
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                if (t < nt && tid4 == (t >> 1)) {
+                    atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID],     (t & 1) ? r1 : r0);
+                    atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID + 8], (t & 1) ? r3 : r2);
+                }
+            }
+        }
+        return;
+    }
+
+    const uint16_t * GGML_CUDA_RESTRICT base = trellis + (int64_t) tr*tiles_y*WORDS;
+    auto issue = [&](int buf, int c0) {
+        const int tiles = (tiles_y - c0) < TILES ? (tiles_y - c0) : TILES;
+        if (tiles <= 0) return;
+        const int bytes = tiles*WORDS*2;                 // WORDS*2 == 48, a multiple of 16
+        char       * dstb = (char *)(tsm + buf*CHUNK_W);
+        const char * srcb = (const char *)(base + (int64_t) c0*WORDS);
+        for (int off = threadIdx.x*16; off < bytes; off += PAW_WALK_NTHR*16)
+            cp_async_cg_16<128>(ggml_cuda_cvta_generic_to_shared(dstb + off), srcb + off);
+    };
+
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+
+    issue(0, 0); paw_cp_commit();
+    int buf = 0;
+    for (int c0 = 0; c0 < tiles_y; c0 += TILES, buf ^= 1) {
+        const int nxt = c0 + TILES;
+        if (nxt < tiles_y) { issue(buf ^ 1, nxt); paw_cp_commit(); paw_cp_wait_group<1>(); }
+        else               { paw_cp_wait_group<0>(); }
+        __syncthreads();
+
+        const uint16_t * GGML_CUDA_RESTRICT sh = tsm + buf*CHUNK_W;
+        const int lim = (tiles_y - c0) < TILES ? (tiles_y - c0) : TILES;
+        for (int l = wid; l < lim; l += PAW_WALK_WPB) {
+            const uint16_t * GGML_CUDA_RESTRICT tw = sh + l*WORDS;
+            half2 hb0, hb1;
+            load_b(c0 + l, hb0, hb1);
+            const uint32_t rb0 = *(uint32_t*)&hb0, rb1 = *(uint32_t*)&hb1;
+            uint32_t ra[4];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                if constexpr (ALIGNED) {
+                    // Integer-rate access-pattern probe: EXL3 at an integer bpw
+                    // pulls 8 weights from ONE aligned 32-bit word (dq8_regs_*),
+                    // where our fractional rate needs three scattered uint16
+                    // reads.  This swaps in that access pattern -- values are
+                    // WRONG, only the L1TEX traffic is meaningful.
+                    const uint32_t * GGML_CUDA_RESTRICT tw32 =
+                        (const uint32_t * GGML_CUDA_RESTRICT) tw;
+                    const uint32_t w32 = tw32[(lane + 8*k) % (WORDS/2)];
+                    const uint32_t alo = w32 & 0xFFFFu, ahi = w32 >> 16;
+                    ra[k + 2*0] = dec_state(alo, ahi, o0[k]);
+                    ra[k + 2*1] = dec_state(alo, ahi, o2[k]);
+                    continue;
+                }
+                if constexpr (WORDS == 64) {
+#pragma unroll
+                    for (int q = 0; q < 2; ++q)
+                        ra[k + 2*q] = dec_state(tw[gw0[k][q]], tw[gw1[k][q]], gof[k][q]);
+                    continue;
+                }
+                const uint32_t lo = tw[u0[k]], hi = tw[u1w[k]];
+                ra[k + 2*0] = dec_state(lo, hi, o0[k]);
+                if constexpr (WORDS == 16) {
+                    // step 2: both j and j+4 sit inside the same unit pair
+                    ra[k + 2*1] = dec_state(lo, hi, o2[k]);
+                } else {
+                    // step 3 and 4 can run past the pair into one more unit
+                    const uint32_t xx = tw[uxw[k]];
+                    ra[k + 2*1] = ((o0[k] + 4*step) >> 4)
+                        ? dec_state(hi, xx, o2[k])
+                        : dec_state(lo, hi, o2[k]);
+                }
+            }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+        }
+        __syncthreads();
+    }
+
+    if constexpr (!MT) {
+        if (tid4 == 0) {
+            atomicAdd(&scr_v[(size_t) tr*16 + groupID],     d0);
+            atomicAdd(&scr_v[(size_t) tr*16 + groupID + 8], d2);
+        }
+    } else {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < nt && tid4 == (t >> 1)) {
+                const float vlo = (t & 1) ? d1 : d0;
+                const float vhi = (t & 1) ? d3 : d2;
+                atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID],     vlo);
+                atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID + 8], vhi);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EXL3-style fused-int8 AR walk (nt == 1).
+//
+// exllamav3's fast K <= 5 GEMV quantizes the activation to signed int8 and
+// uses dp4a to evaluate four weights per instruction.  Its mul1 codebook is
+// affine in a byte sum, so the decoded weights are already integer-friendly.
+// PAW's shipped HYB codebook is different (a 512-entry lookup), but it is a
+// 63-level signed lattice: the largest level is 31 times the lattice step.
+// Preserve the existing bitstream and hash, quantize that tiny table once per
+// CTA from max_abs/31, and use the same int8 dot-product machinery.  For the
+// PAW-27B-v4 F16 table the measured table-only RMS error of this conversion is
+// 2.19e-4 relative (max absolute error 8.20e-4).
+//
+// A warp owns one output row and its lanes own different 16-value input
+// tiles.  This is deliberately an AR kernel: unlike the tensor-core path it
+// computes no seven unused MMA columns.  Trellis chunks retain the proven
+// coalesced cp.async double buffer.  Activation quantization is done once per
+// GEMV into op-local scratch; doing it independently in every output CTA was
+// measured at 18.35 tok/s and rejected before this version.
+#define PAW_I8_CB_COPIES 8
+
+static __global__ void paw_rt_quant_i8_kernel(
+        const float * GGML_CUDA_RESTRICT x,
+        int8_t       * GGML_CUDA_RESTRICT q,
+        float        * GGML_CUDA_RESTRICT s,
+        int          * GGML_CUDA_RESTRICT z,
+        const int n) {
+    const int lane = threadIdx.x & 31;
+    const int half_lane = lane & 15;
+    const int tile = blockIdx.x*16 + (threadIdx.x >> 5)*2 + (lane >> 4);
+    if (tile >= n/16) return;
+    const unsigned mask = lane < 16 ? 0x0000ffffu : 0xffff0000u;
+    const float v = x[tile*16 + half_lane];
+    float am = fabsf(v);
+#pragma unroll
+    for (int d = 8; d > 0; d >>= 1)
+        am = fmaxf(am, __shfl_down_sync(mask, am, d));
+    const int first = lane & 16;
+    float scale = am > 0.0f ? am/127.0f : 1.0f;
+    scale = __shfl_sync(mask, scale, first);
+    int qi = __float2int_rn(v/scale);
+    qi = max(-127, min(127, qi));
+    q[tile*16 + half_lane] = (int8_t)qi;
+    int sum = qi;
+#pragma unroll
+    for (int d = 8; d > 0; d >>= 1)
+        sum += __shfl_down_sync(mask, sum, d);
+    if (half_lane == 0) {
+        s[tile] = scale;
+        z[tile] = sum;
+    }
+}
+
+static __device__ __forceinline__ int paw_dp4a_us(uint32_t a, uint32_t b, int c) {
+    int d;
+    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
+template <int WORDS, bool MUL1>
+__launch_bounds__(PAW_WALK_NTHR, PAW_WALK_BPSM)
+static __global__ void paw_rt_walk_int8_kernel(
+        const uint16_t * GGML_CUDA_RESTRICT trellis,
+        const half     * GGML_CUDA_RESTRICT tlut,
+        const int8_t   * GGML_CUDA_RESTRICT q_u,
+        const float    * GGML_CUDA_RESTRICT q_s,
+        const int      * GGML_CUDA_RESTRICT q_z,
+        float          * GGML_CUDA_RESTRICT scr_v,
+        const int m, const int n) {
+    static_assert(WORDS == 16 || WORDS == 24 || WORDS == 32,
+                  "int8 AR walk covers the PAW-27B shipped rates");
+    constexpr int TILES   = paw_stage_tiles<WORDS>::v;
+    constexpr int CHUNK_W = TILES*WORDS;
+    constexpr int STEP    = WORDS/8;
+
+    const int wid     = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const int tr      = blockIdx.x;
+    const int tiles_y = n/16;
+
+    extern __shared__ uint32_t paw_i8_smem[];
+    constexpr int CB_U16 = MUL1 ? 0 : 512*PAW_I8_CB_COPIES;
+    uint16_t * GGML_CUDA_RESTRICT cb = (uint16_t *) paw_i8_smem;
+    uint16_t * GGML_CUDA_RESTRICT tsm = cb + CB_U16;
+    int8_t   * GGML_CUDA_RESTRICT aq = (int8_t *)(tsm + 2*CHUNK_W);
+    float    * GGML_CUDA_RESTRICT as = (float *)(aq + 2*TILES*16);
+    int      * GGML_CUDA_RESTRICT az = (int *)(as + 2*TILES);
+    float    * GGML_CUDA_RESTRICT red = (float *)(az + 2*TILES); // 16 warp maxima + scale
+
+    // One thread owns one half2 table row.  Derive the lattice scale from the
+    // model table itself instead of baking a model-specific floating constant
+    // into the kernel.
+    half2 hp;
+    float2 fp;
+    float mx = 0.0f;
+    if constexpr (!MUL1) {
+        hp = ((const half2 *) tlut)[threadIdx.x];
+        fp = __half22float2(hp);
+        mx = fmaxf(fabsf(fp.x), fabsf(fp.y));
+    }
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1)
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, d));
+    if (lane == 0) red[wid] = mx;
+    __syncthreads();
+    if (wid == 0) {
+        mx = lane < PAW_WALK_WPB ? red[lane] : 0.0f;
+#pragma unroll
+        for (int d = 16; d > 0; d >>= 1)
+            mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, d));
+        if (lane == 0) red[PAW_WALK_WPB] = mx > 0.0f ? mx/31.0f : 1.0f;
+    }
+    __syncthreads();
+    const float cb_scale = MUL1 ? __half2float(__ushort_as_half(0x20e6)) :
+                                  red[PAW_WALK_WPB];
+    if constexpr (!MUL1) {
+        int q0 = __float2int_rn(fp.x/cb_scale);
+        int q1 = __float2int_rn(fp.y/cb_scale);
+        q0 = max(-127, min(127, q0));
+        q1 = max(-127, min(127, q1));
+        const uint16_t qp = (uint16_t)(uint8_t)(int8_t)q0 |
+                            ((uint16_t)(uint8_t)(int8_t)q1 << 8);
+        const int sw = lane & (PAW_I8_CB_COPIES - 1);
+#pragma unroll
+        for (int c = 0; c < PAW_I8_CB_COPIES; ++c)
+            cb[(threadIdx.x << 3) | (c ^ sw)] = qp;
+    }
+
+    const uint16_t * GGML_CUDA_RESTRICT base =
+        trellis + (int64_t)tr*tiles_y*WORDS;
+    auto issue = [&](int buf, int c0) {
+        const int tiles = min(tiles_y - c0, TILES);
+        if (tiles <= 0) return;
+        const int bytes = tiles*WORDS*2;
+        char       * dstb = (char *)(tsm + buf*CHUNK_W);
+        const char * srcb = (const char *)(base + (int64_t)c0*WORDS);
+        for (int off = threadIdx.x*16; off < bytes; off += PAW_WALK_NTHR*16)
+            cp_async_cg_16<128>(ggml_cuda_cvta_generic_to_shared(dstb + off), srcb + off);
+        char       * dsta = (char *)(aq + buf*TILES*16);
+        const char * srca = (const char *)(q_u + (int64_t)c0*16);
+        for (int off = threadIdx.x*16; off < tiles*16; off += PAW_WALK_NTHR*16)
+            cp_async_cg_16<128>(ggml_cuda_cvta_generic_to_shared(dsta + off), srca + off);
+    };
+
+    float sum = 0.0f;
+    issue(0, 0);
+    paw_cp_commit();
+    int buf = 0;
+    for (int c0 = 0; c0 < tiles_y; c0 += TILES, buf ^= 1) {
+        const int nxt = c0 + TILES;
+        if (nxt < tiles_y) {
+            issue(buf ^ 1, nxt);
+            paw_cp_commit();
+            paw_cp_wait_group<1>();
+        } else {
+            paw_cp_wait_group<0>();
+        }
+        __syncthreads();
+
+        const int lim = min(tiles_y - c0, TILES);
+        int8_t * GGML_CUDA_RESTRICT qab = aq + buf*TILES*16;
+        float  * GGML_CUDA_RESTRICT qsb = as + buf*TILES;
+        int    * GGML_CUDA_RESTRICT qzb = az + buf*TILES;
+
+        // The activation is quantized once per GEMV, not once per output
+        // block.  Only the tiny scale vector needs a regular global load;
+        // packed values arrived coalesced in the cp.async group above.
+        for (int l = threadIdx.x; l < lim; l += PAW_WALK_NTHR) {
+            qsb[l] = q_s[c0 + l];
+            qzb[l] = q_z[c0 + l];
+        }
+        __syncthreads();
+
+        const uint16_t * GGML_CUDA_RESTRICT sh = tsm + buf*CHUNK_W;
+        const int ri = wid;
+        for (int l = lane; l < lim; l += 32) {
+            const uint16_t * GGML_CUDA_RESTRICT tw = sh + l*WORDS;
+            if constexpr (MUL1) {
+                int dot = 0;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int bit = STEP*(8*ri + j);
+                    const int u0 = (bit >> 4) % WORDS;
+                    const int u1 = (u0 + 1) % WORDS;
+                    const int off = bit & 15;
+                    const uint32_t lo = tw[u0], hi = tw[u1];
+                    const uint32_t st = off == 0 ? lo :
+                        (((lo << off) | (hi >> (16 - off))) & 0xffffu);
+                    const uint32_t a0 = (uint8_t)qab[l*16 + 2*j];
+                    const uint32_t a1 = (uint8_t)qab[l*16 + 2*j + 1];
+                    const uint32_t splat = a0 | (a0 << 8) | (a1 << 16) | (a1 << 24);
+                    dot = paw_dp4a_us(st*0x83DCD12Du, splat, dot);
+                }
+                sum += (float)(dot - 255*qzb[l])*(qsb[l]*cb_scale);
+                continue;
+            }
+            uint32_t wp[4] = {0, 0, 0, 0};
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int bit = STEP*(8*ri + j);
+                const int u0 = (bit >> 4) % WORDS;
+                const int u1 = (u0 + 1) % WORDS;
+                const int off = bit & 15;
+                const uint32_t lo = tw[u0], hi = tw[u1];
+                const uint32_t st = off == 0 ? lo :
+                    (((lo << off) | (hi >> (16 - off))) & 0xffffu);
+                const uint32_t ph = st*(st + 1u);
+                const uint16_t p = cb[(((ph >> 6) & 511u) << 3) |
+                                      (lane & (PAW_I8_CB_COPIES - 1))];
+                int w0 = (int)(int8_t)(p & 0xffu);
+                const int w1 = (int)(int8_t)(p >> 8);
+                if (ph & 0x8000u) w0 = -w0;
+                const int shb = (j & 1)*16;
+                wp[j >> 1] |= (uint32_t)(uint8_t)(int8_t)w0 << shb;
+                wp[j >> 1] |= (uint32_t)(uint8_t)(int8_t)w1 << (shb + 8);
+            }
+            const uint32_t * ap = (const uint32_t *)(const void *)(qab + l*16);
+            int dot = 0;
+#pragma unroll
+            for (int g = 0; g < 4; ++g)
+                dot = __dp4a((int)wp[g], (int)ap[g], dot);
+            sum += (float)dot*(qsb[l]*cb_scale);
+        }
+        __syncthreads(); // both double buffers are reused two iterations later
+    }
+
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, d);
+    if (lane == 0) scr_v[(size_t)tr*16 + wid] = sum;
+    (void)m;
+}
+
+// ---------------------------------------------------------------------------
+// Stage2 walk: the staged design plus (a) a software-pipelined inner loop --
+// the next column's trellis units and b-fragment are prefetched into
+// registers before the current column's mma, halving the exposed
+// LDS->emit->mma chain (the frag kernel pipelines exactly this way; the
+// stage kernel does not); (b) for the 32-word rate one aligned 32-bit LDS
+// per unit pair instead of three 16-bit loads (both rows' windows start on
+// even units: state (ri, j=t) begins at bit 4*(8*ri + t) = unit 2*ri,
+// offset 4*t, and the j+4 state is 16 bits later, crossing into unit
+// 2*ri+2); (c) optional GGML_PAW_WALK_MBAL=1 swaps the codebook gather for
+// a computed MUL-BAL-style emission (Proteus Eqs. 2-5 adapted to pair
+// emission: two differently-mixed vabsdiff4 byte-sum Gaussians per 16-bit
+// window, per-layer multiplier from the pre-vetted 3-candidate pool).
+// MBAL values are NOT the codec's on an existing bitstream -- timing probe
+// for the lookup-free walk, correctness needs the re-encode.
+// gridDim.y (GGML_PAW_WALK_STAGE_SPLIT) splits each output tile's columns
+// across blocks; partials fold through the atomicAdd epilogue.
+template <int WORDS, bool MT, bool MBAL = false>
+__launch_bounds__(PAW_WALK_NTHR, PAW_WALK_BPSM)
+static __global__ void paw_rt_walk_qtip_stage2_kernel(
+        const uint16_t * GGML_CUDA_RESTRICT trellis,
+        const half     * GGML_CUDA_RESTRICT tlut,
+        const float    * GGML_CUDA_RESTRICT scr_u,   // [nt, n]
+        float          * GGML_CUDA_RESTRICT scr_v,   // [nt, m]
+        const int m, const int n, const int nt) {
+    static_assert(WORDS == 32, "stage2 pipelined path covers the 32-word rate");
+    const int wid     = threadIdx.x >> 5;
+    const int tr      = blockIdx.x;
+    const int lane    = threadIdx.x & 31;
+    const int tiles_y = n / 16;
+    const int groupID = lane >> 2;
+    const int tid4    = lane & 3;
+
+    constexpr int CB_U32  = 512*PAW_STAGE_COPIES;
+    constexpr int TILES   = paw_stage_tiles<WORDS>::v;
+    constexpr int CHUNK_W = TILES*WORDS;
+
+    extern __shared__ uint32_t paw_stage_smem[];
+    uint32_t * GGML_CUDA_RESTRICT cb  = paw_stage_smem;
+    uint16_t * GGML_CUDA_RESTRICT tsm = (uint16_t *)(paw_stage_smem + CB_U32);
+
+    if constexpr (!MBAL) {
+        {   // 8 lane-copies of the codebook, XOR-swizzled writes
+            const uint32_t * GGML_CUDA_RESTRICT src = (const uint32_t *) tlut;
+            const int sw = lane & (PAW_STAGE_COPIES - 1);
+            for (int r = threadIdx.x; r < 512; r += PAW_WALK_NTHR) {
+                const uint32_t v = src[r];
+#pragma unroll
+                for (int c = 0; c < PAW_STAGE_COPIES; ++c)
+                    cb[(r << PAW_STAGE_LOG2C) | (c ^ sw)] = v;
+            }
+        }
+    }
+
+    // byte offsets of the (lo, hi) window pair and the crossing pair inside
+    // the 64-byte shared tile (units 2*ri / 2*ri+1 / 2*ri+2; the +8 row's
+    // crossing unit wraps at g == 7)
+    const int lo_off[2] = {4*groupID, 4*groupID + 32};
+    const int xx_off[2] = {(4*groupID + 4) & 63, (4*groupID + 36) & 63};
+    const int off0      = 4*tid4;   // bit offset, identical for both rows
+
+    auto emit = [&](uint32_t st) -> uint32_t {
+        if constexpr (MBAL) {
+            const uint32_t x1 = st * 1927765585u;      // pool multiplier a
+            const uint32_t x2 = x1 ^ (x1 >> 17);       // pool shift s
+            uint32_t ua, ub, z = 0;
+            asm("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(ua) : "r"(x2), "r"(z), "r"(z));
+            const uint32_t x3 = x2 ^ (x2 >> 7);        // second mixing for the pair
+            asm("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(ub) : "r"(x3), "r"(z), "r"(z));
+            const __half2 h = __halves2half2(__uint2half_rn(ua), __uint2half_rn(ub));
+            return *(const uint32_t *) &h;
+        }
+        const uint32_t ph = st*(st + 1u);
+        const uint32_t pair = cb[((ph >> (6 - PAW_STAGE_LOG2C)) & (511u << PAW_STAGE_LOG2C))
+                                 | (lane & (PAW_STAGE_COPIES - 1))];
+        return pair ^ (ph & 0x8000u);
+    };
+    auto load_b = [&](int ct, half2& h0, half2& h1) {
+        auto pack = [&](const float * ub) {
+            const float2 v0 = *(const float2 *)(const void *)(ub + tid4*2);
+            const float2 v1 = *(const float2 *)(const void *)(ub + tid4*2 + 8);
+            h0 = __floats2half2_rn(v0.x, v0.y);
+            h1 = __floats2half2_rn(v1.x, v1.y);
+        };
+        if constexpr (!MT) {
+            pack(scr_u + ct*16);
+        } else if (groupID < nt) {
+            pack(scr_u + (int64_t) groupID*n + ct*16);
+        } else {
+            h0 = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
+            h1 = h0;
+        }
+    };
+
+    const uint16_t * GGML_CUDA_RESTRICT base = trellis + (int64_t) tr*tiles_y*WORDS;
+    auto issue = [&](int buf, int c0) {
+        const int tiles = (tiles_y - c0) < TILES ? (tiles_y - c0) : TILES;
+        if (tiles <= 0) return;
+        const int bytes = tiles*WORDS*2;                 // WORDS*2 == 64, multiple of 16
+        char       * dstb = (char *)(tsm + buf*CHUNK_W);
+        const char * srcb = (const char *)(base + (int64_t) c0*WORDS);
+        for (int off = threadIdx.x*16; off < bytes; off += PAW_WALK_NTHR*16)
+            cp_async_cg_16<128>(ggml_cuda_cvta_generic_to_shared(dstb + off), srcb + off);
+    };
+
+    // column split across blocks sharing the output tile (blockIdx.y)
+    const int tpb   = (tiles_y + (int) gridDim.y - 1)/(int) gridDim.y;
+    const int c_beg = tpb*(int) blockIdx.y;
+    const int c_end = tiles_y < c_beg + tpb ? tiles_y : c_beg + tpb;
+
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+
+    issue(0, c_beg); paw_cp_commit();
+    int buf = 0;
+    for (int c0 = c_beg; c0 < c_end; c0 += TILES, buf ^= 1) {
+        const int nxt = c0 + TILES;
+        if (nxt < c_end) { issue(buf ^ 1, nxt); paw_cp_commit(); paw_cp_wait_group<1>(); }
+        else             { paw_cp_wait_group<0>(); }
+        __syncthreads();
+
+        const uint16_t * GGML_CUDA_RESTRICT sh = tsm + buf*CHUNK_W;
+        const int lim = (c_end - c0) < TILES ? (c_end - c0) : TILES;
+        const int l0  = wid;
+        uint32_t plo[2], pxx[2]; half2 phb0, phb1;
+        if (l0 < lim) {
+            const char * tw = (const char *)(sh + l0*WORDS);
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                plo[k] = *(const uint32_t *)(tw + lo_off[k]);
+                pxx[k] = *(const uint32_t *)(tw + xx_off[k]);
+            }
+            load_b(c0 + l0, phb0, phb1);
+        }
+        for (int l = l0; l < lim; l += PAW_WALK_WPB) {
+            const int ln = l + PAW_WALK_WPB;
+            uint32_t nlo[2], nxx[2]; half2 nhb0, nhb1;
+            if (ln < lim) {
+                const char * twn = (const char *)(sh + ln*WORDS);
+#pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    nlo[k] = *(const uint32_t *)(twn + lo_off[k]);
+                    nxx[k] = *(const uint32_t *)(twn + xx_off[k]);
+                }
+                load_b(c0 + ln, nhb0, nhb1);
+            }
+            uint32_t ra[4];
+            const uint32_t rb0 = *(const uint32_t *) &phb0, rb1 = *(const uint32_t *) &phb1;
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                // units are read MSB-first, so a 16-bit window starting at
+                // bit `off0` of the (lo, hi) pair is a 32-bit rotate-left of
+                // the little-endian pair, masked to 16 bits: for off0 == 0
+                // the (32-off0)&31 shift degenerates to lo32 & 0xFFFF == lo,
+                // matching dec_state's off == 0 branch.
+                const uint32_t st1 = ((plo[k] << off0) | (plo[k] >> ((32 - off0) & 31))) & 0xFFFFu;
+                const uint32_t hx  = (plo[k] >> 16) | (pxx[k] << 16);
+                const uint32_t st2 = ((hx << off0) | (hx >> ((32 - off0) & 31))) & 0xFFFFu;
+                ra[k]     = emit(st1);
+                ra[k + 2] = emit(st2);
+            }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb0), "r"(rb1));
+            if (ln < lim) {
+#pragma unroll
+                for (int k = 0; k < 2; ++k) { plo[k] = nlo[k]; pxx[k] = nxx[k]; }
+                phb0 = nhb0; phb1 = nhb1;
+            }
+        }
+        __syncthreads();
+    }
+
+    if constexpr (!MT) {
+        if (tid4 == 0) {
+            atomicAdd(&scr_v[(size_t) tr*16 + groupID],     d0);
+            atomicAdd(&scr_v[(size_t) tr*16 + groupID + 8], d2);
+        }
+    } else {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < nt && tid4 == (t >> 1)) {
+                const float vlo = (t & 1) ? d1 : d0;
+                const float vhi = (t & 1) ? d3 : d2;
+                atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID],     vlo);
+                atomicAdd(&scr_v[(int64_t) t*m + tr*16 + groupID + 8], vhi);
+            }
+        }
     }
 }
 
@@ -1538,6 +2850,116 @@ static __global__ void paw_rt_walk_qtip_kernel(
 // pre-rounded tlut halves (sign flip is exact), then apply the bank with a
 // plain fp32 GEMM-ish kernel. Replaces only the walk stage; rt_u/rt_out are
 // untouched.
+
+// rate-templated twin of paw_rt_dense_decode_kernel: same bank layout,
+// generic per-row state windows (paw_rt_walk_kernel math) so the dense
+// payload's K1/K1.5 rates can materialize fp16 banks for batched apply.
+template <int WORDS>
+static __global__ void paw_rt_dense_decode_rate_kernel(
+        const uint16_t * GGML_CUDA_RESTRICT trellis,
+        const half     * GGML_CUDA_RESTRICT tlut,     // pre-rounded fp16
+        half           * GGML_CUDA_RESTRICT bank,     // [m, n]
+        const int m, const int n) {
+    constexpr int WG = 256;
+    constexpr int step = WORDS/8;
+    __shared__ half slut[1024];
+
+    const int tid = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    for (int i = tid; i < 1024; i += WG) {
+        slut[i] = tlut[i];
+    }
+    __syncthreads();
+
+    const int tiles_y = n / 16;
+    const int gx = blockIdx.x*WG + tid;
+    if (gx >= (m/16)*16*tiles_y) {   // one thread per (tile, tile-row)
+        return;
+    }
+    // column tile fastest: a warp writes 16 consecutive 16-half row chunks
+    const int tc     = gx % tiles_y;
+    const int rowall = gx / tiles_y;
+    const int tr     = rowall >> 4;
+    const int rr     = rowall & 15;
+
+    const int64_t tw = ((int64_t) tr*tiles_y + tc)*WORDS;
+    half * dst = bank + (int64_t)(tr*16 + rr)*n + tc*16;
+    half tmp[16];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int b   = step*(8*rr + j);
+        const int wi  = (b >> 4) % WORDS;
+        const int off = b & 15;
+        const uint32_t w0 = trellis[tw + wi];
+        const uint32_t st = off == 0 ? w0
+            : (((w0 << off) | (trellis[tw + (wi + 1) % WORDS] >> (16 - off)))
+               & 0xFFFFu);
+        const uint32_t ph  = st*(st + 1u);
+        const uint32_t row = (ph >> 6) & 511u;
+        const float a0 = __half2float(slut[2*row + 0]);
+        // negate-then-round-trip is bit-exact for fp16 values (sign bit)
+        tmp[2*j + 0] = __float2half_rn((ph & 0x8000u) ? -a0 : a0);
+        tmp[2*j + 1] = slut[2*row + 1];
+    }
+    paw_store_half16(dst, tmp);   // same bits, 2x16B instead of 16x2B
+}
+
+// e5m2 twin of paw_rt_dense_decode_rate_kernel: rate-generic decode into a
+// 1-byte/weight bank, so the DOL path (GGML_PAW_DOL_K2) can cache non-K4
+// payloads in VRAM. Same emission math, e5m2 stores like the K4 fp8 twin.
+template <int WORDS>
+static __global__ void paw_rt_dense_decode_rate_kernel_fp8(
+        const uint16_t * GGML_CUDA_RESTRICT trellis,
+        const half     * GGML_CUDA_RESTRICT tlut,     // pre-rounded fp16
+        uint8_t        * GGML_CUDA_RESTRICT bank,     // [m, n]
+        const int m, const int n) {
+    constexpr int WG = 256;
+    constexpr int step = WORDS/8;
+    __shared__ half slut[1024];
+
+    const int tid = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    for (int i = tid; i < 1024; i += WG) {
+        slut[i] = tlut[i];
+    }
+    __syncthreads();
+
+    const int tiles_y = n / 16;
+    const int gx = blockIdx.x*WG + tid;
+    if (gx >= (m/16)*16*tiles_y) {
+        return;
+    }
+    const int tc     = gx % tiles_y;
+    const int rowall = gx / tiles_y;
+    const int tr     = rowall >> 4;
+    const int rr     = rowall & 15;
+
+    const int64_t tw = ((int64_t) tr*tiles_y + tc)*WORDS;
+    uint8_t * dst = bank + (int64_t)(tr*16 + rr)*n + tc*16;
+    uint8_t tmp[16];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int b   = step*(8*rr + j);
+        const int wi  = (b >> 4) % WORDS;
+        const int off = b & 15;
+        const uint32_t w0 = trellis[tw + wi];
+        const uint32_t st = off == 0 ? w0
+            : (((w0 << off) | (trellis[tw + (wi + 1) % WORDS] >> (16 - off)))
+               & 0xFFFFu);
+        const uint32_t ph  = st*(st + 1u);
+        const uint32_t row = (ph >> 6) & 511u;
+        const float a0 = __half2float(slut[2*row + 0]);
+        const float a1 = __half2float(slut[2*row + 1]);
+        tmp[2*j + 0] = paw_f32_to_e5m2((ph & 0x8000u) ? -a0 : a0);
+        tmp[2*j + 1] = paw_f32_to_e5m2(a1);
+    }
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        dst[i] = tmp[i];
+    }
+}
 
 static __global__ void paw_rt_dense_decode_kernel(
         const uint16_t * GGML_CUDA_RESTRICT trellis,
@@ -1776,103 +3198,170 @@ static __global__ void paw_rt_apply_kernel(
     }
 }
 
-// --- experimental: tensor-core apply, opt-in via GGML_PAW_RT_APPLY_MMA=1 ---
-//
-// paw_rt_apply_kernel above is a plain scalar/warp-reduce dot product over
-// an already-dense fp16 bank -- by the time it runs, the trellis decode is
-// done and this is an ordinary GEMM (scr_v[nt,m] = scr_u[nt,n] @ bank[m,n]^T).
-// Its own tile shape (16 output rows/block) already matches the m16n8k16
-// tensor-core MMA instruction shape, so this feeds the same computation
-// through wmma instead of scalar FMA + warp_reduce_sum. Activations are cast
-// fp32->fp16 before the multiply (standard practice for tensor-core GEMM,
-// same precision class every other fp16 llama.cpp kernel already uses) --
-// this is the one deliberate numeric difference from the scalar path, and is
-// exactly what the correctness gate below needs to check is within noise.
-//
-// v2: grid.x = m/16, matching the scalar kernel's block count exactly (v1
-// grouped 4 tr's per block instead, cutting block count to a quarter of the
-// scalar kernel's -- occupancy-starved on this GPU, measured slower than
-// scalar: 14.24 vs 21.27 tok/s under np=8. Fixed here by keeping one block
-// per tr and instead splitting the K-loop across the block's 4 warps (each
-// warp accumulates a partial 16x16 tile over its own K-subset), then doing
-// a small cross-warp reduction of the 4 partial tiles at the end -- same
-// occupancy as the scalar path, same MMA benefit per K-step.
-//
-// 16x16x16 is the wmma C++ API's valid fp16 tile shape (the m16n8k16
-// raw-PTX shape QTIP uses isn't exposed by wmma::fragment -- confirmed by a
-// failed build attempt at m16n8k16 first). TC (token tile) is therefore 16
-// here, not 8/4 like the scalar path's RT_TC knob -- when nt < 16 (the
-// common case, nt <= np <= 8 in our serving config) half the N-tile is
-// zero-padded, wasting some MMA throughput but still expected to beat
-// scalar FMA by a wide margin. Activations are cast fp32->fp16 before the
-// multiply (standard practice for tensor-core GEMM, same precision class
-// every other fp16 llama.cpp kernel already uses) -- this is the one
-// deliberate numeric difference from the scalar path, and is exactly what
-// the correctness gate needs to check is within noise.
+
+
+
+
+
+
+
+
+
+// MODE 5: weight-stationary across tokens AND rows. The first WS cut kept
+// one 16-row strip per block, so every row-strip block still re-read the
+// whole nt x n activation slab (~8 GB per call on the shared-expert shape).
+// Staging BM=64 rows per block cuts that by 4x; activations are cast once
+// per K-chunk and reused by all four A tiles held live in registers.
 static __global__ void paw_rt_apply_kernel_mma(
-        const half  * GGML_CUDA_RESTRICT bank,     // [m, n] row-major
-        const float * GGML_CUDA_RESTRICT scr_u,    // [nt, n] row-major
-        float       * GGML_CUDA_RESTRICT scr_v,    // [nt, m] row-major
+        const half  * GGML_CUDA_RESTRICT bank,
+        const float * GGML_CUDA_RESTRICT scr_u,
+        float       * GGML_CUDA_RESTRICT scr_v,
         const int m, const int n, const int nt) {
     using namespace nvcuda;
 
-    const int warp_id = threadIdx.x / 32;
-    const int lane     = threadIdx.x % 32;
-    const int tr  = blockIdx.x;    // row-tile (16 rows) -- whole block, matches scalar kernel
-    const int n16 = blockIdx.z;    // token tile (16 tokens) this block owns
+    constexpr int n_warps = 4;
+    constexpr int bm_t    = 4;                  // 16-row tiles -> BM = 64
+    constexpr int tpb     = 2;                  // token subtiles -> BN = 128
+    constexpr int bn      = n_warps * tpb * 16;
+    constexpr int bk      = 16;                 // == the wmma K tile
 
-    // per-warp staging for the B fragment: col-major [K=16][N=16], so within
-    // a fixed token (column) the K index is contiguous -- matches what
-    // load_matrix_sync(..., col_major) expects with ld=16.
-    __shared__ half  u_half[4][16][16];
-    __shared__ float out_sh[4][16*16];
+    const int warp_id = threadIdx.x / 32;
+    const int lane    = threadIdx.x % 32;
+    const int row0 = blockIdx.x * (bm_t * 16);  // first output row
+    const int tok0 = blockIdx.z * bn;
+
+    __shared__ half Xsh[n_warps][tpb][16][bk];         // 4 KB, warp-private
+    __shared__ float out_sh[n_warps][16*16];           // 4 KB
 
     ggml_cuda_pdl_sync();
 
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
-    wmma::fill_fragment(acc_frag, 0.0f);
-
-    const half * W = bank + (int64_t) tr * 16 * n;
-
-    // this warp handles K-chunks {warp_id*16, warp_id*16 + 4*16, ...}
-    for (int k0 = warp_id*16; k0 < n; k0 += 4*16) {
-        // stage this K-chunk's activations for all 16 tokens into shared
-        // mem, fp32 -> fp16, zero-padding past nt or past n (tail chunk,
-        // same clamp-and-guard spirit as the scalar kernel above).
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[bm_t][tpb];
 #pragma unroll
-        for (int idx = lane; idx < 16*16; idx += 32) {
-            const int tt = idx / 16;
-            const int kk = idx % 16;
-            const int tok = n16*16 + tt;
-            float v = 0.0f;
-            if (tok < nt && (k0 + kk) < n) {
-                v = scr_u[(int64_t) tok*n + (k0 + kk)];
-            }
-            u_half[warp_id][tt][kk] = __float2half(v);
+    for (int r = 0; r < bm_t; ++r) {
+#pragma unroll
+        for (int t = 0; t < tpb; ++t) {
+            wmma::fill_fragment(acc[r][t], 0.0f);
         }
-        __syncwarp();
-
-        wmma::load_matrix_sync(a_frag, W + k0, n);
-        wmma::load_matrix_sync(b_frag, &u_half[warp_id][0][0], 16);
-        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
     }
 
-    wmma::store_matrix_sync(&out_sh[warp_id][0], acc_frag, 16, wmma::mem_row_major);
-    __syncthreads();
-
-    // cross-warp reduction of the 4 partial 16x16 tiles, then scatter to
-    // scr_v (same output layout/bounds-guard as the scalar kernel).
+    for (int k0 = 0; k0 < n; k0 += bk) {
 #pragma unroll
-    for (int idx = threadIdx.x; idx < 16*16; idx += 128) {
-        const int row = idx / 16;
-        const int tt  = idx % 16;
-        const int tok = n16*16 + tt;
-        if (tok < nt) {
-            const float sum = out_sh[0][idx] + out_sh[1][idx] + out_sh[2][idx] + out_sh[3][idx];
-            scr_v[(int64_t) tok*m + tr*16 + row] = sum;
+        for (int t = 0; t < tpb; ++t) {
+            const int tt0 = tok0 + (warp_id*tpb + t)*16;
+            for (int idx = lane; idx < 16*bk; idx += 32) {
+                const int tt = idx / bk;
+                const int kk = idx % bk;
+                const int tok = tt0 + tt;
+                const int kg = k0 + kk;
+                Xsh[warp_id][t][tt][kk] =
+                    (tok < nt && kg < n) ? __float2half(scr_u[(int64_t) tok*n + kg])
+                                         : __float2half(0.0f);
+            }
         }
+        __syncwarp();
+#pragma unroll
+        for (int r = 0; r < bm_t; ++r) {
+            wmma::load_matrix_sync(a_frag,
+                bank + (int64_t)(row0 + r*16)*n + k0, n);
+#pragma unroll
+            for (int t = 0; t < tpb; ++t) {
+                wmma::load_matrix_sync(b_frag, &Xsh[warp_id][t][0][0], bk);
+                wmma::mma_sync(acc[r][t], a_frag, b_frag, acc[r][t]);
+            }
+        }
+        __syncwarp();
+    }
+
+#pragma unroll
+    for (int r = 0; r < bm_t; ++r) {
+#pragma unroll
+        for (int t = 0; t < tpb; ++t) {
+            wmma::store_matrix_sync(&out_sh[warp_id][0], acc[r][t], 16, wmma::mem_row_major);
+            __syncwarp();
+            const int tt0 = tok0 + (warp_id*tpb + t)*16;
+            for (int idx = lane; idx < 16*16; idx += 32) {
+                const int row = idx / 16;
+                const int tt  = idx % 16;
+                const int tok = tt0 + tt;
+                if (tok < nt) {
+                    scr_v[(int64_t) tok*m + row0 + r*16 + row] = out_sh[warp_id][idx];
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+// host-side mode dispatch shared by every rt_apply mma call site so the
+// bisect modes stay consistent across the cached-bank, fresh-bank and
+// batched paths.
+
+// fp32 -> fp16 activation cast feeding the cuBLAS dense apply
+static __global__ void paw_cast_f32_f16_kernel(
+        const float * GGML_CUDA_RESTRICT x, half * GGML_CUDA_RESTRICT h, const int k) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < k) {
+        h[i] = __float2half(x[i]);
+    }
+}
+
+// host dispatch shared by every rt_apply call site. The weight-stationary
+// tensor-core kernel needs m tiled by 64; anything else falls back to the
+// scalar dense apply.
+static void paw_launch_rt_apply_mma(ggml_backend_cuda_context & ctx,
+        cudaStream_t stream, const half * bank,
+        const float * scr_u, float * scr_v, const int m, const int n, const int nt,
+        const int voff = 0) {
+    // voff: first output ROW of this chunk inside the full-m strided dst
+    // (the two-half decode/apply overlap writes scr_v[m0..m) from a bank
+    // slice while keeping the full-row leading dimension)
+    static const int blas_min_tok = paw_env_int("GGML_PAW_RT_BLAS_MIN_TOK", 128);
+    // the host count/cast staging is incompatible with graph capture
+    cudaStreamCaptureStatus rcst = cudaStreamCaptureStatusNone;
+    const bool rt_capturing =
+        cudaStreamIsCapturing(stream, &rcst) == cudaSuccess &&
+        rcst == cudaStreamCaptureStatusActive;
+    if (!rt_capturing && m % 16 == 0 && n % 8 == 0 && nt >= blas_min_tok) {
+        // dense apply against a materialized bank is an ordinary GEMM; hand
+        // large batches to the tensor-core BLAS. Activations are cast once
+        // to fp16 -- the same conversion the custom kernels stage anyway.
+        ggml_cuda_pool_alloc<half> u_h_alloc(ctx.pool());
+        half * u_h = u_h_alloc.alloc((size_t) nt*n);
+        paw_launch(paw_cast_f32_f16_kernel,
+            ggml_cuda_kernel_launch_params(
+                dim3(((size_t) nt*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            scr_u, u_h, (int)((size_t) nt*n));
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(),
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                m, nt, n,
+                &alpha,
+                bank, CUDA_R_16F, n,
+                u_h,  CUDA_R_16F, n,
+                &beta,
+                scr_v + voff, CUDA_R_32F, m,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        return;
+    }
+    GGML_ASSERT(voff == 0 && "row-offset apply only supported on the cublas path");
+    // The WS-mma kernel tiles tokens by 128; at DFlash verify sizes (nt ~ 8)
+    // nearly the whole tile is padding and the lane regresses ~45% versus the
+    // scalar apply (188.9 -> 105 tok/s code-lane, bisected to 05b8814). Keep
+    // mma for the large-batch shapes it wins; hand small ubatches to the
+    // scalar kernel<8> path. GGML_PAW_APPLY_MMA_MIN_TOK overrides the cutoff.
+    static const int mma_min_tok = paw_env_int("GGML_PAW_APPLY_MMA_MIN_TOK", 32);
+    if (m % 64 == 0 && nt >= mma_min_tok) {
+        paw_launch(paw_rt_apply_kernel_mma,
+            ggml_cuda_kernel_launch_params(dim3(m/64, 1, (nt + 127)/128), dim3(128, 1, 1), 0, stream),
+            bank, scr_u, scr_v, m, n, nt);
+    } else {
+        paw_launch(paw_rt_apply_kernel<8>,
+            ggml_cuda_kernel_launch_params(dim3(m/16, 1, (nt + 7)/8), dim3(128, 1, 1), 0, stream),
+            bank, (const float *) scr_u, scr_v, m, n, nt);
     }
 }
 
@@ -1994,11 +3483,337 @@ static __global__ void paw_rt_walk_kernel_mma(
 // is identical across steps; the dense path has been re-decoding it every
 // step. Caching it here turns the per-step walk/decode into a plain
 // bandwidth-bound fp16 GEMV/GEMM over the cached bank. Keyed by the trellis
-// data pointer; entries are intentionally leaked (one per matrix, matching the
-// weight allocation's lifetime). GGML_PAW_BANK_CACHE=0 falls back to the
-// original per-step walk/decode.
+// data pointer *and shape*; entries are intentionally leaked (one per matrix,
+// matching the weight allocation's lifetime). GGML_PAW_BANK_CACHE=0 falls back
+// to the original per-step walk/decode.
+//
+// The shape belongs in the key because a pointer alone is only unique for the
+// lifetime of the allocation behind it. Model weights live forever, so the old
+// pointer-only key was safe in a server; test-backend-ops recycles buffers
+// between cases, so a later case with a different shape used to be handed the
+// previous case's bank -- wrong numbers, and an out-of-bounds read as soon as
+// the new shape was larger.
+struct paw_bank_key {
+    const void * trellis;
+    int m;
+    int n;
+    bool operator==(const paw_bank_key & o) const {
+        return trellis == o.trellis && m == o.m && n == o.n;
+    }
+};
+struct paw_bank_key_hash {
+    size_t operator()(const paw_bank_key & k) const {
+        return std::hash<const void *>()(k.trellis) ^ (std::hash<int>()(k.m) << 1)
+                                                    ^ (std::hash<int>()(k.n) << 2);
+    }
+};
 static std::mutex paw_rt_bank_mutex;
-static std::unordered_map<const void *, const void *> paw_rt_banks;
+static std::unordered_map<paw_bank_key, const void *, paw_bank_key_hash> paw_rt_banks;
+// DOL (GGML_PAW_DOL_K2) bank budget accounting, guarded by paw_rt_bank_mutex.
+// Counts only banks the DOL path created; K4 bank-cache users are unbounded
+// exactly as before.
+static int64_t paw_dol_banked = 0;
+
+// rate-dispatch wrapper: any supported trellis rate through the templated
+// tensor-core walk (K4 included -- the generic window math is bit-identical)
+template <int WORDS>
+static void paw_rt_walk_qtip_frag_dispatch(const uint16_t * trellis,
+        const half * tlut, const float * scr_u, float * scr_v,
+        int8_t * q_u, float * q_s, int * q_z,
+        const int m, const int n, const int nt, cudaStream_t stream) {
+    // The same fused-int8/dp4a decode strategy that is enabled by default in
+    // exllamav3, adapted to PAW's existing lattice lookup and bitstream.
+    // Keep it opt-in until end-to-end quality and speed are measured.
+    // mode 1 adapts the current LUT payload. Mode 2 is a lookup-free paired
+    // mul1 timing prototype, not EXL3 format compatibility: PAW V=2 emits a
+    // pair per state, whereas EXL3 mul1 emits one scalar per state. It needs a
+    // matching re-encode and remains timing-only until that encoder exists.
+    static const int int8_mode = paw_env_int("GGML_PAW_WALK_INT8", 0);
+    if (int8_mode != 0 && nt == 1 &&
+        (WORDS == 16 || WORDS == 24 || WORDS == 32)) {
+        if constexpr (WORDS == 16 || WORDS == 24 || WORDS == 32) {
+            paw_launch(paw_rt_quant_i8_kernel,
+                ggml_cuda_kernel_launch_params(dim3((n/16 + 15)/16, 1, 1),
+                    dim3(256, 1, 1), 0, stream),
+                scr_u, q_u, q_s, q_z, n);
+            constexpr int TILES = paw_stage_tiles<WORDS>::v;
+            const size_t cb_bytes = int8_mode == 2 ? 0 :
+                (size_t)512*PAW_I8_CB_COPIES*sizeof(uint16_t);
+            const size_t int8_smem = cb_bytes +
+                (size_t)2*TILES*WORDS*sizeof(uint16_t) +
+                (size_t)2*TILES*16*sizeof(int8_t) +
+                (size_t)2*TILES*sizeof(float) +
+                (size_t)2*TILES*sizeof(int) +
+                (size_t)(PAW_WALK_WPB + 1)*sizeof(float);
+            static bool si8_lut = false, si8_mul1 = false;
+            if (int8_mode == 2 && !si8_mul1) {
+                CUDA_CHECK(cudaFuncSetAttribute(
+                    (const void *)paw_rt_walk_int8_kernel<WORDS, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)int8_smem));
+                si8_mul1 = true;
+            } else if (int8_mode != 2 && !si8_lut) {
+                CUDA_CHECK(cudaFuncSetAttribute(
+                    (const void *)paw_rt_walk_int8_kernel<WORDS, false>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)int8_smem));
+                si8_lut = true;
+            }
+            if (int8_mode == 2)
+                paw_launch(paw_rt_walk_int8_kernel<WORDS, true>,
+                    ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1),
+                        dim3(PAW_WALK_NTHR, 1, 1), int8_smem, stream),
+                    trellis, tlut, q_u, q_s, q_z, scr_v, m, n);
+            else
+                paw_launch(paw_rt_walk_int8_kernel<WORDS, false>,
+                    ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1),
+                        dim3(PAW_WALK_NTHR, 1, 1), int8_smem, stream),
+                    trellis, tlut, q_u, q_s, q_z, scr_v, m, n);
+            return;
+        }
+    }
+    // enough blocks that no warp walks a long serial chain of tile columns
+    // (measured neutral on PAW-27B -- small-m attention projections are not
+    // on the critical path; kept for narrow-m payloads)
+    static const int split_min_blocks =
+        paw_env_int("GGML_PAW_WALK_SPLIT_BLOCKS", 0);
+    static const int split_max   = paw_env_int("GGML_PAW_WALK_SPLIT_MAX", 8);
+    int S = 1;
+    if (split_min_blocks > 0 && m/16 < split_min_blocks && n >= 256) {
+        S = (split_min_blocks + m/16 - 1)/(m/16);
+        if (S > split_max) S = split_max;
+        if (S < 1)         S = 1;
+    }
+    if (S > 1) {
+        CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) nt*m*sizeof(float), stream));
+    }
+    // Staged walk (cp.async the trellis into shared). w24 alone measured
+    // +12.0% on tg64 (23.88 -> 26.75) with byte-identical output, so it is
+    // extended to the other two shipped rates here.
+    // Stage2 (GGML_PAW_WALK_STAGE2=1): pipelined + 32-bit-unit stage walk
+    // (w32 only; other rates fall through to stage1). Optional knobs:
+    //   GGML_PAW_WALK_MBAL=1         computed MUL-BAL emission (timing only
+    //                                on an existing bitstream)
+    //   GGML_PAW_WALK_STAGE_SPLIT=N  split each output tile's columns across
+    //                                blocks when m/16 < N (atomicAdd folds)
+    static const bool stage2_on  = paw_env_int("GGML_PAW_WALK_STAGE2", 0) != 0;
+    static const bool mbal_on    = paw_env_int("GGML_PAW_WALK_MBAL", 0) != 0;
+    static const int  ssplit_min = paw_env_int("GGML_PAW_WALK_STAGE_SPLIT", 0);
+    if (stage2_on && WORDS == 32) {
+        if constexpr (WORDS == 32) {
+        int S2 = 1;
+        if (ssplit_min > 0 && m/16 < ssplit_min && n >= 256) {
+            S2 = (ssplit_min + m/16 - 1)/(m/16);
+            if (S2 > split_max) S2 = split_max;
+            if (S2 < 1)         S2 = 1;
+        }
+        if (S2 > 1) {
+            CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) nt*m*sizeof(float), stream));
+        }
+        constexpr size_t stage_smem =
+            (size_t) 512*PAW_STAGE_COPIES*sizeof(uint32_t)
+            + (size_t) 2*paw_stage_tiles<WORDS>::v*WORDS*sizeof(uint16_t);
+        auto launch2 = [&](auto mt, auto mb) {
+            constexpr bool mtb = decltype(mt)::value, mbb = decltype(mb)::value;
+            paw_launch((paw_rt_walk_qtip_stage2_kernel<WORDS, mtb, mbb>),
+                ggml_cuda_kernel_launch_params(dim3(m/16, S2, 1),
+                    dim3(PAW_WALK_NTHR, 1, 1), stage_smem, stream),
+                trellis, tlut, scr_u, scr_v, m, n, nt);
+        };
+        if (mbal_on) {
+            if (nt <= 1) launch2(std::false_type{}, std::true_type{});
+            else         launch2(std::true_type{},  std::true_type{});
+        } else {
+            if (nt <= 1) launch2(std::false_type{}, std::false_type{});
+            else         launch2(std::true_type{},  std::false_type{});
+        }
+        return;
+        }
+    }
+    static const bool stage_on = paw_env_int("GGML_PAW_WALK_STAGE", 1) != 0;
+    static const bool computed = paw_env_int("GGML_PAW_WALK_COMPUTED", 0) != 0;
+    static const bool aligned  = paw_env_int("GGML_PAW_WALK_ALIGNED", 0) != 0;
+    static const bool regres   = paw_env_int("GGML_PAW_WALK_REGRES", 0) != 0;
+    if constexpr (WORDS == 16 || WORDS == 24 || WORDS == 32 || WORDS == 64) {
+        if (stage_on && S == 1) {
+            constexpr size_t stage_smem =
+                (size_t) 512*PAW_STAGE_COPIES*sizeof(uint32_t)
+                + (size_t) 2*paw_stage_tiles<WORDS>::v*WORDS*sizeof(uint16_t);
+            // GGML_PAW_WALK_COMPUTED=1 also drives the staged walk now: it is
+            // the default path and ncu measures it L1TEX-bound at 84%, so the
+            // codebook gather has to be tested here, not only in the frag kernel.
+            if (nt <= 1 && regres && WORDS == 32) {
+                static bool sr = false;
+                if (!sr) { CUDA_CHECK(cudaFuncSetAttribute(
+                    (const void *) paw_rt_walk_qtip_stage_kernel<WORDS, false, false, false, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int) stage_smem)); sr = true; }
+                paw_launch((paw_rt_walk_qtip_stage_kernel<WORDS, false, false, false, true>),
+                    ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1),
+                        dim3(PAW_WALK_NTHR, 1, 1), stage_smem, stream),
+                    trellis, tlut, scr_u, scr_v, m, n, nt);
+            } else if (nt <= 1 && aligned) {
+                static bool sa = false;
+                if (!sa) { CUDA_CHECK(cudaFuncSetAttribute(
+                    (const void *) paw_rt_walk_qtip_stage_kernel<WORDS, false, false, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int) stage_smem)); sa = true; }
+                paw_launch((paw_rt_walk_qtip_stage_kernel<WORDS, false, false, true>),
+                    ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1),
+                        dim3(PAW_WALK_NTHR, 1, 1), stage_smem, stream),
+                    trellis, tlut, scr_u, scr_v, m, n, nt);
+            } else if (nt <= 1 && computed) {
+                static bool sc = false;
+                if (!sc) { CUDA_CHECK(cudaFuncSetAttribute(
+                    (const void *) paw_rt_walk_qtip_stage_kernel<WORDS, false, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int) stage_smem)); sc = true; }
+                paw_launch((paw_rt_walk_qtip_stage_kernel<WORDS, false, true>),
+                    ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1),
+                        dim3(PAW_WALK_NTHR, 1, 1), stage_smem, stream),
+                    trellis, tlut, scr_u, scr_v, m, n, nt);
+            } else if (nt <= 1) {
+                static bool sf = false;
+                if (!sf) { CUDA_CHECK(cudaFuncSetAttribute(
+                    (const void *) paw_rt_walk_qtip_stage_kernel<WORDS, false>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int) stage_smem)); sf = true; }
+                paw_launch((paw_rt_walk_qtip_stage_kernel<WORDS, false>),
+                    ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1),
+                        dim3(PAW_WALK_NTHR, 1, 1), stage_smem, stream),
+                    trellis, tlut, scr_u, scr_v, m, n, nt);
+            } else {
+                static bool st = false;
+                if (!st) { CUDA_CHECK(cudaFuncSetAttribute(
+                    (const void *) paw_rt_walk_qtip_stage_kernel<WORDS, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int) stage_smem)); st = true; }
+                paw_launch((paw_rt_walk_qtip_stage_kernel<WORDS, true>),
+                    ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1),
+                        dim3(PAW_WALK_NTHR, 1, 1), stage_smem, stream),
+                    trellis, tlut, scr_u, scr_v, m, n, nt);
+            }
+            return;
+        }
+    }
+    // 64 KiB of dynamic shared is above the 48 KiB default and has to be
+    // opted into per kernel (once per instantiation).
+    // GGML_PAW_WALK_COMPUTED=1: lookup-free emission prototype (Track B) --
+    // no shared codebook (0 dynamic smem), the gather is an integer chain.
+    auto launch_frag = [&](auto MT_C, auto C, int nt_) {
+        constexpr bool mt  = decltype(MT_C)::value;
+        constexpr bool cmp = decltype(C)::value;
+        constexpr size_t smem = cmp ? 0 : PAW_WALK_CBSZ;
+        static bool set_attr = false;
+        if (!set_attr) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                (const void *) paw_rt_walk_qtip_frag_kernel<WORDS, mt, cmp>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+            set_attr = true;
+        }
+        paw_launch((paw_rt_walk_qtip_frag_kernel<WORDS, mt, cmp>),
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1),
+                dim3(PAW_WALK_NTHR, 1, 1), smem, stream),
+            trellis, tlut, scr_u, scr_v, m, n, nt_);
+    };
+    if (nt <= 1) {
+        if (computed) launch_frag(std::false_type{}, std::true_type{}, nt);
+        else          launch_frag(std::false_type{}, std::false_type{}, nt);
+    } else {
+        if (computed) launch_frag(std::true_type{}, std::true_type{}, nt);
+        else          launch_frag(std::true_type{}, std::false_type{}, nt);
+    }
+}
+
+static void paw_rt_walk_qtip_rate_launch(const uint16_t * trellis,
+        const half * tlut, const float * scr_u, float * scr_v,
+        const int m, const int n, const int words, cudaStream_t stream) {
+    // column-split factor: enough blocks in flight that no single warp walks
+    // a long serial chain of tile columns (the walk is latency-bound); the
+    // machine holds ~42k threads = ~168 of these 256-thread blocks, so any
+    // matrix with fewer than ~1500 output-tile blocks gets split
+    static const int split_min_blocks =
+        paw_env_int("GGML_PAW_WALK_SPLIT_BLOCKS", 1500);
+    static const int split_max   = paw_env_int("GGML_PAW_WALK_SPLIT_MAX", 8);
+    int S = 1;
+    if (split_min_blocks > 0 && m/16 < split_min_blocks && n >= 256) {
+        S = (split_min_blocks + m/16 - 1)/(m/16);
+        if (S > split_max)  S = split_max;
+        if (S*16 > n/16*8)  S = std::max(1, (n/16*8)/16);   // keep every warp busy
+        if (S < 1)          S = 1;
+    }
+    if (S > 1) {
+        CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) m*sizeof(float), stream));
+    }
+    switch (words) {
+        case 16: paw_launch(paw_rt_walk_qtip_rate_kernel<16>,
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        case 24: paw_launch(paw_rt_walk_qtip_rate_kernel<24>,
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        case 32: paw_launch(paw_rt_walk_qtip_rate_kernel<32>,
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        case 40: paw_launch(paw_rt_walk_qtip_rate_kernel<40>,
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        case 56: paw_launch(paw_rt_walk_qtip_rate_kernel<56>,
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        case 64: paw_launch(paw_rt_walk_qtip_rate_kernel<64>,
+            ggml_cuda_kernel_launch_params(dim3(m/16, S, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, scr_u, scr_v, m, n); break;
+        default: GGML_ABORT("paw: unsupported trellis rate for qtip walk");
+    }
+}
+
+static void paw_rt_dense_decode_rate_launch(const uint16_t * trellis,
+        const half * tlut, half * bank, const int m, const int n,
+        const int words, cudaStream_t stream) {
+    switch (words) {
+        case 16: paw_launch(paw_rt_dense_decode_rate_kernel<16>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 24: paw_launch(paw_rt_dense_decode_rate_kernel<24>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 32: paw_launch(paw_rt_dense_decode_rate_kernel<32>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 40: paw_launch(paw_rt_dense_decode_rate_kernel<40>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 56: paw_launch(paw_rt_dense_decode_rate_kernel<56>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 64: paw_launch(paw_rt_dense_decode_rate_kernel<64>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        default: GGML_ABORT("paw: unsupported trellis rate for dense decode");
+    }
+}
+
+// fp8 twin of paw_rt_dense_decode_rate_launch (rate-generic e5m2 banks)
+static void paw_rt_dense_decode_rate_launch_fp8(const uint16_t * trellis,
+        const half * tlut, uint8_t * bank, const int m, const int n,
+        const int words, cudaStream_t stream) {
+    switch (words) {
+        case 16: paw_launch(paw_rt_dense_decode_rate_kernel_fp8<16>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 24: paw_launch(paw_rt_dense_decode_rate_kernel_fp8<24>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 32: paw_launch(paw_rt_dense_decode_rate_kernel_fp8<32>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 40: paw_launch(paw_rt_dense_decode_rate_kernel_fp8<40>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 56: paw_launch(paw_rt_dense_decode_rate_kernel_fp8<56>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        case 64: paw_launch(paw_rt_dense_decode_rate_kernel_fp8<64>,
+            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+            trellis, tlut, bank, m, n); break;
+        default: GGML_ABORT("paw: unsupported trellis rate for dense decode fp8");
+    }
+}
+
 
 static bool paw_bank_cache_on() {
     static const bool on = paw_env_int("GGML_PAW_BANK_CACHE", 1) != 0;
@@ -2012,13 +3827,17 @@ static size_t paw_rt_idx_bytes(const int m, const int n) {
 // decode-once and return the cached bank [m, n] for this trellis (fp16 or
 // e5m2 fp8). Caller must not hold the mutex; the first call per matrix syncs
 // the stream to make the decode visible before the dependent GEMM launches.
+// words is the trellis rate (16*rt_K): 64 selects the original K=4 kernels,
+// any other supported rate goes through the rate-templated decode twins.
 static const void * paw_rt_bank_get(
-        const void * trellis, const void * tlut, const int m, const int n, cudaStream_t stream) {
-    const bool idx = paw_rt_bank_idx_on();
+        const void * trellis, const void * tlut, const int m, const int n, cudaStream_t stream,
+        const int words = 64) {
+    const bool idx = words == 64 && paw_rt_bank_idx_on();
     const bool fp8 = !idx && paw_rt_bank_fp8_on();
+    const paw_bank_key key{trellis, m, n};
     {
         std::lock_guard<std::mutex> lock(paw_rt_bank_mutex);
-        auto it = paw_rt_banks.find(trellis);
+        auto it = paw_rt_banks.find(key);
         if (it != paw_rt_banks.end()) {
             return it->second;
         }
@@ -2035,23 +3854,33 @@ static const void * paw_rt_bank_get(
             ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
             (const uint16_t *) trellis, (const half *) tlut, (half *) ((uint8_t *) bank + idx_bytes), m, n);
     } else if (fp8) {
-        paw_launch(paw_rt_dense_decode_kernel_fp8,
-            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
-            (const uint16_t *) trellis, (const half *) tlut, (uint8_t *) bank, m, n);
+        if (words == 64) {
+            paw_launch(paw_rt_dense_decode_kernel_fp8,
+                ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+                (const uint16_t *) trellis, (const half *) tlut, (uint8_t *) bank, m, n);
+        } else {
+            paw_rt_dense_decode_rate_launch_fp8((const uint16_t *) trellis,
+                (const half *) tlut, (uint8_t *) bank, m, n, words, stream);
+        }
     } else {
-        paw_launch(paw_rt_dense_decode_kernel,
-            ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
-            (const uint16_t *) trellis, (const half *) tlut, (half *) bank, m, n);
+        if (words == 64) {
+            paw_launch(paw_rt_dense_decode_kernel,
+                ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+                (const uint16_t *) trellis, (const half *) tlut, (half *) bank, m, n);
+        } else {
+            paw_rt_dense_decode_rate_launch((const uint16_t *) trellis,
+                (const half *) tlut, (half *) bank, m, n, words, stream);
+        }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     {
         std::lock_guard<std::mutex> lock(paw_rt_bank_mutex);
-        auto it = paw_rt_banks.find(trellis);
+        auto it = paw_rt_banks.find(key);
         if (it != paw_rt_banks.end()) {
             cudaFree(bank);
             return it->second;
         }
-        paw_rt_banks.emplace(trellis, bank);
+        paw_rt_banks.emplace(key, bank);
     }
     return bank;
 }
@@ -2193,6 +4022,66 @@ static __global__ void paw_rt_gemv_u_kernel(
         const float2 w = __half22float2(W2[i]);
         const float2 uu = u2[i];
         acc += w.x*uu.x + w.y*uu.y;
+    }
+    acc = warp_reduce_sum<32>(acc);
+    if (lane == 0) {
+        scr_v[(int64_t) t*m + row] = acc;
+    }
+}
+// fused rt_u + fp8-bank GEMV: the e5m2 twin of paw_rt_gemv_u_kernel. The
+// half-reading variant must not run against an fp8 cached bank, so when
+// GGML_PAW_RT_BANK_FP8=1 this kernel handles the fused path instead.
+static __global__ void paw_rt_gemv_u_fp8_kernel(
+        const uint8_t * GGML_CUDA_RESTRICT bank,  // [m, n] row-major e5m2
+        const float   * GGML_CUDA_RESTRICT su,    // [n]
+        const float   * GGML_CUDA_RESTRICT x,     // [nt, n] row-major
+        float         * GGML_CUDA_RESTRICT scr_v, // [nt, m] row-major
+        const int m, const int n, const int nt) {
+    __shared__ float sh[4096];
+    __shared__ float lut[256];
+
+    const int tid  = threadIdx.x;
+    if (tid < 256) {
+        lut[tid] = paw_e5m2_to_f32((uint8_t) tid);
+    }
+    __syncthreads();
+
+    const int row  = blockIdx.x*8 + (tid >> 5);
+    const int t    = blockIdx.z;
+    const int lane = tid & 31;
+
+    if (row >= m) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    for (int i = tid; i < n; i += 256) {
+        sh[i] = su[i] * x[(int64_t) t*n + i];
+    }
+    __syncthreads();
+    paw_fwht_block(sh, n, tid, 256);
+    const float sc = __fsqrt_rn((float) n);
+    for (int i = tid; i < n; i += 256) {
+        sh[i] = __fdiv_rn(sh[i], sc);
+    }
+    __syncthreads();
+
+    const uint8_t * W = bank + (int64_t) row*n;
+    const float4 * u4 = (const float4 *) sh;
+
+    float acc = 0.0f;
+    if (n % 4 == 0) {
+        const uint32_t * W4 = (const uint32_t *) W;
+        const int n4 = n/4;
+        for (int i = lane; i < n4; i += 32) {
+            const uint32_t w = W4[i];
+            const uint8_t * wb = (const uint8_t *) &w;
+            const float4 uu = u4[i];
+            acc += lut[wb[0]]*uu.x + lut[wb[1]]*uu.y + lut[wb[2]]*uu.z + lut[wb[3]]*uu.w;
+        }
+    } else {
+        for (int i = lane; i < n; i += 32) {
+            acc += lut[W[i]]*sh[i];
+        }
     }
     acc = warp_reduce_sum<32>(acc);
     if (lane == 0) {
@@ -2347,36 +4236,44 @@ static __global__ void paw_rt_out_kernel(
         float       * GGML_CUDA_RESTRICT dst,
         const float * GGML_CUDA_RESTRICT gate,
         const float * GGML_CUDA_RESTRICT acc,
-        const int m) {
+        const int m,
+        const int blk) {
+    // blk == m reproduces the pre-blocking kernel exactly (one iteration).
+    // blockIdx.y selects the output chunk so chunks run on separate SMs
+    // instead of serializing inside one block (per-chunk math is unchanged).
     __shared__ float sh[8192];
 
     const int t   = blockIdx.x;
+    const int off = blockIdx.y * blk;
     const int tid = threadIdx.x;
 
     ggml_cuda_pdl_sync();
-    for (int i = tid; i < m; i += WG) {
-        __pipeline_memcpy_async(&sh[i], &scr_v[(int64_t) t*m + i], sizeof(float));
-    }
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
-    __syncthreads();
-    if (WG == m/16 && paw_fwht_v2_ok(m)) {
-        paw_fwht_block_v2(sh, m, tid, WG);
-    } else {
-        paw_fwht_block(sh, m, tid, WG);
-    }
-    const float sc     = __fsqrt_rn((float) m);
+    const float sc     = __fsqrt_rn((float) blk);
     const float inv_sc = __frcp_rn(sc);
-    for (int i = tid; i < m; i += WG) {
-        const int64_t oi = (int64_t) t*m + i;
-        const float y = sh[i] * inv_sc * sv[i];
-        if constexpr (EPILOGUE) {
-            const float sigmoid = 1.0f / (1.0f + expf(-gate[t]));
-            const float gated = __fmul_rn(y, sigmoid);
-            dst[oi] = __fadd_rn(acc[oi], gated);
-        } else {
-            dst[oi] = y;
+    {
+        for (int i = tid; i < blk; i += WG) {
+            __pipeline_memcpy_async(&sh[i], &scr_v[(int64_t) t*m + off + i], sizeof(float));
         }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        if (WG == blk/16 && paw_fwht_v2_ok(blk)) {
+            paw_fwht_block_v2(sh, blk, tid, WG);
+        } else {
+            paw_fwht_block(sh, blk, tid, WG);
+        }
+        for (int i = tid; i < blk; i += WG) {
+            const int64_t oi = (int64_t) t*m + off + i;
+            const float y = sh[i] * inv_sc * sv[off + i];
+            if constexpr (EPILOGUE) {
+                const float sigmoid = 1.0f / (1.0f + expf(-gate[t]));
+                const float gated = __fmul_rn(y, sigmoid);
+                dst[oi] = __fadd_rn(acc[oi], gated);
+            } else {
+                dst[oi] = y;
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -2388,7 +4285,7 @@ static __global__ void paw_rt_out_epilogue_dot_kernel(
         const float * GGML_CUDA_RESTRICT gate_w,
         const float * GGML_CUDA_RESTRICT gate_x,
         const float * GGML_CUDA_RESTRICT acc,
-        const int m, const int gate_n) {
+        const int m, const int gate_n, const int blk) {
     __shared__ float sh[8192];
     const int t   = blockIdx.x;
     const int tid = threadIdx.x;
@@ -2406,23 +4303,27 @@ static __global__ void paw_rt_out_epilogue_dot_kernel(
         __syncthreads();
     }
     const float sigmoid = 1.0f / (1.0f + expf(-sh[0]));
+    __syncthreads();   // sh is about to be reused as the FWHT staging buffer
 
-    for (int i = tid; i < m; i += WG) {
-        __pipeline_memcpy_async(&sh[i], &scr_v[(int64_t) t*m + i], sizeof(float));
-    }
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
-    __syncthreads();
-    if (WG == m/16 && paw_fwht_v2_ok(m)) {
-        paw_fwht_block_v2(sh, m, tid, WG);
-    } else {
-        paw_fwht_block(sh, m, tid, WG);
-    }
-    const float inv_sc = __frcp_rn(__fsqrt_rn((float) m));
-    for (int i = tid; i < m; i += WG) {
-        const int64_t oi = (int64_t) t*m + i;
-        const float y = sh[i] * inv_sc * sv[i];
-        dst[oi] = __fadd_rn(acc[oi], __fmul_rn(y, sigmoid));
+    const float inv_sc = __frcp_rn(__fsqrt_rn((float) blk));
+    for (int off = 0; off < m; off += blk) {
+        for (int i = tid; i < blk; i += WG) {
+            __pipeline_memcpy_async(&sh[i], &scr_v[(int64_t) t*m + off + i], sizeof(float));
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        if (WG == blk/16 && paw_fwht_v2_ok(blk)) {
+            paw_fwht_block_v2(sh, blk, tid, WG);
+        } else {
+            paw_fwht_block(sh, blk, tid, WG);
+        }
+        for (int i = tid; i < blk; i += WG) {
+            const int64_t oi = (int64_t) t*m + off + i;
+            const float y = sh[i] * inv_sc * sv[off + i];
+            dst[oi] = __fadd_rn(acc[oi], __fmul_rn(y, sigmoid));
+        }
+        __syncthreads();
     }
 }
 
@@ -2453,17 +4354,43 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(ggml_is_contiguous(tlut));
     GGML_ASSERT(ggml_is_contiguous(x));
     GGML_ASSERT(ggml_is_contiguous(dst));
-    GGML_ASSERT(trellis->ne[0] == 64);   // K = 4 (the walk kernel hardcodes the rate)
+    // Trellis rate from the payload: words-per-tile = 16*K at V = 2.
+    // 64 -> K=4 (the shipped 35B NE spine), 32 -> K=2, 16 -> K=1.
+    const int rt_words = (int) trellis->ne[0];
+    const int rt_K     = rt_words / 16;   // == 4 only for the shipped payload
+    GGML_ASSERT(rt_words % 8 == 0 && rt_words >= 16 && rt_words <= 64);
 
     const int n  = (int) su->ne[0];
     const int m  = (int) sv->ne[0];
     const int nt = (int)(x->ne[1]*x->ne[2]*x->ne[3]);
-    GGML_ASSERT(n <= 4096);   // rt_u shared bound
-    GGML_ASSERT(m <= 8192);   // rt_out shared bound
+    // Rotation block size. 0 means one Hadamard over the whole dimension --
+    // the shipped power-of-two payloads. A blocked payload rotates within
+    // blk-wide groups, which is what lets non-power-of-two dense shapes
+    // (5120, 17408, ...) run at all: only one block is ever staged in shared.
+    const int rht_blk = dst->op_params[GGML_PAW_RHT_BLK_SLOT];
+    const int bn = rht_blk ? rht_blk : n;
+    const int bm = rht_blk ? rht_blk : m;
+    const bool blocked = (bn != n) || (bm != m);
+    // The bank decode, the fused cooperative kernel, the gemv variants and the
+    // qtip walk all bake in the K=4 stream layout. Only the generic walk below
+    // is rate-aware, so every other rate is routed through it.
+    const bool k4 = rt_words == 64;
+    GGML_ASSERT(bn <= 4096);          // rt_u shared bound, now per block
+    GGML_ASSERT(bm <= 8192);          // rt_out shared bound, now per block
+    GGML_ASSERT(n % bn == 0 && m % bm == 0);
 
-    ggml_cuda_pool_alloc<float> scr(ctx.pool(), (size_t) nt*n + (size_t) nt*m);
+    // The fused-int8 AR walk needs one byte/activation plus one float scale
+    // per 16 values.  Keep the workspace attached to this op so CUDA graph
+    // capture and concurrent contexts do not share mutable global storage.
+    const size_t i8_q_floats = ((size_t)n + sizeof(float) - 1)/sizeof(float);
+    const size_t i8_s_floats = (size_t)n/16;
+    ggml_cuda_pool_alloc<float> scr(ctx.pool(),
+        (size_t)nt*n + (size_t)nt*m + i8_q_floats + 2*i8_s_floats);
     float * scr_u = scr.get();
     float * scr_v = scr_u + (size_t) nt*n;
+    int8_t * q_u = (int8_t *)(scr_v + (size_t)nt*m);
+    float * q_s = (float *)(q_u + i8_q_floats*sizeof(float));
+    int * q_z = (int *)(q_s + i8_s_floats);
 
     cudaStream_t stream = ctx.stream();
 
@@ -2474,7 +4401,10 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     static const bool rt_fused = paw_env_int("GGML_PAW_RT_FUSED", 0) != 0;
     static const int  dense_min_tok = paw_env_int("GGML_PAW_DENSE_MIN_TOK", 4);
-    if (rt_fused && !paw_rt_bank_fp8_on() && !paw_rt_bank_idx_on() && nt < dense_min_tok && paw_bank_cache_on()) {
+    // above this many tokens, a per-pass fp16 bank + batched apply beats the
+    // generic per-token walk on non-K4 payloads
+    static const int  rt_blas_min_nt = paw_env_int("GGML_PAW_RT_BLAS_MIN_NT", 8);
+    if (k4 && !blocked && rt_fused && !paw_rt_bank_fp8_on() && !paw_rt_bank_idx_on() && nt < dense_min_tok && paw_bank_cache_on()) {
         // cooperative single-launch RT_MM (rt_u + bank GEMV + rt_out)
         const int id = ggml_cuda_get_device();
         const bool coop = ggml_cuda_info().devices[id].supports_cooperative_launch;
@@ -2499,6 +4429,21 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         }
     }
 
+    // K=4 fused walk, OFF by default -- and it must stay off.
+    //
+    // Measured +12.0% on PAW-35B (75.45 -> 84.54 tg64) and that number was an
+    // artifact of benchmarking without the model's own serving flags. PAW-35B
+    // ships every codec optimization opt-in and default-off (see
+    // PAW-weights/SERVING.md and artifacts/mach1_reverse/v14/serve_best.sh);
+    // with GGML_PAW_RT_BATCH and GGML_PAW_RT_BANK_IDX on, as they are meant to
+    // be, the decode-to-bank path this replaces is *faster*:
+    //
+    //   tuned config, AR, no drafter:   qtip=0  92.37   qtip=1  90.53
+    //   tuned config, dflash2 drafter:  qtip=0  84.81   qtip=1  84.80
+    //
+    // The staged WORDS=64 walk below is kept and still works, but it only ever
+    // runs at nt == 1, which the drafter bypasses, and it loses to a properly
+    // batched bank path. Turn it on only with a measurement to justify it.
     static const bool rt_walk_qtip = paw_env_int("GGML_PAW_RT_WALK_QTIP", 0) != 0;
     const bool bank_cache = paw_bank_cache_on();
 
@@ -2506,49 +4451,208 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // computes u internally. Valid when the gemv geometry matches the kernel's
     // assumptions (n >= 256, n % 2 == 0, m % 8 == 0).
     static const bool rt_gemvu = paw_env_int("GGML_PAW_RT_GEMVU", 0) != 0;
-    const bool gemvu = rt_gemvu && bank_cache && nt < dense_min_tok &&
+    const bool gemvu = k4 && !blocked && rt_gemvu && bank_cache && !paw_rt_bank_idx_on() &&
+                       nt < dense_min_tok &&
                        n >= 256 && n % 2 == 0 && m % 8 == 0;
 
-    if (!gemvu) {
+    static const bool uout_noop = paw_env_int("GGML_PAW_UOUT_NOOP", 0) != 0;
+    if (!gemvu && !uout_noop) {
     paw_timed(stream, std::string("rt_u") + shp, [&]() {
-    if (paw_fwht_v2_on() && paw_fwht_v2_ok(n)) {
+    if (!blocked && paw_fwht_v2_on() && paw_fwht_v2_ok(n)) {
         paw_fwht_for_wg(n/16, [&](auto WG) {
             constexpr int wg = decltype(WG)::value;
             paw_launch(paw_rt_u_kernel<wg>,
-                ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(wg, 1, 1), 0, stream),
-                (const float *) su->data, (const float *) x->data, scr_u, n);
+                ggml_cuda_kernel_launch_params(dim3(nt, n/bn, 1), dim3(wg, 1, 1), 0, stream),
+                (const float *) su->data, (const float *) x->data, scr_u, n, bn);
         });
-    } else if (paw_fwht_wg512()) {
+    } else if (!blocked && paw_fwht_wg512()) {
         paw_launch(paw_rt_u_kernel<512>,
-            ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), 0, stream),
-            (const float *) su->data, (const float *) x->data, scr_u, n);
+            ggml_cuda_kernel_launch_params(dim3(nt, n/bn, 1), dim3(512, 1, 1), 0, stream),
+            (const float *) su->data, (const float *) x->data, scr_u, n, bn);
     } else {
         paw_launch(paw_rt_u_kernel<256>,
-            ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), 0, stream),
-            (const float *) su->data, (const float *) x->data, scr_u, n);
+            ggml_cuda_kernel_launch_params(dim3(nt, n/bn, 1), dim3(256, 1, 1), 0, stream),
+            (const float *) su->data, (const float *) x->data, scr_u, n, bn);
     }
     });
     }
 
-    if (rt_walk_qtip && nt == 1) {
+    // the rate-templated walk is default-ON for non-K4 payloads: they have
+    // no cached-bank alternative at nt==1 (banking the whole dense FFN would
+    // not fit VRAM), and the generic walk is ~10x slower per call
+    static const bool rt_walk_qtip_dense = paw_env_int("GGML_PAW_RT_WALK_QTIP_DENSE", 1) != 0;
+    // Multi-token walk: the frag kernel's eight mma B-columns can carry eight
+    // tokens for ONE walk of the trellis. The walk is 81% of a decode token
+    // and is LSU-gather bound (ncu: l1tex 60.7%, dram 16.0%, tensor 9.1%), so
+    // dividing the gathers across nt tokens is the only lever that scales --
+    // the gather:weight ratio is fixed by the codec at 1:2 and cannot be cut
+    // in place. Restricted to the dense frag path: the rate kernel is
+    // documented [nt=1, m] and the k4 payloads have their own bank cache.
+    // GGML_PAW_WALK_MT_MAX=1 disables and restores the nt==1-only behaviour.
+    static const int  walk_mt_max  = paw_env_int("GGML_PAW_WALK_MT_MAX", 8);
+    static const bool walk_frag_g  = paw_env_int("GGML_PAW_WALK_FRAG", 1) != 0;
+    static const bool walk_noop_g  = paw_env_int("GGML_PAW_WALK_NOOP", 0) != 0;
+    static const bool walk_skip_g  = paw_env_int("GGML_PAW_WALK_SKIP_M_ON", 0) != 0;
+    const bool qtip_mt = !k4 && rt_walk_qtip_dense && walk_frag_g &&
+                         !walk_noop_g && !walk_skip_g &&
+                         nt > 1 && nt <= walk_mt_max;
+    const bool use_qtip = (nt == 1 && (k4 ? rt_walk_qtip : rt_walk_qtip_dense) &&
+                           !debug_diff_on()) ||
+                          (qtip_mt && !debug_diff_on());
+    // Decode-once (DOL) for non-K4 payloads -- the same deal the K=4 payloads
+    // already get from the bank cache. The frag walk is LSU-gather bound
+    // (ncu: l1tex 60.7%, dram 16.0%, tensor 9.1%) and is ~81% of a K=2
+    // decode token; in-place gather tuning is exhausted (16x codebook
+    // replication is gather-clean and did not move the time), so the
+    // remaining lever is to not decode the trellis per token at all: the
+    // first call for a matrix materializes a persistent fp16 (or e5m2) bank
+    // and every later call is a plain bandwidth-bound GEMV over it.
+    // GGML_PAW_DOL_K2=1 opt-in because the bank lives in VRAM next to the
+    // model (2 bytes/weight fp16, 1 byte/weight e5m2) and can OOM a small
+    // card -- the same trade the K4 bank cache makes.
+    // No blocked check: rht_blk only shapes the rt_u/rt_out rotations; the
+    // bank is the plain decoded [m, n] weight and the GEMV below is agnostic,
+    // exactly like the K4 bank branch and the dense-apply branch.
+    static const bool dol_on = paw_env_int("GGML_PAW_DOL_K2", 0) != 0;
+    // Bank budget: on small cards the model + full banks do not fit (3060:
+    // 7.27 GiB model + 5.62 GB fp8 banks > 11.9 GB). Bank whatever fits,
+    // walk the rest -- benefit per banked byte is uniform (walk time and
+    // bank bytes both scale with m*n), so greedy first-come banking is
+    // near-optimal. GGML_PAW_DOL_MAX_MB caps the total; 0 = unbounded.
+    static const int64_t dol_max_bytes =
+        (int64_t) paw_env_int("GGML_PAW_DOL_MAX_MB", 0) << 20;
+    // Per-matrix cap: bank small matrices first. The frag walk's cost per
+    // weight depends on m/16 block count (small m = few blocks per SM =
+    // latency-bound walk): on PAW-27B-v12d the small matrices walk at ~34
+    // ns/weight vs ~4 ns/weight for the big ones, so banking smalls buys
+    // ~8x more decode-time per bank byte than banking bigs (which are also
+    // the ones a plain bandwidth-bound GEMV helps least).
+    static const int64_t dol_max_bank_bytes =
+        (int64_t) paw_env_int("GGML_PAW_DOL_MAX_BANK_MB", 0) << 20;
+    const bool dol = !k4 && dol_on && !debug_diff_on() &&
+                     nt < rt_blas_min_nt && !walk_noop_g && !walk_skip_g;
+    bool dol_bank = false;
+    if (dol) {
+        const bool fp8b = !paw_rt_bank_idx_on() && paw_rt_bank_fp8_on();
+        const int64_t need = (int64_t) m*n*(fp8b ? 1 : 2);
+        std::lock_guard<std::mutex> lock(paw_rt_bank_mutex);
+        const bool cached =
+            paw_rt_banks.count(paw_bank_key{trellis->data, m, n}) != 0;
+        // reserve at decision time so a single token cannot overshoot the
+        // budget while its banks are still decoding; decode is single-threaded
+        // per graph compute, so the reservation cannot double-count.
+        dol_bank = cached ||
+            (dol_max_bytes == 0 || paw_dol_banked + need <= dol_max_bytes);
+        if (dol_bank && !cached && dol_max_bank_bytes != 0 &&
+            need > dol_max_bank_bytes) {
+            dol_bank = false;   // too big per-matrix: its walk is efficient
+        }
+        if (!cached && dol_bank) {
+            paw_dol_banked += need;
+            static const bool dol_trace = paw_env_int("GGML_PAW_DOL_TRACE", 0) != 0;
+            if (dol_trace) {
+                fprintf(stderr, "[dol-trace] reserve m=%d n=%d words=%d need=%.1fMB total=%.1fMB fp8=%d\n",
+                        m, n, rt_words, need/1048576.0, paw_dol_banked/1048576.0, (int) fp8b);
+            }
+        }
+    }
+    if (dol && dol_bank) {
+        const void * bank = paw_rt_bank_get(trellis->data, tlut->data, m, n, stream, rt_words);
+        const bool fp8 = !paw_rt_bank_idx_on() && paw_rt_bank_fp8_on();
+        paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
+        // GGML_PAW_DOL_APPLY_MMA=1: tensor-core apply over the fp16 bank
+        // (weight-stationary wmma, needs m tiled by 64). At batch 1 the
+        // scalar gemvs are issue-bound on the per-weight FMA chain, while
+        // the wmma apply is purely byte-bound -- 2 bytes/weight at DRAM
+        // speed beats 1 byte/weight at issue speed on the big shapes.
+        static const bool dol_apply_mma = paw_env_int("GGML_PAW_DOL_APPLY_MMA", 0) != 0;
+        if (dol_apply_mma && !fp8 && m % 64 == 0) {
+            paw_launch_rt_apply_mma(ctx, stream, (const half *) bank,
+                (const float *) scr_u, scr_v, m, n, nt);
+        } else
+        // the v3 gemvs stage u in __shared__ float[4096]: only legal for
+        // n <= 4096. This payload's dense shapes (5120/6144/17408) exceed
+        // that, so they take the plain one-row-per-warp gemv (no u staging,
+        // any n -- bandwidth-bound either way at these widths).
+        if (fp8) {
+            if (n <= 4096 && n % 4 == 0) {
+                paw_launch(paw_rt_bank_gemv_fp8_v3,
+                    ggml_cuda_kernel_launch_params(dim3((m + 15)/16, 1, nt), dim3(256, 1, 1), 0, stream),
+                    (const uint8_t *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            } else {
+                paw_launch(paw_rt_bank_gemv_fp8,
+                    ggml_cuda_kernel_launch_params(dim3((m + 7)/8, 1, nt), dim3(256, 1, 1), 0, stream),
+                    (const uint8_t *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            }
+        } else {
+            static const bool rt_gemv3 = paw_env_int("GGML_PAW_RT_GEMV3", 1) != 0;
+            if (rt_gemv3 && n <= 4096 && n % 2 == 0) {
+                paw_launch(paw_rt_bank_gemv_v3,
+                    ggml_cuda_kernel_launch_params(dim3((m + 15)/16, 1, nt), dim3(256, 1, 1), 0, stream),
+                    (const half *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            } else {
+                paw_launch(paw_rt_bank_gemv,
+                    ggml_cuda_kernel_launch_params(dim3((m + 7)/8, 1, nt), dim3(256, 1, 1), 0, stream),
+                    (const half *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            }
+        }
+        });
+        // numeric oracle: the first few nt==1 calls also compute the exact
+        // fp16-bank GEMV and the rate-walk reference, and report max abs
+        // deltas of the chosen path against both.
+        static const bool dol_debug = paw_env_int("GGML_PAW_DOL_DEBUG", 0) != 0;
+        if (dol_debug && nt == 1) {
+            static int dol_dbg_calls = 0;
+            if (dol_dbg_calls < 16) {
+                ++dol_dbg_calls;
+                ggml_cuda_pool_alloc<float> walk_v(ctx.pool(), (size_t) nt*m);
+                ggml_cuda_pool_alloc<float> fp16_v(ctx.pool(), (size_t) nt*m);
+                ggml_cuda_pool_alloc<half>  ref_bank(ctx.pool(), (size_t) m*n);
+                paw_rt_dense_decode_rate_launch((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, ref_bank.get(), m, n, rt_words, stream);
+                paw_launch(paw_rt_bank_gemv,
+                    ggml_cuda_kernel_launch_params(dim3((m + 7)/8, 1, nt), dim3(256, 1, 1), 0, stream),
+                    ref_bank.get(), (const float *) scr_u, fp16_v.get(), m, n, nt);
+                paw_rt_walk_qtip_rate_launch((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, walk_v.get(),
+                    m, n, rt_words, stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                std::vector<float> hv(nt*m), hf(nt*m), hw(nt*m);
+                CUDA_CHECK(cudaMemcpy(hv.data(), scr_v, nt*m*sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hf.data(), fp16_v.get(), nt*m*sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hw.data(), walk_v.get(), nt*m*sizeof(float), cudaMemcpyDeviceToHost));
+                double e16 = 0.0, e8 = 0.0;
+                for (size_t i = 0; i < hv.size(); ++i) {
+                    const double d16 = (double) hv[i] - (double) hf[i];
+                    const double d8  = (double) hv[i] - (double) hw[i];
+                    const double a16 = d16 < 0 ? -d16 : d16;
+                    const double a8  = d8  < 0 ? -d8  : d8;
+                    if (a16 > e16) e16 = a16;
+                    if (a8  > e8)  e8  = a8;
+                }
+                fprintf(stderr, "[dol-debug] m=%d n=%d words=%d fp8=%d"
+                        " |fp8bank-fp16bank|max=%.3e |fp16bank-walk|max=%.3e\n",
+                        m, n, rt_words, (int) fp8, e16, e8);
+            }
+        }
+    } else if (use_qtip) {
         static int debug_calls = 0;
         static const bool debug_diff = paw_env_int("GGML_PAW_RT_WALK_QTIP_DEBUG", 0) != 0;
         if (debug_diff && debug_calls < 6) {
             ggml_cuda_pool_alloc<float> ref_v_alloc(ctx.pool(), (size_t) m);
             float * ref_v = ref_v_alloc.get();
             if (n/16 <= 128) {
-                paw_launch(paw_rt_walk_kernel<128>,
+                paw_launch((paw_rt_walk_kernel<128, 64>),
                     ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(128, 1, 1), 0, stream),
                     (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n);
             } else {
-                paw_launch(paw_rt_walk_kernel<256>,
+                paw_launch((paw_rt_walk_kernel<256, 64>),
                     ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
                     (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n);
             }
-            paw_launch(paw_rt_walk_qtip_kernel,
-                ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(32, 1, 1), 0, stream),
-                (const uint16_t *) trellis->data, (const half *) tlut->data,
-                (const float *) scr_u, scr_v, m, n);
+            paw_rt_walk_qtip_rate_launch((const uint16_t *) trellis->data,
+                (const half *) tlut->data, (const float *) scr_u, scr_v,
+                m, n, rt_words, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::vector<float> hv(m), hr(m);
             CUDA_CHECK(cudaMemcpy(hv.data(), scr_v, m*sizeof(float), cudaMemcpyDeviceToHost));
@@ -2567,11 +4671,11 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         } else if (debug_diff) {
             // past the debug window: use the known-good reference path
             if (n/16 <= 128) {
-                paw_launch(paw_rt_walk_kernel<128>,
+                paw_launch((paw_rt_walk_kernel<128, 64>),
                     ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(128, 1, 1), 0, stream),
                     (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, scr_v, m, n);
             } else {
-                paw_launch(paw_rt_walk_kernel<256>,
+                paw_launch((paw_rt_walk_kernel<256, 64>),
                     ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(256, 1, 1), 0, stream),
                     (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, scr_v, m, n);
             }
@@ -2581,14 +4685,91 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         // paw_rt_walk_qtip_kernel's header comment. Falls through to the
         // rt_out call below (same as every other branch here) -- does NOT
         // return early.
-        paw_timed(stream, std::string("rt_walk_qtip") + shp, [&]() {
-        paw_launch(paw_rt_walk_qtip_kernel,
-            ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(32, 1, 1), 0, stream),
-            (const uint16_t *) trellis->data, (const half *) tlut->data,
-            (const float *) scr_u, scr_v, m, n);
+        static const bool walk_noop = paw_env_int("GGML_PAW_WALK_NOOP", 0) != 0;
+        // fragment-direct variant (default ON): each lane decodes exactly its
+        // own mma.sync fragment elements straight from the trellis -- no
+        // shared staging, no syncwarp in the loop; scr_v is accumulated with
+        // atomics so it must be zeroed first
+        static const bool walk_frag = paw_env_int("GGML_PAW_WALK_FRAG", 1) != 0;
+        static const bool frag_dbg_on = paw_env_int("GGML_PAW_WALK_FRAG_DEBUG", 0) != 0;
+        static int frag_dbg_calls = 0;
+        if (!walk_noop && walk_frag && frag_dbg_on &&
+            frag_dbg_calls < paw_env_int("GGML_PAW_WALK_FRAG_DEBUG_MAX", 4) &&
+            (rt_words == 16 || rt_words == 24 || rt_words == 32)) {
+            // correctness probe: frag variant vs the generic reference walk
+            ggml_cuda_pool_alloc<float> ref_v_alloc(ctx.pool(), (size_t) m);
+            float * ref_v = ref_v_alloc.get();
+            CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) m*sizeof(float), stream));
+            switch (rt_words) {
+                case 24: paw_rt_walk_qtip_frag_dispatch<24>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
+                case 32: paw_rt_walk_qtip_frag_dispatch<32>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
+                default: paw_rt_walk_qtip_frag_dispatch<16>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
+            }
+            #define PAW_FRAG_DBG(WG) \
+                switch (rt_words) { \
+                    case 16: paw_launch((paw_rt_walk_kernel<WG, 16>),\
+                        ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(WG, 1, 1), 0, stream),\
+                        (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n); break;\
+                    case 24: paw_launch((paw_rt_walk_kernel<WG, 24>),\
+                        ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(WG, 1, 1), 0, stream),\
+                        (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n); break;\
+                    case 32: paw_launch((paw_rt_walk_kernel<WG, 32>),\
+                        ggml_cuda_kernel_launch_params(dim3(m/16, 1, 1), dim3(WG, 1, 1), 0, stream),\
+                        (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, ref_v, m, n); break;\
+                    default: GGML_ABORT("frag-dbg: rate");\
+                }
+            if (n/16 <= 128) { PAW_FRAG_DBG(128) } else { PAW_FRAG_DBG(256) }
+            #undef PAW_FRAG_DBG
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<float> hv(m), hr(m);
+            CUDA_CHECK(cudaMemcpy(hv.data(), scr_v, m*sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hr.data(), ref_v, m*sizeof(float), cudaMemcpyDeviceToHost));
+            double md=0, sc=0; int maxi=-1;
+            for (int i = 0; i < m; ++i) { double d=fabs(hv[i]-hr[i]); if(d>md){md=d;maxi=i;} sc=fmax(sc,fabs(hr[i])); }
+            fprintf(stderr, "[frag-dbg] m=%d n=%d words=%d maxdiff=%g scale=%g rel=%.2e at %d | frag[0..2]=%g,%g,%g ref=%g,%g,%g\n",
+                m,n,rt_words,md,sc,md/(sc+1e-30),maxi,hv[0],hv[1],hv[2],hr[0],hr[1],hr[2]);
+            frag_dbg_calls++;
+            return;   // skip normal path this call; v already computed by frag
+        }
+        // timing-only attribution knob: skip walks whose m is in the list
+        // (wrong results; use with GGML_PAW_WALK_NOOP-style runs only)
+        static const bool walk_skip_on = paw_env_int("GGML_PAW_WALK_SKIP_M_ON", 0) != 0;
+        static const std::string walk_skip_csv = std::string(",") +
+            (getenv("GGML_PAW_WALK_SKIP_M") ? getenv("GGML_PAW_WALK_SKIP_M") : "") + ",";
+        const bool walk_skip = walk_skip_on &&
+            walk_skip_csv.find("," + std::to_string(m) + ",") != std::string::npos;
+        if (walk_skip_on) {
+            static std::string seen;
+            const std::string key = "," + std::to_string(m) + "x" + std::to_string(n) + "w" + std::to_string(rt_words);
+            if (seen.find(key) == std::string::npos) { seen += key; fprintf(stderr, "[walk-shape]%s\n", key.c_str()); }
+        }
+        if (!walk_noop && !walk_skip && walk_frag) {
+            CUDA_CHECK(cudaMemsetAsync(scr_v, 0, (size_t) nt*m*sizeof(float), stream));
+            switch (rt_words) {
+                case 16: paw_rt_walk_qtip_frag_dispatch<16>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
+                case 24: paw_rt_walk_qtip_frag_dispatch<24>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
+                case 32: paw_rt_walk_qtip_frag_dispatch<32>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
+                case 40: paw_rt_walk_qtip_frag_dispatch<40>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
+                case 56: paw_rt_walk_qtip_frag_dispatch<56>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
+                case 64: paw_rt_walk_qtip_frag_dispatch<64>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
+                default: GGML_ABORT("paw: unsupported trellis rate for frag walk");
+            }
+        } else if (!walk_noop && !walk_skip) paw_timed(stream, std::string("rt_walk_qtip") + shp, [&]() {
+        paw_rt_walk_qtip_rate_launch((const uint16_t *) trellis->data,
+            (const half *) tlut->data, (const float *) scr_u, scr_v,
+            m, n, rt_words, stream);
         });
         }
-    } else if (bank_cache) {
+    } else if (k4 && bank_cache) {
         // Marlin-style: the bank is decoded once and cached; the per-step
         // decode is skipped and both paths run a plain GEMM/GEMV over it.
         const void * bank = paw_rt_bank_get(trellis->data, tlut->data, m, n, stream);
@@ -2596,32 +4777,51 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         const bool fp8 = !idx && paw_rt_bank_fp8_on();
         const half * dense_bank = idx ? paw_rt_idx_fp16_bank(bank, m, n) : (const half *) bank;
         static const bool rt_tc4     = paw_env_int("GGML_PAW_RT_TC", 8) == 4;
-        static const bool rt_apply_mma = paw_env_int("GGML_PAW_RT_APPLY_MMA", 0) != 0;
-        if (idx && nt < dense_min_tok) {
+        static const bool rt_apply_mma = paw_env_int("GGML_PAW_RT_APPLY_MMA", 1) != 0;
+        if (gemvu) {
+            // fused rt_u + bank GEMV; the half-reading variant must not run
+            // against an fp8 cached bank, so pick the twin by bank format
+            paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
+            if (fp8) {
+                paw_launch(paw_rt_gemv_u_fp8_kernel,
+                    ggml_cuda_kernel_launch_params(dim3(m/8, 1, nt), dim3(256, 1, 1), 0, stream),
+                    (const uint8_t *) dense_bank, (const float *) su->data,
+                    (const float *) x->data, scr_v, m, n, nt);
+            } else {
+                paw_launch(paw_rt_gemv_u_kernel,
+                    ggml_cuda_kernel_launch_params(dim3(m/8, 1, nt), dim3(256, 1, 1), 0, stream),
+                    dense_bank, (const float *) su->data, (const float *) x->data, scr_v, m, n, nt);
+            }
+            });
+        } else if (idx && nt < dense_min_tok) {
             paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
             paw_launch(paw_rt_bank_gemv_idx80,
                 ggml_cuda_kernel_launch_params(dim3((m + 15)/16, 1, nt), dim3(512, 1, 1), 0, stream),
                 (const uint16_t *) bank, (const half *) tlut->data,
                 (const float *) scr_u, scr_v, m, n, nt);
             });
-        } else if (fp8) {
-            // fp8 bank: one gemv kernel serves both the decode and prefill
-            // paths (grid.z = nt). The fp16-only variants read the wrong
-            // element size, so bypass them wholesale.
+        } else if (fp8 && nt < dense_min_tok) {
+            // fp8 bank gemv: decode-side only. Large batches go through the
+            // dense-apply pipeline below, which re-decodes from trellis and
+            // never touches the stored bank, so the bank format is free to
+            // differ per batch size.
             paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
-            paw_launch(paw_rt_bank_gemv_fp8,
-                ggml_cuda_kernel_launch_params(dim3((m + 7)/8, 1, nt), dim3(256, 1, 1), 0, stream),
-                (const uint8_t *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            if (n % 4 == 0) {
+                paw_launch(paw_rt_bank_gemv_fp8_v3,
+                    ggml_cuda_kernel_launch_params(dim3((m + 15)/16, 1, nt), dim3(256, 1, 1), 0, stream),
+                    (const uint8_t *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            } else {
+                paw_launch(paw_rt_bank_gemv_fp8,
+                    ggml_cuda_kernel_launch_params(dim3((m + 7)/8, 1, nt), dim3(256, 1, 1), 0, stream),
+                    (const uint8_t *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            }
             });
         } else if (nt < dense_min_tok) {
             static const bool rt_gemv2 = paw_env_int("GGML_PAW_RT_GEMV2", 0) != 0;
-            static const bool rt_gemv3 = paw_env_int("GGML_PAW_RT_GEMV3", 0) != 0;
+            // float4+shared variant: measured ~3.5 t/s gen gain on RTX 3060
+            static const bool rt_gemv3 = paw_env_int("GGML_PAW_RT_GEMV3", 1) != 0;
             paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
-            if (gemvu) {
-                paw_launch(paw_rt_gemv_u_kernel,
-                    ggml_cuda_kernel_launch_params(dim3(m/8, 1, nt), dim3(256, 1, 1), 0, stream),
-                    dense_bank, (const float *) su->data, (const float *) x->data, scr_v, m, n, nt);
-            } else if (rt_gemv3 && n % 2 == 0) {
+            if (rt_gemv3 && n % 2 == 0) {
                 paw_launch(paw_rt_bank_gemv_v3,
                     ggml_cuda_kernel_launch_params(dim3((m + 15)/16, 1, nt), dim3(256, 1, 1), 0, stream),
                     dense_bank, (const float *) scr_u, scr_v, m, n, nt);
@@ -2636,28 +4836,105 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             }
             });
         } else {
+            // an fp8 cached bank cannot feed the fp16 GEMM: decode a fresh
+            // fp16 bank from trellis into scratch for this pass
+            ggml_cuda_pool_alloc<half> fp16_bank_alloc(ctx.pool());
+            const half * apply_bank = dense_bank;
+            if (fp8) {
+                apply_bank = fp16_bank_alloc.alloc((size_t) m*n);
+                paw_launch(paw_rt_dense_decode_kernel,
+                    ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, 1), dim3(256, 1, 1), 0, stream),
+                    (const uint16_t *) trellis->data, (const half *) tlut->data,
+                    (half *) apply_bank, m, n);
+            }
             paw_timed(stream, std::string("rt_apply") + shp, [&]() {
             if (rt_apply_mma) {
-                paw_launch(paw_rt_apply_kernel_mma,
-                    ggml_cuda_kernel_launch_params(
-                        dim3(m/16, 1, (nt + 15)/16), dim3(128, 1, 1), 0, stream),
-                    dense_bank, (const float *) scr_u, scr_v, m, n, nt);
+                paw_launch_rt_apply_mma(ctx, stream, apply_bank, (const float *) scr_u, scr_v, m, n, nt);
             } else if (rt_tc4) {
                 paw_launch(paw_rt_apply_kernel<4>,
                     ggml_cuda_kernel_launch_params(
                         dim3(m/16, 1, (nt + 3)/4), dim3(128, 1, 1), 0, stream),
-                    dense_bank, (const float *) scr_u, scr_v, m, n, nt);
+                    apply_bank, (const float *) scr_u, scr_v, m, n, nt);
             } else {
                 paw_launch(paw_rt_apply_kernel<8>,
                     ggml_cuda_kernel_launch_params(
                         dim3(m/16, 1, (nt + 7)/8), dim3(128, 1, 1), 0, stream),
-                    dense_bank, (const float *) scr_u, scr_v, m, n, nt);
+                    apply_bank, (const float *) scr_u, scr_v, m, n, nt);
             }
             });
         }
+    } else if (!k4 && nt >= rt_blas_min_nt) {
+        // dense payload prefill: materialize an fp16 bank ONCE per pass
+        // (rate-templated decode) and run the same batched apply the K4
+        // cached-bank branch uses. The generic walk this replaces re-decodes
+        // every weight per token -- measured 7.4 t/s prompt at nt~1000.
+        static const bool rt_apply_mma_d = paw_env_int("GGML_PAW_RT_APPLY_MMA", 1) != 0;
+        // split the matrix into two row halves and decode half 2 on the aux
+        // stream while half 1 applies on the main stream -- hides roughly
+        // half the decode traffic behind apply traffic. Same event pattern
+        // as the expert blas pipeline; capture-unsafe, so graphs-off only.
+        cudaStreamCaptureStatus dcst = cudaStreamCaptureStatusNone;
+        const bool dcap = cudaStreamIsCapturing(stream, &dcst) == cudaSuccess &&
+                          dcst == cudaStreamCaptureStatusActive;
+        // default OFF: the two-half overlap produces corrupted logits after a
+        // long prefill (generation degenerates to repeated '?'); bisected to
+        // this commit. Re-enable only after the race is found.
+        static const bool rt_ovl = paw_env_int("GGML_PAW_RT_DECODE_OVL", 0) != 0;
+        // voff applies only on the cublas path, which needs nt >= its own
+        // threshold; below that keep the serial single-bank flow
+        const bool ovl = rt_ovl && !dcap && m >= 2048 &&
+                         nt >= paw_env_int("GGML_PAW_RT_BLAS_MIN_TOK", 128);
+        ggml_cuda_pool_alloc<half> bank_alloc(ctx.pool());
+        half * apply_bank = bank_alloc.alloc((size_t) m*n);
+        auto apply_fn = [&](const half * bk, int rows, int voff) {
+            if (rt_apply_mma_d) {
+                paw_launch_rt_apply_mma(ctx, stream, bk,
+                    (const float *) scr_u, scr_v, rows, n, nt, voff);
+            } else {
+                paw_launch(paw_rt_apply_kernel<8>,
+                    ggml_cuda_kernel_launch_params(
+                        dim3(rows/16, 1, (nt + 7)/8), dim3(128, 1, 1), 0, stream),
+                    bk, (const float *) scr_u, scr_v, rows, n, nt);
+            }
+        };
+        if (!ovl) {
+            paw_rt_dense_decode_rate_launch((const uint16_t *) trellis->data,
+                (const half *) tlut->data, apply_bank, m, n, rt_words, stream);
+            paw_timed(stream, std::string("rt_apply_dense") + shp, [&]() {
+                apply_fn(apply_bank, m, 0);
+            });
+        } else {
+            const int m0 = m/2;   // multiples of 16 guaranteed (m >= 2048)
+            cudaEvent_t ev0, ev1;
+            CUDA_CHECK(cudaEventCreate(&ev0));
+            CUDA_CHECK(cudaEventCreate(&ev1));
+            cudaStream_t ds = paw_aux_stream();
+            paw_rt_dense_decode_rate_launch((const uint16_t *) trellis->data,
+                (const half *) tlut->data, apply_bank, m0, n, rt_words, stream);
+            CUDA_CHECK(cudaEventRecord(ev0, stream));
+            paw_rt_dense_decode_rate_launch((const uint16_t *) trellis->data,
+                (const half *) tlut->data, apply_bank + (size_t) m0*n,
+                m - m0, n, rt_words, ds);
+            CUDA_CHECK(cudaEventRecord(ev1, ds));
+            paw_timed(stream, std::string("rt_apply_dense") + shp, [&]() {
+                apply_fn(apply_bank, m0, 0);
+                CUDA_CHECK(cudaStreamWaitEvent(stream, ev1));
+                apply_fn(apply_bank + (size_t) m0*n, m - m0, m0);
+            });
+            CUDA_CHECK(cudaEventDestroy(ev0));
+            CUDA_CHECK(cudaEventDestroy(ev1));
+        }
     } else {
     ggml_cuda_pool_alloc<half> bank_alloc(ctx.pool());
-    if (nt >= dense_min_tok) {
+    // paw_rt_dense_decode_kernel bakes in the K=4 stream layout: 64 words per
+    // tile and the byte-aligned state window that only WORDS=64 gives. On a
+    // lower-rate payload (paw-dense runs K=1/1.5/2) it reads past the end of
+    // the trellis -- an illegal access on the first prefill, since nt >= 4
+    // there. Only the walk below is rate-aware, so every other rate takes it.
+    // TODO: templating the decode kernel on WORDS the way the walk is would
+    // restore the prefill fast path for dense payloads; it needs the generic
+    // bit-offset window extraction and a numeric check against the walk.
+    if (k4 && nt >= dense_min_tok) {
         half * bank = bank_alloc.alloc((size_t) m*n);
         paw_timed(stream, std::string("rt_dense_decode") + shp, [&]() {
         paw_launch(paw_rt_dense_decode_kernel,
@@ -2665,17 +4942,14 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (const uint16_t *) trellis->data, (const half *) tlut->data, bank, m, n);
         });
         static const bool rt_tc4     = paw_env_int("GGML_PAW_RT_TC", 8) == 4;
-        static const bool rt_apply_mma = paw_env_int("GGML_PAW_RT_APPLY_MMA", 0) != 0;
+        static const bool rt_apply_mma = paw_env_int("GGML_PAW_RT_APPLY_MMA", 1) != 0;
         paw_timed(stream, std::string("rt_apply") + shp, [&]() {
         if (rt_apply_mma) {
             // experimental tensor-core path -- see paw_rt_apply_kernel_mma
             // comment above. TC fixed at 16 (wmma's fp16 tile shape). m must
             // be a multiple of 16 (same assumption the scalar path already
             // makes via m/16 grid dims).
-            paw_launch(paw_rt_apply_kernel_mma,
-                ggml_cuda_kernel_launch_params(
-                    dim3(m/16, 1, (nt + 15)/16), dim3(128, 1, 1), 0, stream),
-                (const half *) bank, (const float *) scr_u, scr_v, m, n, nt);
+            paw_launch_rt_apply_mma(ctx, stream, (const half *) bank, (const float *) scr_u, scr_v, m, n, nt);
         } else if (rt_tc4) {
             paw_launch(paw_rt_apply_kernel<4>,
                 ggml_cuda_kernel_launch_params(
@@ -2697,63 +4971,84 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                     dim3(m/16, 1, (nt + 15)/16), dim3(128, 1, 1), 0, stream),
                 (const uint16_t *) trellis->data, (const half *) tlut->data,
                 scr_u, scr_v, m, n, nt);
-        } else if (n/16 <= 128) {
-            paw_launch(paw_rt_walk_kernel<128>,
-                ggml_cuda_kernel_launch_params(dim3(m/16, 1, nt), dim3(128, 1, 1), 0, stream),
-                (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, scr_v, m, n);
         } else {
-            paw_launch(paw_rt_walk_kernel<256>,
-                ggml_cuda_kernel_launch_params(dim3(m/16, 1, nt), dim3(256, 1, 1), 0, stream),
-                (const uint16_t *) trellis->data, (const half *) tlut->data, scr_u, scr_v, m, n);
+            const int wg = n/16 <= 128 ? 128 : 256;
+            auto go = [&](auto WGC, auto KC) {
+                paw_launch((paw_rt_walk_kernel<decltype(WGC)::value, decltype(KC)::value>),
+                    ggml_cuda_kernel_launch_params(dim3(m/16, 1, nt), dim3(wg, 1, 1), 0, stream),
+                    (const uint16_t *) trellis->data, (const half *) tlut->data,
+                    scr_u, scr_v, m, n);
+            };
+            #define PAW_WALK_DISPATCH(WGV)                                        \
+                switch (rt_words) {                                               \
+                    case 16: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 16>{}); break;        \
+                    case 24: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 24>{}); break;        \
+                    case 32: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 32>{}); break;        \
+                    case 40: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 40>{}); break;        \
+                    case 48: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 48>{}); break;        \
+                    case 56: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 56>{}); break;        \
+                    case 64: go(std::integral_constant<int, WGV>{},               \
+                                std::integral_constant<int, 64>{}); break;        \
+                    default: GGML_ABORT("paw: unsupported trellis rate, "          \
+                                        "%d words per tile", rt_words);           \
+                }
+            if (wg == 128) { PAW_WALK_DISPATCH(128) } else { PAW_WALK_DISPATCH(256) }
+            #undef PAW_WALK_DISPATCH
         }
         });
     }
     }
 
-    paw_timed(stream, std::string("rt_out") + shp, [&]() {
+    if (!uout_noop) paw_timed(stream, std::string("rt_out") + shp, [&]() {
     if (epilogue_dot) {
-        GGML_ASSERT(m == 2048 && paw_fwht_v2_on() && paw_fwht_v2_ok(m));
+        GGML_ASSERT(!blocked && m == 2048 && paw_fwht_v2_on() && paw_fwht_v2_ok(m));
         paw_launch((paw_rt_out_epilogue_dot_kernel<128>),
             ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(128, 1, 1), 0, stream),
             (const float *) sv->data, scr_v, (float *) dst->data,
             (const float *) gate->data, (const float *) gate_x->data,
-            (const float *) acc->data, m, (int) gate->ne[0]);
+            (const float *) acc->data, m, (int) gate->ne[0], bm);
     } else
-    if (paw_fwht_v2_on() && paw_fwht_v2_ok(m)) {
+    if (!blocked && paw_fwht_v2_on() && paw_fwht_v2_ok(m)) {
         paw_fwht_for_wg(m/16, [&](auto WG) {
             constexpr int wg = decltype(WG)::value;
             if (epilogue) {
                 paw_launch((paw_rt_out_kernel<wg, true>),
-                    ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(wg, 1, 1), 0, stream),
+                    ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(wg, 1, 1), 0, stream),
                     (const float *) sv->data, scr_v, (float *) dst->data,
-                    (const float *) gate->data, (const float *) acc->data, m);
+                    (const float *) gate->data, (const float *) acc->data, m, bm);
             } else {
                 paw_launch((paw_rt_out_kernel<wg, false>),
-                    ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(wg, 1, 1), 0, stream),
-                    (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m);
+                    ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(wg, 1, 1), 0, stream),
+                    (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m, bm);
             }
         });
-    } else if (paw_fwht_wg512()) {
+    } else if (!blocked && paw_fwht_wg512()) {
         if (epilogue) {
             paw_launch((paw_rt_out_kernel<512, true>),
-                ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), 0, stream),
+                ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(512, 1, 1), 0, stream),
                 (const float *) sv->data, scr_v, (float *) dst->data,
-                (const float *) gate->data, (const float *) acc->data, m);
+                (const float *) gate->data, (const float *) acc->data, m, bm);
         } else {
             paw_launch((paw_rt_out_kernel<512, false>),
-                ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), 0, stream),
-                (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m);
+                ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(512, 1, 1), 0, stream),
+                (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m, bm);
         }
     } else {
         if (epilogue) {
             paw_launch((paw_rt_out_kernel<256, true>),
-                ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), 0, stream),
+                ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(256, 1, 1), 0, stream),
                 (const float *) sv->data, scr_v, (float *) dst->data,
-                (const float *) gate->data, (const float *) acc->data, m);
+                (const float *) gate->data, (const float *) acc->data, m, bm);
         } else {
             paw_launch((paw_rt_out_kernel<256, false>),
-                ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), 0, stream),
-                (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m);
+                ggml_cuda_kernel_launch_params(dim3(nt, m/bm, 1), dim3(256, 1, 1), 0, stream),
+                (const float *) sv->data, scr_v, (float *) dst->data, nullptr, nullptr, m, bm);
         }
     }
     });
@@ -3058,6 +5353,10 @@ void ggml_cuda_op_paw_rt_mm_batch(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int n_matrices = dst->op_params[0];
     GGML_ASSERT(n_matrices >= 2 && n_matrices <= 4);
     GGML_ASSERT(dst->op == GGML_OP_PAW_RT_MM_BATCH);
+    // supports_op already refuses these, so reaching here means a caller built
+    // the op directly; fail loudly rather than rotate with the wrong basis.
+    GGML_ASSERT(dst->op_params[GGML_PAW_RHT_BLK_SLOT] == 0 &&
+                "paw: the batched RT path has no blocked-rotation kernel yet");
 
     // tlut is src[3K], x is src[3K+1]
     const ggml_tensor * tlut = dst->src[3*n_matrices];
@@ -3155,7 +5454,7 @@ void ggml_cuda_op_paw_rt_mm_batch(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     static const int  dense_min_tok = paw_env_int("GGML_PAW_DENSE_MIN_TOK", 4);
     static const bool rt_tc4        = paw_env_int("GGML_PAW_RT_TC", 8) == 4;
-    static const bool rt_apply_mma  = paw_env_int("GGML_PAW_RT_APPLY_MMA", 0) != 0;
+    static const bool rt_apply_mma  = paw_env_int("GGML_PAW_RT_APPLY_MMA", 1) != 0;
     const bool idx = paw_rt_bank_idx_on();
     const bool fp8 = !idx && paw_rt_bank_fp8_on();
     if (idx && nt < dense_min_tok) {
@@ -3185,10 +5484,7 @@ void ggml_cuda_op_paw_rt_mm_batch(ggml_backend_cuda_context & ctx, ggml_tensor *
             float * v_i       = scr_v + hdesc[i].v_off;
             paw_timed(stream, std::string("rt_apply") + shp, [&]() {
             if (rt_apply_mma) {
-                paw_launch(paw_rt_apply_kernel_mma,
-                    ggml_cuda_kernel_launch_params(
-                        dim3(mi/16, 1, (nt + 15)/16), dim3(128, 1, 1), 0, stream),
-                    hdesc[i].dense_bank, u_i, v_i, mi, ni, nt);
+                paw_launch_rt_apply_mma(ctx, stream, hdesc[i].dense_bank, u_i, v_i, mi, ni, nt);
             } else if (rt_tc4) {
                 paw_launch(paw_rt_apply_kernel<4>,
                     ggml_cuda_kernel_launch_params(
@@ -3659,6 +5955,51 @@ static __device__ __forceinline__ void paw_exp_walk_v2_steps(
 //             table and resolve levels from shared — bit-identical values.
 // --- grid compaction for exp_walk at nt==1, GGML_PAW_EXP_WALK_COMPACT=1 ---
 //
+// consolidated P4 tables in a single allocation so an L2 persisting window
+// can pin them: the fused kernel's gathers were going to DRAM whenever the
+// live attention/KV traffic evicted the tables between launches
+struct paw_l2_tables {
+    uint32_t * packed = nullptr;
+    float    * levels = nullptr;
+    void     * base   = nullptr;
+};
+static paw_l2_tables g_paw_l2tab;
+
+static const paw_l2_tables & paw_l2_tables_get(cudaStream_t stream,
+        const paw_p4_table & t) {
+    if (!g_paw_l2tab.base && t.packed) {
+        constexpr size_t packed_b = (size_t) 32768*4;
+        constexpr size_t levels_b = 16*4;
+        void * base = nullptr;
+        if (cudaMalloc(&base, packed_b + levels_b) == cudaSuccess) {
+            CUDA_CHECK(cudaMemcpyAsync(base, t.packed, packed_b,
+                cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync((char *) base + packed_b, t.levels,
+                levels_b, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            cudaStreamAttrValue attr = {};
+            attr.accessPolicyWindow.base_ptr = base;
+            attr.accessPolicyWindow.num_bytes = packed_b + levels_b;
+            attr.accessPolicyWindow.hitRatio = 1.0f;
+            attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+            attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+            cudaStreamSetAttribute(stream,
+                cudaStreamAttributeAccessPolicyWindow, &attr);
+            size_t carve = 0;
+            cudaDeviceGetLimit(&carve, cudaLimitPersistingL2CacheSize);
+            if (carve < packed_b + levels_b) {
+                cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                    packed_b + levels_b);
+            }
+            g_paw_l2tab.packed = (uint32_t *) base;
+            g_paw_l2tab.levels = (float *)((char *) base + packed_b);
+            g_paw_l2tab.base = base;
+        }
+    }
+    return g_paw_l2tab;
+}
+
+
 // The walk kernels below launch grid.z=n_groups (up to 256) but at nt==1
 // only n_used (~8) are ever active -- every other block reads scr_i[g]==0
 // and exits immediately. This writes the n_used active group ids directly
@@ -4017,7 +6358,7 @@ static __global__ void paw_exp_walk_v8_warp_kernel(
 // enters the chain). exp_group/exp_u/exp_out are untouched.
 
 template <bool V8, bool P4>
-static __global__ void paw_exp_dense_decode_kernel(
+static __global__ void __launch_bounds__(256, 8) paw_exp_dense_decode_kernel(
         const uint16_t * GGML_CUDA_RESTRICT kept,
         const uint16_t * GGML_CUDA_RESTRICT dem,     // placeholder (= kept) when absent
         const void     * GGML_CUDA_RESTRICT tlut,    // float (V2) or half (V8)
@@ -4025,7 +6366,9 @@ static __global__ void paw_exp_dense_decode_kernel(
         const float    * GGML_CUDA_RESTRICT p4lv,    // P4 only, nullptr otherwise
         const int32_t  * GGML_CUDA_RESTRICT scr_i,
         half           * GGML_CUDA_RESTRICT bank,    // [n_groups, m, n]
-        const int m, const int n, const int n_kept, const int n_groups) {
+        const int m, const int n, const int n_kept, const int n_groups,
+        const int g0,                                 // first group of this slab
+        const half    * GGML_CUDA_RESTRICT wgamma) { // V8 wave gamma or nullptr
     static_assert(V8 || !P4, "P4 is a V8-tlut repack");
     constexpr int WG = 256;
     __shared__ float lv[16];
@@ -4035,7 +6378,7 @@ static __global__ void paw_exp_dense_decode_kernel(
     (void) p4lv;
     (void) n_groups;
 
-    const int g   = blockIdx.z;
+    const int g   = g0 + (int) blockIdx.z;
     const int tid = threadIdx.x;
 
     ggml_cuda_pdl_sync();
@@ -4080,7 +6423,7 @@ static __global__ void paw_exp_dense_decode_kernel(
         tbase = ((int64_t) ei*ntiles + tile)*words;
     }
 
-    half * dst = bank + ((int64_t) g*m + tr*16 + rr)*n + tc*16;
+    half * dst = bank + ((int64_t)(g - g0)*m + tr*16 + rr)*n + tc*16;
     half tmp[16];
 
     if constexpr (V8) {
@@ -4142,7 +6485,423 @@ static __global__ void paw_exp_dense_decode_kernel(
             tmp[2*s + 1] = __float2half_rn(v1);
         }
     }
+    if (V8 && wgamma != nullptr) {
+        // fold the wave gamma into the weights so the apply runs as a plain
+        // GEMM; product terms match folding it into the activations up to a
+        // contractible fp16 rounding site
+        const int e_ori = scr_i[2*n_groups + g];
+        const int Mb      = m/16;
+        const int tiles_y = n/16;
+        const int wv = (tr + tc <= tiles_y - 1) ? Mb + tiles_y - 1 - (tr + tc)
+                                                : Mb + tiles_y - 2 - (tr + tc);
+        const float gv = __half2float(wgamma[(int64_t) e_ori*(Mb + tiles_y) + wv]);
+#pragma unroll
+        for (int c = 0; c < 16; ++c) {
+            tmp[c] = __float2half_rn(gv*__half2float(tmp[c]));
+        }
+    }
     paw_store_half16(dst, tmp);   // same bits, 2x16B instead of 16x2B
+}
+
+
+// warp-per-tile variant of paw_exp_dense_decode_kernel (V8 layout): the 16
+// rows of a tile all live in the same 24 stream words, so the warp stages
+// them in shared once instead of every lane re-reading them from global;
+// lanes 0..15 then decode one row each off shared. Removes the redundant
+// global traffic and the per-row serial load chain that starved the old
+// mapping (measured ~3.4 GB/s effective on RTX 3060).
+template <bool P4>
+static __global__ void paw_exp_dense_decode_kernel_v2(
+        const uint16_t * GGML_CUDA_RESTRICT kept,
+        const void     * GGML_CUDA_RESTRICT tlut,
+        const uint32_t * GGML_CUDA_RESTRICT p4,
+        const float    * GGML_CUDA_RESTRICT p4lv,
+        const int32_t  * GGML_CUDA_RESTRICT scr_i,
+        half           * GGML_CUDA_RESTRICT bank,
+        const int m, const int n, const int n_groups,
+        const int g0,
+        const half    * GGML_CUDA_RESTRICT wgamma) {
+    constexpr int WARPS = 8;
+    constexpr int WG    = 24;                    // words per tile
+    __shared__ float    lv[16];
+    __shared__ uint16_t wsh[WARPS][WG];
+
+    const int g    = g0 + (int) blockIdx.z;
+    const int tid  = threadIdx.x;
+    const int wid  = tid >> 5;
+    const int lane = tid & 31;
+
+    ggml_cuda_pdl_sync();
+    if (scr_i[g] == 0) {                         // block-uniform
+        return;
+    }
+    if constexpr (P4) {
+        if (tid < 16) {
+            lv[tid] = p4lv[tid];
+        }
+        __syncthreads();
+    }
+
+    const int tiles_y = n / 16;
+    const int ntiles  = (m / 16)*tiles_y;
+    const int tile    = blockIdx.x*WARPS + wid;
+    if (tile >= ntiles) {
+        return;
+    }
+
+    // stage this tile's stream words once per warp
+    if (lane < WG) {
+        wsh[wid][lane] = kept[((int64_t) g*ntiles + tile)*WG + lane];
+    }
+    __syncwarp();
+
+    half tmp16[16];
+
+    const int tr   = tile / tiles_y;
+    const int tc   = tile % tiles_y;
+    const int rr   = lane & 15;
+    half * dst = bank + ((int64_t)(g - g0)*m + tr*16 + rr)*n + tc*16;
+
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+        const int      i   = 2*rr + jj;
+        const int      bb  = 12*i;
+        const int      wi  = bb >> 4;
+        const int      o   = bb & 15;
+        const int      wn  = wi + 1 < WG ? wi + 1 : 0;
+        const uint32_t w2  = ((uint32_t) wsh[wid][wi] << 16) | (uint32_t) wsh[wid][wn];
+        const uint32_t reg = (w2 >> (16 - o)) & 0xFFFFu;
+        const uint32_t ph  = reg*(reg + 1u);
+        const uint32_t row = ph & 0x7FFFu;
+        if constexpr (P4) {
+            const uint32_t pk = p4[row];
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                float vv = lv[(pk >> (4*c)) & 0xFu];
+                if (c == 0 && (ph & 0x8000u)) {
+                    vv = -vv;
+                }
+                tmp16[jj*8 + c] = __float2half_rn(vv);
+            }
+        } else {
+            const half * tl = (const half *) tlut + 8*(int64_t) row;
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                float vv = __half2float(tl[c]);
+                if (c == 0 && (ph & 0x8000u)) {
+                    vv = -vv;
+                }
+                tmp16[jj*8 + c] = __float2half_rn(vv);
+            }
+        }
+    }
+    if (wgamma != nullptr) {
+        const int e_ori = scr_i[2*n_groups + g];
+        const int Mb    = m/16;
+        const int wv    = (tr + tc <= tiles_y - 1) ? Mb + tiles_y - 1 - (tr + tc)
+                                                   : Mb + tiles_y - 2 - (tr + tc);
+        const float gv = __half2float(wgamma[(int64_t) e_ori*(Mb + tiles_y) + wv]);
+#pragma unroll
+        for (int c = 0; c < 16; ++c) {
+            tmp16[c] = __float2half_rn(gv*__half2float(tmp16[c]));
+        }
+    }
+    paw_store_half16(dst, tmp16);
+}
+
+
+
+
+// decode one 16-row weight strip of one k-tile straight into shared memory
+template <bool P4>
+static __device__ __forceinline__ void paw_fused_decode_strip(
+        const uint16_t * GGML_CUDA_RESTRICT kept,
+        const void     * GGML_CUDA_RESTRICT tlut,
+        const uint32_t * GGML_CUDA_RESTRICT p4,
+        const float    * lv,
+        const half     * GGML_CUDA_RESTRICT gamma,
+        const int g, const int tr_r, const int tc,
+        const int tiles_y, const int ntiles, const int m, const int n,
+        const int n_groups, const int e_ori,
+        uint16_t * wsh, half (* wout)[16], const int lane) {
+    const int tile  = tr_r*tiles_y + tc;
+    const int tbase = ((int64_t) g*ntiles + tile)*24;
+    if (lane < 24) {
+        wsh[lane] = kept[tbase + lane];
+    }
+    __syncwarp();
+    const int rr  = lane & 15;
+    const int Mb  = m/16;
+    const int wv  = (tr_r + tc <= tiles_y - 1)
+                        ? Mb + tiles_y - 1 - (tr_r + tc)
+                        : Mb + tiles_y - 2 - (tr_r + tc);
+    const float gv =
+        __half2float(gamma[(int64_t) e_ori*(Mb + tiles_y) + wv]);
+    if (lane >= 16) {
+        return;
+    }
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+        const int      i   = 2*rr + jj;
+        const int      bb  = 12*i;
+        const int      wi  = bb >> 4;
+        const int      o   = bb & 15;
+        const int      wn  = wi + 1 < 24 ? wi + 1 : 0;
+        const uint32_t w2  = ((uint32_t) wsh[wi] << 16) | (uint32_t) wsh[wn];
+        const uint32_t reg = (w2 >> (16 - o)) & 0xFFFFu;
+        const uint32_t ph  = reg*(reg + 1u);
+        const uint32_t lrow = ph & 0x7FFFu;
+        if constexpr (P4) {
+            const uint32_t pk = p4[lrow];
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                float vv = lv[(pk >> (4*c)) & 0xFu];
+                if (c == 0 && (ph & 0x8000u)) {
+                    vv = -vv;
+                }
+                wout[rr][8*jj + c] =
+                    __float2half_rn(gv*__half2float(__float2half_rn(vv)));
+            }
+        } else {
+            const half * tl = (const half *) tlut + 8*(int64_t) lrow;
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                float vv = __half2float(tl[c]);
+                if (c == 0 && (ph & 0x8000u)) {
+                    vv = -vv;
+                }
+                wout[rr][8*jj + c] =
+                    __float2half_rn(gv*__half2float(__float2half_rn(vv)));
+            }
+        }
+    }
+}
+
+// Fully-fused expert apply: the WS apply skeleton, but the weight tiles are
+// decoded from the QTIP stream directly into shared memory right before the
+// wmma load -- no fp16 bank materialization at all. Kills the ~2 GB/pass
+// bank write+readback of the decode->GEMM pipeline and overlaps the LUT
+// gather latency with tensor-core work.
+template <bool P4, int BMT>
+static __global__ void __launch_bounds__(128, 4) paw_exp_apply_kernel_fused(
+        const uint16_t * GGML_CUDA_RESTRICT kept,
+        const half     * GGML_CUDA_RESTRICT bank,   // debug: pre-decoded weights
+        const void     * GGML_CUDA_RESTRICT tlut,
+        const uint32_t * GGML_CUDA_RESTRICT p4,
+        const float    * GGML_CUDA_RESTRICT p4lv,
+        const int32_t  * GGML_CUDA_RESTRICT scr_i,
+        const half     * GGML_CUDA_RESTRICT xg,      // [P, n] grouped fp16
+        float          * GGML_CUDA_RESTRICT scr_v,   // [P, m]
+        const half     * GGML_CUDA_RESTRICT gamma,   // V8 wave gamma
+        float          * GGML_CUDA_RESTRICT dbg,     // debug dump or nullptr
+        const int m, const int n, const int n_groups) {
+    using namespace nvcuda;
+
+    constexpr int n_warps  = 4;
+    constexpr int bk       = 16;                  // == the wmma K tile
+    constexpr int bn       = 64;                  // token chunk, whole block
+    constexpr int n_tt     = bn / 16;             // token subtiles per chunk
+
+    const int g    = blockIdx.y;
+    const int row0 = blockIdx.x*(n_warps*16);
+    const int tid  = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane    = tid & 31;
+    const int tiles_y = n/16;
+    const int ntiles  = (m/16)*tiles_y;
+
+    __shared__ half     Xsh[bn][bk];              // staged activation tile
+    // double-buffered per-warp weight strips: tile k+1 decodes while tile k
+    // is still being multiplied, hiding LUT gather latency behind tensor math
+    __shared__ half     Wsh[2][n_warps][16][bk];
+    __shared__ float    out_sh[n_warps][16*16];
+    __shared__ int      pidx_sh[bn];
+    __shared__ uint16_t wsh[n_warps][24];
+    __shared__ float    lv[16];                   // staged P4 levels
+
+    ggml_cuda_pdl_sync();
+    const int cnt = scr_i[g];
+    if (cnt == 0) {
+        return;
+    }
+    const int off   = scr_i[n_groups + g];
+    const int e_ori = scr_i[2*n_groups + g];
+    if constexpr (P4) {
+        if (tid < 16) {
+            lv[tid] = p4lv[tid];
+        }
+        __syncthreads();
+    }
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[n_tt];
+
+    for (int q0 = 0; q0 < cnt; q0 += bn) {
+#pragma unroll
+        for (int t = 0; t < n_tt; ++t) {
+            wmma::fill_fragment(acc[t], 0.0f);
+        }
+        for (int i = tid; i < bn; i += 128) {
+            pidx_sh[i] = scr_i[4*n_groups + off + min(q0 + i, cnt - 1)];
+        }
+        __syncthreads();
+
+        // prologue: decode strip k=0 into buffer 0 before the loop
+        int cur = 0;
+        paw_fused_decode_strip<P4>(kept, tlut, p4, lv, gamma,
+            g, row0/16 + warp_id, 0, tiles_y, ntiles, m, n, n_groups, e_ori,
+            wsh[warp_id], Wsh[0][warp_id], lane);
+
+        for (int k0 = 0; k0 < n; k0 += bk, cur ^= 1) {
+            // kick off the next strip into the other buffer; its LUT
+            // gathers then overlap with this tile's mma chain
+            if (k0 + bk < n) {
+                paw_fused_decode_strip<P4>(kept, tlut, p4, lv, gamma,
+                    g, row0/16 + warp_id, (k0 + bk)/16, tiles_y, ntiles, m, n,
+                    n_groups, e_ori, wsh[warp_id], Wsh[cur ^ 1][warp_id], lane);
+            }
+
+            __syncwarp();
+            wmma::load_matrix_sync(a_frag, &Wsh[cur][warp_id][0][0], bk);
+
+            if (dbg && g == 0 && blockIdx.x == 0 && q0 == 0 && k0 == 0) {
+                for (int idx = lane; idx < 16*bk; idx += 32) {
+                    const int rrr = idx / bk;
+                    const int kkk = idx % bk;
+                    dbg[(warp_id*16 + rrr)*bk + kkk] =
+                        __half2float(Wsh[cur][warp_id][rrr][kkk]);
+                }
+                __syncwarp();
+            }
+
+            // vectorized activation staging: 16B per lane, tail rows clamp
+            // onto the last valid pair (store guards discard those slots)
+            {
+                const int last = off + cnt - 1;
+                uint4 * xd = (uint4 *) &Xsh[0][0];
+                for (int idx = tid; idx < bn*(bk/8); idx += 128) {
+                    const int tt = idx / (bk/8);
+                    const int vq = off + q0 + tt;
+                    const uint4 * xs = (const uint4 *)
+                        (xg + (int64_t) min(vq, last)*n + k0);
+                    xd[idx] = xs[idx % (bk/8)];
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int t = 0; t < n_tt; ++t) {
+                wmma::load_matrix_sync(b_frag, &Xsh[t*16][0], bk);
+                wmma::mma_sync(acc[t], a_frag, b_frag, acc[t]);
+            }
+        }
+
+        // store this warp's strip for every token subtile
+#pragma unroll
+        for (int t = 0; t < n_tt; ++t) {
+            wmma::store_matrix_sync(&out_sh[warp_id][0], acc[t], 16,
+                                    wmma::mem_row_major);
+            __syncwarp();
+            for (int idx = lane; idx < 16*16; idx += 32) {
+                const int row = idx / 16;
+                const int tt  = idx % 16;
+                if (q0 + t*16 + tt < cnt) {
+                    scr_v[(int64_t) pidx_sh[t*16 + tt]*m + row0 + warp_id*16 + row] =
+                        out_sh[warp_id][idx];
+                }
+            }
+            __syncwarp();
+        }
+        // block-wide barrier before the next chunk refills pidx_sh: the
+        // store loop above reads it under a mere per-warp sync
+        __syncthreads();
+    }
+}
+
+// ---- decode-kernel microbench (dev harness, not used by inference) -------
+// Launches the v1 and v2 dense-decode kernels on synthetic data at real
+// shapes, checks bit-exact agreement of the banks, and prints timings.
+
+
+extern "C" void paw_decode_bench(int m, int n, int n_groups, int iters) {
+    const size_t words = (size_t) n_groups*(m/16)*(n/16)*24;
+    const size_t tlut_n = 32768*8;
+    uint16_t * kept;  CUDA_CHECK(cudaMalloc(&kept,  words*2));
+    half     * tlut;  CUDA_CHECK(cudaMalloc(&tlut,  tlut_n*2));
+    uint32_t * p4t;   CUDA_CHECK(cudaMalloc(&p4t,   32768*4));
+    float    * p4l;   CUDA_CHECK(cudaMalloc(&p4l,   16*4));
+    int32_t  * scr;   CUDA_CHECK(cudaMalloc(&scr,   (size_t) 3*n_groups*4));
+    half     * b1;    CUDA_CHECK(cudaMalloc(&b1,   (size_t) n_groups*m*n*2));
+    half     * b2;    CUDA_CHECK(cudaMalloc(&b2,   (size_t) n_groups*m*n*2));
+    half     * gam;   CUDA_CHECK(cudaMalloc(&gam,   (size_t) 256*(m/16 + n/16)*2));
+
+    // deterministic pseudo-random fill
+    std::vector<uint16_t> hk(words);
+    unsigned rng = 12345;
+    for (auto & w : hk) { rng = rng*1103515245u + 12345u; w = (uint16_t)(rng >> 9); }
+    CUDA_CHECK(cudaMemcpy(kept, hk.data(), words*2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(tlut, 0, tlut_n*2));
+    CUDA_CHECK(cudaMemset(p4t, 0, 32768*4));
+    std::vector<float> hl(16, 0.5f);
+    CUDA_CHECK(cudaMemcpy(p4l, hl.data(), 64, cudaMemcpyHostToDevice));
+    std::vector<int32_t> hs(3*(size_t) n_groups, 8);   // all groups active
+    CUDA_CHECK(cudaMemcpy(scr, hs.data(), hs.size()*4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(gam, 0, (size_t) 256*(m/16 + n/16)*2));
+
+    cudaStream_t st; CUDA_CHECK(cudaStreamCreate(&st));
+    cudaEvent_t e0, e1; CUDA_CHECK(cudaEventCreate(&e0)); CUDA_CHECK(cudaEventCreate(&e1));
+    half * gnullptr_h = nullptr;
+
+    auto launch_v1 = [&](half * bank) {
+        if (m % 16 == 0 && n % 16 == 0) {
+            paw_launch(paw_exp_dense_decode_kernel<true, true>,
+                ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, n_groups), dim3(256,1,1), 0, st),
+                kept, kept, (const void *) tlut, p4t,
+                p4l, scr, bank, m, n, n_groups, n_groups, 0,
+                (const half *) gam);
+        }
+    };
+    auto launch_v2 = [&](half * bank) {
+        paw_launch(paw_exp_dense_decode_kernel_v2<true>,
+            ggml_cuda_kernel_launch_params(dim3(((m/16)*(n/16) + 7)/8, 1, n_groups), dim3(256,1,1), 0, st),
+            kept, (const void *) tlut, p4t,
+            p4l, scr, bank, m, n, n_groups, 0,
+            (const half *) gam);
+    };
+
+    // correctness: one pass each, compare banks
+    CUDA_CHECK(cudaMemset(b1, 0xaa, (size_t) n_groups*m*n*2));
+    CUDA_CHECK(cudaMemset(b2, 0xbb, (size_t) n_groups*m*n*2));
+    launch_v1(b1); launch_v2(b2);
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    std::vector<half> h1((size_t) n_groups*m*n), h2((size_t) n_groups*m*n);
+    CUDA_CHECK(cudaMemcpy(h1.data(), b1, h1.size()*2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h2.data(), b2, h2.size()*2, cudaMemcpyDeviceToHost));
+    size_t diff = 0;
+    for (size_t i = 0; i < h1.size(); ++i) {
+        if (((uint16_t*)h1.data())[i] != ((uint16_t*)h2.data())[i]) ++diff;
+    }
+
+    // timing
+    float ms1 = -1.f, ms2 = -1.f;
+    CUDA_CHECK(cudaEventRecord(e0, st));
+    for (int i = 0; i < iters; ++i) { launch_v1(b1); }
+    CUDA_CHECK(cudaEventRecord(e1, st));
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    CUDA_CHECK(cudaEventElapsedTime(&ms1, e0, e1));
+    CUDA_CHECK(cudaEventRecord(e0, st));
+    for (int i = 0; i < iters; ++i) { launch_v2(b2); }
+    CUDA_CHECK(cudaEventRecord(e1, st));
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    CUDA_CHECK(cudaEventElapsedTime(&ms2, e0, e1));
+    (void) gnullptr_h;
+    printf("decode-bench m=%d n=%d groups=%d | v1 %.3f ms | v2 %.3f ms | speedup %.2fx | bitdiff %zu / %zu\n",
+           m, n, n_groups, ms1/iters, ms2/iters, ms1/ms2, diff, h1.size());
+    fflush(stdout);
+
+    cudaStreamDestroy(st);
+    cudaFree(kept); cudaFree(tlut); cudaFree(p4t); cudaFree(p4l);
+    cudaFree(scr); cudaFree(b1); cudaFree(b2); cudaFree(gam);
 }
 
 // grid (m/16, n_groups): each block owns 16 output rows of one group's bank
@@ -4268,6 +7027,442 @@ static __global__ void paw_exp_apply_kernel(
         }
         if (q0 + PC < cnt) __syncthreads();   // red is reused by the next chunk -- skip on last iter, nothing left to protect
     }
+}
+
+
+
+// Groups the routed-pair activation slab by expert: xg[(off_g + j)*n + k] =
+// x[plist[off_g + j]*n + k]. Turns the apply kernels' random-row gathers
+// into sequential reads; costs one extra pass over P*n floats.
+static __global__ void paw_exp_permute_x_kernel(
+        const int32_t * GGML_CUDA_RESTRICT scr_i,
+        const float   * GGML_CUDA_RESTRICT x,
+        half          * GGML_CUDA_RESTRICT xg,
+        const int n, const int n_groups) {
+    const int g  = blockIdx.y;
+    const int kg = blockIdx.x*blockDim.x + threadIdx.x;
+    if (kg >= n) {
+        return;
+    }
+    const int cnt = scr_i[g];
+    const int off = scr_i[n_groups + g];
+    const int32_t * plist = scr_i + 4*n_groups;
+    // halves on purpose: the ws apply staged these exact conversions anyway,
+    // and the slab must fit next to the weights on small cards
+    for (int j = 0; j < cnt; ++j) {
+        xg[(int64_t)(off + j)*n + kg] = __float2half(x[(int64_t) plist[off + j]*n + kg]);
+    }
+}
+
+
+// In-place wave-gamma scale of a decoded group bank: W'[r,k] = W[r,k] * g,
+// with the closed-form diagonal wave index of the fused walk. Folding the
+// gamma into the weights (instead of the activations) lets the apply run
+// as a plain GEMM; the product terms are unchanged up to one fp16 rounding
+// site, the same contractible class the dense paths already accept.
+static __global__ void paw_exp_scale_bank_gamma_kernel(
+        half          * GGML_CUDA_RESTRICT bank,
+        const int32_t * GGML_CUDA_RESTRICT scr_i,
+        const half    * GGML_CUDA_RESTRICT gamma,
+        const int m, const int n, const int n_groups) {
+    const int g = blockIdx.y;
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= m*n) {
+        return;
+    }
+    const int tr_r = (i / n) >> 4;
+    const int kt   = (i % n) >> 4;
+    const int e_ori = scr_i[2*n_groups + g];
+    const int Mb      = m/16;
+    const int tiles_y = n/16;
+    const int wv = (tr_r + kt <= tiles_y - 1) ? Mb + tiles_y - 1 - (tr_r + kt)
+                                              : Mb + tiles_y - 2 - (tr_r + kt);
+    const size_t o = (size_t) g*m*n + i;
+    bank[o] = __float2half(__half2float(bank[o]) *
+                           __half2float(gamma[(int64_t) e_ori*(Mb + tiles_y) + wv]));
+}
+
+// inverse of the grouped slab: scr_v[pidx] = yg[off + j]
+static __global__ void paw_exp_unpermute_y_kernel(
+        const int32_t * GGML_CUDA_RESTRICT scr_i,
+        const half    * GGML_CUDA_RESTRICT yg,
+        float         * GGML_CUDA_RESTRICT scr_v,
+        const int m, const int n_groups) {
+    const int g   = blockIdx.y;
+    const int col = blockIdx.x*blockDim.x + threadIdx.x;
+    if (col >= m) {
+        return;
+    }
+    const int cnt = scr_i[g];
+    const int off = scr_i[n_groups + g];
+    const int32_t * plist = scr_i + 4*n_groups;
+    for (int j = 0; j < cnt; ++j) {
+        scr_v[(int64_t) plist[off + j]*m + col] =
+            __half2float(yg[(int64_t)(off + j)*m + col]);
+    }
+}
+
+// Weight-stationary tensor-core twin of paw_exp_apply_kernel for the dense
+// prefill path (V8 and legacy payloads). One persistent block per (group,
+// 64-row tile) sweeps that group's routed pairs in chunks of bn pairs; a
+// full-K accumulation finishes each chunk before the next starts, so a
+// group with cnt <= bn reads its bank strip exactly once instead of
+// ceil(cnt/PC) times. The V8 wave gamma is row-strip dependent, so instead
+// of folding it into the shared activation slab the B tile is rescaled per
+// A-tile into a small scratch buffer -- the association is contractible in
+// the same sense the fused walk documents. Requires m % 64 == 0.
+template <bool V8, int BMT, bool GX>
+static __global__ void paw_exp_apply_kernel_ws(
+        const half    * GGML_CUDA_RESTRICT bank,     // [n_groups, m, n]
+        const int32_t * GGML_CUDA_RESTRICT scr_i,
+        const float   * GGML_CUDA_RESTRICT scr_u,    // [P, n]
+        const half    * GGML_CUDA_RESTRICT xg,       // [P, n] grouped fp16 (GX)
+        float         * GGML_CUDA_RESTRICT scr_v,    // [P, m]
+        const half    * GGML_CUDA_RESTRICT gamma,    // V8 only, else nullptr
+        const int m, const int n, const int n_groups) {
+    using namespace nvcuda;
+
+    constexpr int n_warps = 4;
+    constexpr int bm_t    = BMT;                  // narrow tiles for small m
+    constexpr int tpb     = 2;                    // BN = 128 pairs per chunk
+    constexpr int bn      = n_warps * tpb * 16;
+    constexpr int bk      = 16;                   // == the wmma K tile
+
+    const int g    = blockIdx.y;
+    const int row0 = blockIdx.x * (bm_t * 16);
+    const int tid  = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane    = tid % 32;
+    const int tiles_y = n / 16;
+    const int Mb      = m / 16;
+
+    __shared__ half Xsh[n_warps][tpb][16][bk];    // raw gathered activations
+    __shared__ half Bsh[n_warps][16][bk];         // gamma-scaled B tile
+    __shared__ float out_sh[n_warps][16*16];
+    __shared__ int pidx_sh[bn];
+    __shared__ int scnt, soff, e_ori;
+
+    ggml_cuda_pdl_sync();
+    if (tid == 0) {
+        scnt   = scr_i[g];
+        soff   = scr_i[n_groups + g];
+        e_ori  = V8 ? scr_i[2*n_groups + g] : 0;
+    }
+    __syncthreads();
+    const int cnt = scnt;
+    if (cnt == 0) {                // block-uniform: whole block exits together
+        return;
+    }
+    const int off = soff;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[bm_t][tpb];
+
+    for (int q0 = 0; q0 < cnt; q0 += bn) {
+#pragma unroll
+        for (int r = 0; r < bm_t; ++r) {
+#pragma unroll
+            for (int t = 0; t < tpb; ++t) {
+                wmma::fill_fragment(acc[r][t], 0.0f);
+            }
+        }
+        for (int i = tid; i < bn; i += 128) {
+            // tail chunk: clamp (duplicate compute, write-guarded below)
+            pidx_sh[i] = scr_i[4*n_groups + off + min(q0 + i, cnt - 1)];
+        }
+        __syncthreads();
+
+        for (int k0 = 0; k0 < n; k0 += bk) {
+#pragma unroll
+            for (int t = 0; t < tpb; ++t) {
+                const int tt0 = (warp_id*tpb + t)*16;
+                for (int idx = lane; idx < 16*bk; idx += 32) {
+                    const int tt = idx / bk;
+                    const int kk = idx % bk;
+                    const int kg = k0 + kk;
+                    float v = 0.0f;
+                    if (kg < n && q0 + tt0 + tt < cnt) {
+                        // GX: activations arrive pre-grouped (and pre-cast),
+                        // rows are read sequentially instead of gathered
+                        const int64_t row = GX ? (int64_t)(off + q0 + tt0 + tt)
+                                               : (int64_t) pidx_sh[tt0 + tt];
+                        v = GX ? __half2float(xg[row*n + kg])
+                               : scr_u[(int64_t) pidx_sh[tt0 + tt]*n + kg];
+                    }
+                    Xsh[warp_id][t][tt][kk] = __float2half(v);
+                }
+            }
+            __syncwarp();
+#pragma unroll
+            for (int r = 0; r < bm_t; ++r) {
+                wmma::load_matrix_sync(a_frag,
+                    bank + ((int64_t) g*m + row0 + r*16)*n + k0, n);
+                float gv = 1.0f;
+                if (V8) {
+                    // closed-form wave index of the fused walk, per column
+                    // tile, for this block's r-th output strip
+                    const int tr_r = row0/16 + r;
+                    const int wv = (tr_r + k0/16 <= tiles_y - 1)
+                        ? Mb + tiles_y - 1 - (tr_r + k0/16)
+                        : Mb + tiles_y - 2 - (tr_r + k0/16);
+                    gv = __half2float(gamma[(int64_t) e_ori*(Mb + tiles_y) + wv]);
+                }
+#pragma unroll
+                for (int t = 0; t < tpb; ++t) {
+                    if (V8) {
+                        for (int idx = lane; idx < 16*bk; idx += 32) {
+                            const int tt = idx / bk;
+                            const int kk = idx % bk;
+                            Bsh[warp_id][tt][kk] = __float2half(
+                                gv*__half2float(Xsh[warp_id][t][tt][kk]));
+                        }
+                        __syncwarp();
+                        wmma::load_matrix_sync(b_frag, &Bsh[warp_id][0][0], bk);
+                    } else {
+                        wmma::load_matrix_sync(b_frag, &Xsh[warp_id][t][0][0], bk);
+                    }
+                    wmma::mma_sync(acc[r][t], a_frag, b_frag, acc[r][t]);
+                }
+            }
+            __syncwarp();
+        }
+
+#pragma unroll
+        for (int r = 0; r < bm_t; ++r) {
+#pragma unroll
+            for (int t = 0; t < tpb; ++t) {
+                wmma::store_matrix_sync(&out_sh[warp_id][0], acc[r][t], 16, wmma::mem_row_major);
+                __syncwarp();
+                const int tt0 = (warp_id*tpb + t)*16;
+                for (int idx = lane; idx < 16*16; idx += 32) {
+                    const int row = idx / 16;
+                    const int tt  = idx % 16;
+                    if (q0 + tt0 + tt < cnt) {
+                        scr_v[(int64_t) pidx_sh[tt0 + tt]*m + row0 + r*16 + row] =
+                            out_sh[warp_id][idx];
+                    }
+                }
+                __syncwarp();
+            }
+        }
+    }
+}
+
+extern "C" int paw_fused_bench(int m, int n, int n_groups, int P) {
+    const size_t words = (size_t) n_groups*(m/16)*(n/16)*24;
+    uint16_t * kept;  CUDA_CHECK(cudaMalloc(&kept, words*2));
+    half     * tlut;  CUDA_CHECK(cudaMalloc(&tlut, (size_t)32768*8*2));
+    uint32_t * p4t;   CUDA_CHECK(cudaMalloc(&p4t,  32768*4));
+    float    * p4l;   CUDA_CHECK(cudaMalloc(&p4l,  16*4));
+    int32_t  * scr;   CUDA_CHECK(cudaMalloc(&scr,  (size_t)(5*n_groups + P)*4));
+    half     * xg;    CUDA_CHECK(cudaMalloc(&xg,   (size_t) P*n*2));
+    float    * v;     CUDA_CHECK(cudaMalloc(&v,    (size_t) P*m*4));
+    half     * gam;   CUDA_CHECK(cudaMalloc(&gam,  (size_t) 256*(m/16 + n/16)*2));
+
+    std::vector<uint16_t> hk(words);
+    {
+        unsigned rng = 9973;
+        for (size_t i = 0; i < words; ++i) {
+            rng = rng*1103515245u + 12345u;
+            hk[i] = (uint16_t)((rng >> 8) | 1u);   // nonzero streams
+        }
+    }
+    CUDA_CHECK(cudaMemcpy(kept, hk.data(), words*2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(tlut, 0, (size_t)32768*16));
+    CUDA_CHECK(cudaMemset(p4t, 0, 32768*4));
+    std::vector<float> hl(16, 0.5f);
+    CUDA_CHECK(cudaMemcpy(p4l, hl.data(), 64, cudaMemcpyHostToDevice));
+    // group g active with cnt=8, offsets staggered
+    const int CNT = getenv("FUSED_CNT") ? atoi(getenv("FUSED_CNT")) : 8;
+    std::vector<int32_t> hs(5*(size_t)n_groups + (size_t)(CNT>0?0:P), 0);
+    // pair-list region sized by total routed pairs
+    hs.resize(5*(size_t)n_groups + (size_t) n_groups*CNT);
+    int32_t * pairs = hs.data() + 4*n_groups;
+    for (int g = 0; g < n_groups; ++g) {
+        hs[g] = CNT;
+        hs[n_groups + g] = CNT*g;            // off
+        hs[2*n_groups + g] = g % 256;        // e_ori
+        for (int q = 0; q < CNT; ++q) {
+            pairs[CNT*g + q] = (CNT*g + q) % P;         // pair list
+        }
+    }
+    CUDA_CHECK(cudaMemcpy(scr, hs.data(), hs.size()*4, cudaMemcpyHostToDevice));
+    {
+        std::vector<half> hx((size_t)P*n);
+        unsigned rng = 31;
+        for (size_t i = 0; i < hx.size(); ++i) {
+            rng = rng*1103515245u + 12345u;
+            hx[i] = __float2half(((int)(rng >> 16 & 0xFF) - 128) / 512.0f);
+        }
+        CUDA_CHECK(cudaMemcpy(xg, hx.data(), hx.size()*2, cudaMemcpyHostToDevice));
+    }
+    CUDA_CHECK(cudaMemset(v, 0, (size_t)P*m*4));
+    std::vector<half> hg((size_t)256*(m/16 + n/16), __float2half(1.0f));
+    CUDA_CHECK(cudaMemcpy(gam, hg.data(), hg.size()*2, cudaMemcpyHostToDevice));
+
+    float * dbgf; CUDA_CHECK(cudaMalloc(&dbgf, 64*16*4));
+    CUDA_CHECK(cudaMemset(dbgf, 0, 64*16*4));
+    cudaStream_t st; CUDA_CHECK(cudaStreamCreate(&st));
+    paw_launch(paw_exp_apply_kernel_fused<true, 4>,
+        ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128,1,1), 0, st),
+        kept, (const half *) nullptr, (const void *) tlut, (const uint32_t *) p4t,
+        (const float *) p4l, (const int32_t *) scr, xg, v, (const half *) gam,
+        (float *) nullptr, m, n, n_groups);
+    cudaError_t le = cudaGetLastError();
+
+    // structural twin: same loops, bank-fed weights
+    half * bank2; CUDA_CHECK(cudaMalloc(&bank2, (size_t) n_groups*m*n*2));
+    float * vf;   CUDA_CHECK(cudaMalloc(&vf, (size_t) P*m*4));
+    CUDA_CHECK(cudaMemset(vf, 0, (size_t) P*m*4));
+    {
+        std::vector<uint16_t> hkz(words, 0x1555u);
+        CUDA_CHECK(cudaMemcpy(kept, hkz.data(), words*2, cudaMemcpyHostToDevice));
+    }
+    paw_launch(paw_exp_dense_decode_kernel<true, true>,
+        ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, n_groups), dim3(256,1,1), 0, st),
+        kept, kept, (const void *) tlut, p4t, p4l,
+        (const int32_t *) scr, bank2, m, n, n_groups, n_groups, 0,
+        (const half *) gam);
+    {
+        std::vector<uint16_t> hkr(words);
+        unsigned rng = 9973;
+        for (size_t i = 0; i < words; ++i) {
+            rng = rng*1103515245u + 12345u;
+            hkr[i] = (uint16_t)((rng >> 8) | 1u);
+        }
+        CUDA_CHECK(cudaMemcpy(kept, hkr.data(), words*2, cudaMemcpyHostToDevice));
+    }
+    paw_launch(paw_exp_apply_kernel_fused<true, 4>,
+        ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128,1,1), 0, st),
+        kept, (const half *) bank2, (const void *) tlut, p4t, p4l,
+        (const int32_t *) scr, xg, vf, (const half *) gam,
+        dbgf, m, n, n_groups);
+
+    // reference: decode into a bank, then WS apply over it
+    half * bank; CUDA_CHECK(cudaMalloc(&bank, (size_t) n_groups*m*n*2));
+    float * vref; CUDA_CHECK(cudaMalloc(&vref, (size_t) P*m*4));
+    CUDA_CHECK(cudaMemset(vref, 0, (size_t) P*m*4));
+    paw_launch(paw_exp_dense_decode_kernel<true, true>,
+        ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, n_groups), dim3(256,1,1), 0, st),
+        kept, kept, (const void *) tlut, p4t, p4l,
+        (const int32_t *) scr, bank, m, n, n_groups, n_groups, 0,
+        (const half *) gam);
+    paw_launch(paw_exp_apply_kernel_ws<true, 4, true>,
+        ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128,1,1), 0, st),
+        (const half *) bank, (const int32_t *) scr, nullptr, xg, vref,
+        (const half *) gam, m, n, n_groups);
+
+    cudaError_t se = cudaStreamSynchronize(st);
+    printf("fused-bench m=%d n=%d groups=%d P=%d | launch=%s sync=%s\n",
+           m, n, n_groups, P, cudaGetErrorString(le), cudaGetErrorString(se));
+    std::vector<float> hv((size_t)P*m), hr((size_t)P*m), hf((size_t)P*m);
+    CUDA_CHECK(cudaMemcpy(hv.data(), v, hv.size()*4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hr.data(), vref, hr.size()*4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hf.data(), vf, hf.size()*4, cudaMemcpyDeviceToHost));
+    size_t fdiff = 0;
+    for (size_t i = 0; i < hf.size(); ++i) {
+        if (fabs((double)hf[i] - (double)hr[i]) > 0) ++fdiff;
+    }
+    printf("bankfed-fused diff %zu / %zu\n", fdiff, hf.size());
+    {
+        std::vector<float> hd(64*16);
+        CUDA_CHECK(cudaMemcpy(hd.data(), dbgf, hd.size()*4, cudaMemcpyDeviceToHost));
+        std::vector<half> hb((size_t) n_groups*m*n);
+        CUDA_CHECK(cudaMemcpy(hb.data(), bank2, hb.size()*2, cudaMemcpyDeviceToHost));
+        int shown = 0;
+        for (int w = 0; w < 4 && shown < 8; ++w) {
+            for (int e = 0; e < 4 && shown < 8; ++e) {
+                float got = hd[(w*16 + 0)*16 + e];      // row 0 of strip w, k=e
+                float want = __half2float(hb[((size_t)0*m + (0*16 + w*16))*n + e]);
+                if (fabs(got - want) > 1e-3) {
+                    printf("  dbg warp%d k%d: Wsh=%.4f bank=%.4f\n", w, e, got, want);
+                    ++shown;
+                }
+            }
+        }
+        if (!shown) printf("  dbg: all sampled W tiles match bank\n");
+    }
+
+    // ---- host ground truth over group 0's pairs only (fast enough) ----
+    {
+        std::vector<half> hb((size_t) n_groups*m*n);
+        CUDA_CHECK(cudaMemcpy(hb.data(), bank2, hb.size()*2, cudaMemcpyDeviceToHost));
+        std::vector<half> hx((size_t)P*n);
+        CUDA_CHECK(cudaMemcpy(hx.data(), xg, hx.size()*2, cudaMemcpyDeviceToHost));
+        std::vector<int32_t> hsc(5*(size_t)n_groups + (size_t)n_groups*CNT);
+        CUDA_CHECK(cudaMemcpy(hsc.data(), scr, hsc.size()*4, cudaMemcpyDeviceToHost));
+        double worst_f = 0, worst_r = 0;
+        long long bad_f = 0, bad_r = 0, bad_f_row[4] = {0,0,0,0};
+        const int GCHK = n_groups < 4 ? n_groups : 4;
+        for (int g = 0; g < GCHK; ++g) {
+            const int cg = hsc[g];
+            const int og = hsc[n_groups + g];
+            const int32_t * pp = hsc.data() + 4*n_groups + og;
+            for (int i = 0; i < cg; ++i) {
+                const int qp = pp[i];
+                for (int rr = 0; rr < 64; rr += 16) {   // strips via blocks; check first block rows 0..63
+                    for (int r16 = 0; r16 < 16; ++r16) {
+                        const int row = rr + r16;
+                        const half * wr = hb.data() + ((size_t) g*m + row)*n;
+                        const half * xr = hx.data() + (size_t) qp*n;
+                        double acc = 0;
+                        for (int k = 0; k < n; ++k) {
+                            acc += (double)__half2float(wr[k]) * (double)__half2float(xr[k]);
+                        }
+                        const size_t idx = (size_t) qp*m + row;
+                        double df = fabs(acc - (double)hf[idx]);
+                        double dr = fabs(acc - (double)hr[idx]);
+                        if (df > worst_f) worst_f = df;
+                        if (dr > worst_r) worst_r = dr;
+                        if (df > 0.05) { ++bad_f; ++bad_f_row[rr/16]; }
+                        if (dr > 0.05) ++bad_r;
+                    }
+                }
+            }
+        }
+        printf("host-truth: fused bad=%lld worst=%.4f | ref bad=%lld worst=%.4f\n",
+               bad_f, worst_f, bad_r, worst_r);
+        printf("  fused bad by strip: %lld %lld %lld %lld\n",
+               bad_f_row[0], bad_f_row[1], bad_f_row[2], bad_f_row[3]);
+    }
+    size_t diff = 0; double maxd = 0;
+    int shown = 0;
+    long long by_strip[8] = {0,0,0,0,0,0,0,0}, by_qmod[8] = {0,0,0,0,0,0,0,0};
+    for (size_t i = 0; i < hv.size(); ++i) {
+        double d = fabs((double)hv[i] - (double)hr[i]);
+        if (d > 0) ++diff;
+        if (d > maxd) maxd = d;
+        if (d > 0 && shown < 5 && hr[i] != 0.0f) {
+            size_t qq = i / m, rr = i % m;
+            printf("  mismatch q=%zu row=%zu fused=%.4f ref=%.4f\n",
+                   qq, rr, (double)hv[i], (double)hr[i]);
+            ++shown;
+        }
+        if (d > 0) {
+            by_strip[(i % m)/16 & 7]++;
+            by_qmod[(i / m) & 7]++;
+        }
+    }
+    printf("  by_strip:");
+    for (int k2 = 0; k2 < 8; ++k2) printf(" %lld", by_strip[k2]);
+    printf("\n  by_qmod: ");
+    for (int k2 = 0; k2 < 8; ++k2) printf(" %lld", by_qmod[k2]);
+    printf("\n");
+    printf("out diff %zu / %zu max=%.6f\n", diff, hv.size(), maxd);
+    {
+        long long by_strip[8] = {0}, by_qmod[8] = {0};
+        for (size_t i = 0; i < hv.size(); ++i) {
+            if (((uint32_t)0)) break;
+        }
+        (void)by_strip; (void)by_qmod;
+    }
+    fflush(stdout);
+    cudaFree(bank); cudaFree(vref);
+    cudaStreamDestroy(st);
+    cudaFree(kept); cudaFree(tlut); cudaFree(p4t); cudaFree(p4l);
+    cudaFree(scr); cudaFree(xg); cudaFree(v); cudaFree(gam);
+    return (int)(le != cudaSuccess || se != cudaSuccess);
 }
 
 // --- per-routing-slot expert bank cache (nt==1 only), GGML_PAW_EXP_CACHE=1 ---
@@ -4843,7 +8038,7 @@ void ggml_cuda_op_paw_exp_mm_batch2(ggml_backend_cuda_context & ctx, ggml_tensor
     GGML_ASSERT(n_groups <= 512);
     GGML_ASSERT(n_tok == 1);   // caller-scoped: decode-only
 
-    static const bool walk_compact = paw_env_int("GGML_PAW_EXP_WALK_COMPACT", 0) != 0;
+    static const bool walk_compact = paw_env_int("GGML_PAW_EXP_WALK_COMPACT", 1) != 0;
     ggml_cuda_pool_alloc<int32_t> scr_i_alloc(ctx.pool(), (size_t) 4*n_groups + P + (walk_compact ? n_used : 0));
     ggml_cuda_pool_alloc<float>   scr_f_alloc(ctx.pool(), 2*((size_t) P*n + (size_t) P*m));
     int32_t * scr_i  = scr_i_alloc.get();
@@ -5135,34 +8330,228 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     ggml_cuda_pool_alloc<half> bank_alloc(ctx.pool());
     if (P >= dense_min) {
         // dense prefill: decode active groups once, then apply
-        half * bank = bank_alloc.alloc((size_t) n_groups*m*n);
+        static const bool exp_ws  = paw_env_int("GGML_PAW_EXP_APPLY_WS", 1) != 0;
+        static const bool exp_gp  = paw_env_int("GGML_PAW_EXP_XGROUP", 1) != 0;
+        static const int exp_pc   = paw_env_int("GGML_PAW_EXP_PC", 8);
+        static const bool exp_blas = paw_env_int("GGML_PAW_EXP_BLAS", 1) != 0;
+        // slab width for the chunked blas pipeline; bounds staging VRAM
+        static const int exp_chunk = paw_env_int("GGML_PAW_EXP_BLAS_CHUNK_G", 16);
+        // pool is strict LIFO: bank must be allocated before xg so the
+        // destructor order (xg first, bank last) unwinds it correctly
+        // the blas branch pulls group counts to host (uncaptured stream);
+        // under graph capture fall back to the fully device-driven path
+        cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
+        const bool capturing = cudaStreamIsCapturing(stream, &cst) == cudaSuccess &&
+                               cst == cudaStreamCaptureStatusActive;
+        // single-token passes go through the fused WS kernel instead: no
+        // staging round-trip and no host sync (measured +3 t/s generation)
+        // below this, micro-batches skip the cuBLAS pipeline (host sync
+        // per pass dominates); measured neutral-to-better at 29k ctx
+        static const int exp_blas_min_nt = paw_env_int("GGML_PAW_EXP_BLAS_MIN_NT", 128);
+        // fully-fused trellis->wmma apply: no bank materialization, no host
+        // sync; supersedes the chunked cuBLAS pipeline where it applies
+        // correct and graph-safe, but on RTX 3060 the cuBLAS split still
+        // beats it at large nt (see paw_fused_bench); flip when the kernel
+        // closes the activation-restage gap
+        static const bool exp_fused = paw_env_int("GGML_PAW_EXP_FUSED", 0) != 0;
+        const bool use_fused = v8 && exp_fused && exp_ws && exp_gp &&
+                               m % 16 == 0 && n_tok >= exp_blas_min_nt;
+        const bool use_blas = v8 && exp_blas && exp_ws && exp_gp &&
+                              m % 16 == 0 && n_tok >= exp_blas_min_nt &&
+                              !use_fused && !capturing;
+        // overlap decode of slab i+1 with GEMMs of slab i on a second stream
+        // off by default: measured no gain (decode and GEMM contend for the same
+// bandwidth on this part); kept for parts where that does not hold
+        static const bool exp_ovl = paw_env_int("GGML_PAW_EXP_OVERLAP", 0) != 0;
+        const bool do_ovl = use_blas && exp_ovl && n_groups > exp_chunk;
+        const int n_slabs = use_blas ? (n_groups + exp_chunk - 1)/exp_chunk : 1;
+        const int bank_bufs = do_ovl ? 2 : 1;
+        const int bank_g = use_blas ? (exp_chunk < n_groups ? exp_chunk : n_groups)
+                                    : n_groups;
+        half * bank = use_fused ? nullptr
+                                : bank_alloc.alloc((size_t) bank_g*bank_bufs*m*n);
+        ggml_cuda_pool_alloc<half> xg_alloc(ctx.pool());
+        half * xg = nullptr;
+        if (v8 && exp_ws && exp_gp) {
+            xg = xg_alloc.alloc((size_t) P*n);
+            paw_timed(stream, std::string("exp_xgroup") + shp, [&]() {
+            paw_launch(paw_exp_permute_x_kernel,
+                ggml_cuda_kernel_launch_params(
+                    dim3((n + 255)/256, n_groups, 1), dim3(256, 1, 1), 0, stream),
+                (const int32_t *) scr_i, (const float *) scr_u, xg, n, n_groups);
+            });
+        }
+        if (use_fused) {
+            const ggml_cuda_kernel_launch_params fparams =
+                ggml_cuda_kernel_launch_params(
+                    dim3(m/64, n_groups, 1), dim3(128, 1, 1), 0, stream);
+            paw_timed(stream, std::string("exp_fused") + shp, [&]() {
+                if (p4) {
+                    const paw_l2_tables & lt = paw_l2_tables_get(stream, p4t);
+                    paw_launch(paw_exp_apply_kernel_fused<true, 4>, fparams,
+                        kept_d, (const half *) nullptr, (const void *) tlut->data,
+                        lt.packed ? lt.packed : p4t.packed,
+                        lt.levels ? lt.levels : p4t.levels,
+                        (const int32_t *) scr_i, xg, scr_v,
+                        (const half *) gamma->data,
+                        (float *) nullptr, m, n, n_groups);
+                } else {
+                    paw_launch(paw_exp_apply_kernel_fused<false, 4>, fparams,
+                        kept_d, (const half *) nullptr, (const void *) tlut->data,
+                        (const uint32_t *) nullptr, (const float *) nullptr,
+                        (const int32_t *) scr_i, xg, scr_v,
+                        (const half *) gamma->data,
+                        (float *) nullptr, m, n, n_groups);
+                }
+            });
+        } else if (!use_blas) {
+        static const bool dec_v2 = paw_env_int("GGML_PAW_EXP_DECODE_V2", 1) != 0;
         const ggml_cuda_kernel_launch_params dec_params =
             ggml_cuda_kernel_launch_params(dim3((m/16*n + 255)/256, 1, n_groups),
                                            dim3(256, 1, 1), 0, stream);
         paw_timed(stream, std::string("exp_dense_decode") + shp, [&]() {
         if (v8) {
-            if (p4) {
-                paw_launch(paw_exp_dense_decode_kernel<true, true>, dec_params,
-                    kept_d, dem_d, (const void *) tlut->data, p4t.packed, p4t.levels,
-                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups);
-            } else {
-                paw_launch(paw_exp_dense_decode_kernel<true, false>, dec_params,
-                    kept_d, dem_d, (const void *) tlut->data,
+            // warp-per-tile decode: same bits out, fewer passes over the
+            // stream words
+            const ggml_cuda_kernel_launch_params v2_params =
+                ggml_cuda_kernel_launch_params(
+                    dim3(((m/16)*(n/16) + 7)/8, 1, n_groups), dim3(256, 1, 1), 0, stream);
+            if (p4 && dec_v2) {
+                paw_launch(paw_exp_dense_decode_kernel_v2<true>, v2_params,
+                    kept_d, (const void *) tlut->data, p4t.packed, p4t.levels,
+                    (const int32_t *) scr_i, bank, m, n, n_groups, 0,
+                    nullptr);
+            } else if (dec_v2) {
+                paw_launch(paw_exp_dense_decode_kernel_v2<false>, v2_params,
+                    kept_d, (const void *) tlut->data,
                     (const uint32_t *) nullptr, (const float *) nullptr,
-                    (const int32_t *) scr_i, bank, m, n, n_kept, n_groups);
+                    (const int32_t *) scr_i, bank, m, n, n_groups, 0,
+                    nullptr);
             }
         } else {
             paw_launch(paw_exp_dense_decode_kernel<false, false>, dec_params,
                 kept_d, dem_d, (const void *) tlut->data,
                 (const uint32_t *) nullptr, (const float *) nullptr,
-                (const int32_t *) scr_i, bank, m, n, n_kept, n_groups);
+                (const int32_t *) scr_i, bank, m, n, n_kept, n_groups, 0,
+                nullptr);
         }
         });
+        }
         const ggml_cuda_kernel_launch_params app_params =
             ggml_cuda_kernel_launch_params(dim3(m/16, n_groups, 1), dim3(128, 1, 1), 0, stream);
-        static const int exp_pc = paw_env_int("GGML_PAW_EXP_PC", 8);
+        if (use_blas) {
+            // tall-skinny shape: per-expert dense GEMMs over the grouped
+            // slab beat every custom kernel here; the wave gamma is folded
+            // into the decoded banks first
+            // fp16 output keeps the padded slab small enough for 12GB cards;
+            // the unpermute pass widens back to fp32 for downstream ops
+            ggml_cuda_pool_alloc<half> ygf_alloc(ctx.pool());
+            half * ygf = ygf_alloc.alloc((size_t) P*m);
+            // the per-group GEMM dims live on device; pull the count table
+            // once (a few hundred bytes). Requires uncaptured stream, so the
+            // caller keeps this branch behind GGML_CUDA_DISABLE_GRAPHS=1.
+            std::vector<int32_t> hscr(2*n_groups);
+            CUDA_CHECK(cudaMemcpyAsync(hscr.data(), scr_i,
+                (size_t) 2*n_groups*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+            const float alpha = 1.0f;
+            const float beta  = 0.0f;
+            // diagnostic: GGML_PAW_EXP_BLAS_SKIP_DECODE=1 times GEMMs alone
+            // (output is garbage; perf signal only)
+            static const bool blas_skip_dec =
+                paw_env_int("GGML_PAW_EXP_BLAS_SKIP_DECODE", 0) != 0;
+            paw_timed(stream, std::string("exp_blas") + shp, [&]() {
+            std::vector<cudaEvent_t> ev(do_ovl ? 2*n_slabs + 1 : 0);
+            if (do_ovl) {
+                for (auto & e : ev) {
+                    CUDA_CHECK(cudaEventCreate(&e));
+                }
+                CUDA_CHECK(cudaEventRecord(ev[0], stream));
+            }
+            cudaStream_t ds = do_ovl ? paw_aux_stream() : stream;
+            for (int si = 0; si < n_slabs; ++si) {
+                const int g0 = si*exp_chunk;
+                const int gc = exp_chunk < n_groups - g0 ? exp_chunk : n_groups - g0;
+                half * buf = bank + (size_t)(do_ovl ? (si % 2) : 0)*bank_g*m*n;
+                const ggml_cuda_kernel_launch_params dp =
+                    ggml_cuda_kernel_launch_params(
+                        dim3((m/16*n + 255)/256, 1, gc), dim3(256, 1, 1), 0, ds);
+                if (!blas_skip_dec) {
+                    if (do_ovl) {
+                        // gate: previous slab's GEMMs released this buffer
+                        CUDA_CHECK(cudaStreamWaitEvent(ds, ev[2*si]));
+                    }
+                    static const bool dec_v2 = paw_env_int("GGML_PAW_EXP_DECODE_V2", 1) != 0;
+                    const ggml_cuda_kernel_launch_params v2p =
+                        ggml_cuda_kernel_launch_params(
+                            dim3(((m/16)*(n/16) + 7)/8, 1, gc), dim3(256, 1, 1), 0, ds);
+                    if (p4 && dec_v2) {
+                        paw_launch(paw_exp_dense_decode_kernel_v2<true>, v2p,
+                            kept_d, (const void *) tlut->data, p4t.packed, p4t.levels,
+                            (const int32_t *) scr_i, buf, m, n, n_groups, g0,
+                            (const half *) gamma->data);
+                    } else if (dec_v2) {
+                        paw_launch(paw_exp_dense_decode_kernel_v2<false>, v2p,
+                            kept_d, (const void *) tlut->data,
+                            (const uint32_t *) nullptr, (const float *) nullptr,
+                            (const int32_t *) scr_i, buf, m, n, n_groups, g0,
+                            (const half *) gamma->data);
+                    }
+                    if (do_ovl) {
+                        CUDA_CHECK(cudaEventRecord(ev[2*si + 1], ds));
+                        CUDA_CHECK(cudaStreamWaitEvent(stream, ev[2*si + 1]));
+                    }
+                }
+                for (int gi = 0; gi < gc; ++gi) {
+                    const int cnt = hscr[g0 + gi];
+                    if (cnt == 0) {
+                        continue;
+                    }
+                    const int off = hscr[n_groups + g0 + gi];
+                    CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(),
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            m, cnt, n,
+                            &alpha,
+                            buf + (size_t) gi*m*n,                  CUDA_R_16F, n,
+                            xg + (int64_t) off*n,                   CUDA_R_16F, n,
+                            &beta,
+                            ygf + (int64_t) off*m,                  CUDA_R_16F, m,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                }
+                if (do_ovl && si + 1 < n_slabs) {
+                    CUDA_CHECK(cudaEventRecord(ev[2*si + 2], stream));
+                }
+            }
+            if (do_ovl) {
+                // pool frees ride on the main stream: pin aux work to it too
+                CUDA_CHECK(cudaEventRecord(ev[2*n_slabs], ds));
+                CUDA_CHECK(cudaStreamWaitEvent(stream, ev[2*n_slabs]));
+                CUDA_CHECK(cudaStreamWaitEvent(ds, ev[2*n_slabs]));
+                for (auto & e : ev) {
+                    CUDA_CHECK(cudaEventDestroy(e));
+                }
+            }
+            });
+            paw_timed(stream, std::string("exp_unperm") + shp, [&]() {
+            paw_launch(paw_exp_unpermute_y_kernel,
+                ggml_cuda_kernel_launch_params(
+                    dim3((m + 255)/256, n_groups, 1), dim3(256, 1, 1), 0, stream),
+                (const int32_t *) scr_i, ygf, scr_v, m, n_groups);
+            });
+        } else if (!use_fused) {
+        // fused handled everything above; this branch applies over a
+        // materialized bank and must not run when no bank exists
         paw_timed(stream, std::string("exp_apply") + shp, [&]() {
-        if (v8) {
+        static const int ws_min_m = paw_env_int("GGML_PAW_EXP_WS_MIN_M", 512);
+        if (v8 && exp_ws && xg && m % 64 == 0 && m >= ws_min_m) {
+            paw_launch(paw_exp_apply_kernel_ws<true, 4, true>,
+                ggml_cuda_kernel_launch_params(dim3(m/64, n_groups, 1), dim3(128, 1, 1), 0, stream),
+                (const half *) bank, (const int32_t *) scr_i, nullptr, xg, scr_v,
+                (const half *) gamma->data, m, n, n_groups);
+        } else if (v8) {
+        // m < 1024 keeps the scalar PC path: measured slower than WS there
+        // (the pair-gather latency chain dominates the short row dimension)
             if (exp_pc == 1) {
                 paw_launch(paw_exp_apply_kernel<true, 1>, app_params,
                     (const half *) bank, (const int32_t *) scr_i, (const float *) scr_u, scr_v,
@@ -5192,8 +8581,9 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             }
         }
         });
+        }
     } else {
-        static const bool walk_compact = paw_env_int("GGML_PAW_EXP_WALK_COMPACT", 0) != 0;
+        static const bool walk_compact = paw_env_int("GGML_PAW_EXP_WALK_COMPACT", 1) != 0;
         const bool do_compact = walk_compact && n_tok == 1;
         const bool walk_warp = v8 && n/16 <= 32 && m % 64 == 0;
         const bool fuse_warp_group = do_compact && walk_warp;
@@ -5283,6 +8673,112 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 // supports_op — mirrors the Vulkan predicate (ggml-vulkan.cpp)
 //
 
+// --- PAW_V_REORDER --------------------------------------------------------
+//
+// Row permutation for the v3 mach1 codec. Within the segment starting at
+// seg_off (seg_rows = hd*K*r rows): out[(v*K + k)*hd + d] =
+// in[(k*r + v)*hd + d]. All other rows copy through. Replaces the
+// cont/permute/cont + concat chains the graph used per SSM layer.
+static __global__ void paw_v_reorder_kernel(
+        const float * GGML_CUDA_RESTRICT y,   // [M, T], rows y_stride floats apart
+        float       * GGML_CUDA_RESTRICT dst, // [M, T] packed
+        const int M, const int T, const int y_stride,
+        const int seg_off, const int hd, const int K, const int r) {
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t total = (int64_t) M*T;
+    if (idx >= total) {
+        return;
+    }
+    const int row = (int)(idx % M);
+    const int t   = (int)(idx / M);
+    int src_row = row;
+    const int j = row - seg_off;
+    if (j >= 0 && j < hd*K*r) {
+        const int v   = j / (K*hd);
+        const int rem = j % (K*hd);
+        const int k   = rem / hd;
+        const int d   = rem % hd;
+        src_row = seg_off + (k*r + v)*hd + d;
+    }
+    dst[idx] = y[(int64_t) t*y_stride + src_row];
+}
+
+void ggml_cuda_op_paw_v_reorder(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * y = dst->src[0];
+    GGML_ASSERT(y->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int seg_off = dst->op_params[0];
+    const int hd      = dst->op_params[1];
+    const int K       = dst->op_params[2];
+    const int r       = dst->op_params[3];
+
+    const int M     = (int) y->ne[0];
+    const int T     = (int) y->ne[1];
+    const int y_str = (int)(y->nb[1] / sizeof(float));
+    const int64_t total = (int64_t) M*T;
+    const int blocks = (int)((total + 255)/256);
+    paw_launch(paw_v_reorder_kernel,
+        ggml_cuda_kernel_launch_params(dim3(blocks, 1, 1), dim3(256, 1, 1), 0, ctx.stream()),
+        (const float *) y->data, (float *) dst->data, M, T, y_str, seg_off, hd, K, r);
+}
+
+// --- PAW_DUAL_MM ----------------------------------------------------------
+//
+// Two small [n_embd -> R] GEMVs sharing one input, fused into a single
+// launch (the mamba ssm_alpha/ssm_beta projections at decode: two launches
+// of ~10 us each for a few KB of arithmetic, 30 layers). One warp per
+// output row; x is staged in shared once per block.
+template <int WARPS>
+static __global__ void paw_dual_mm_kernel(
+        const float * GGML_CUDA_RESTRICT w0,  // [K, R]
+        const float * GGML_CUDA_RESTRICT w1,  // [K, R]
+        const float * GGML_CUDA_RESTRICT x,   // [K, T]
+        float       * GGML_CUDA_RESTRICT dst, // [2R, T]
+        const int K, const int R, const int T) {
+    __shared__ float sh[4096];
+    const int t    = blockIdx.z;
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    for (int i = threadIdx.x; i < K; i += WARPS*32) {
+        sh[i] = x[(int64_t) t*K + i];
+    }
+    __syncthreads();
+
+    for (int r = wid; r < WARPS*4; r += WARPS) {
+        const int row  = blockIdx.x*WARPS*4 + r;
+        if (row >= 2*R) {
+            return;
+        }
+        const float * w = (row < R ? w0 : w1) + (int64_t)(row % R)*K;
+        float acc = 0.0f;
+        for (int i = lane; i < K; i += 32) {
+            acc += w[i]*sh[i];
+        }
+        acc = warp_reduce_sum<32>(acc);
+        if (lane == 0) {
+            dst[(int64_t) t*(2*R) + row] = acc;
+        }
+    }
+}
+
+void ggml_cuda_op_paw_dual_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * w0 = dst->src[0];
+    const ggml_tensor * w1 = dst->src[1];
+    const ggml_tensor * x  = dst->src[2];
+    GGML_ASSERT(x->ne[0] <= 4096);
+
+    const int K = (int) w0->ne[0];
+    const int R = (int) w0->ne[1];
+    const int T = (int) x->ne[1];
+    constexpr int WARPS = 8;
+    paw_launch(paw_dual_mm_kernel<WARPS>,
+        ggml_cuda_kernel_launch_params(dim3((2*R + WARPS*4 - 1)/(WARPS*4), 1, T),
+                                       dim3(WARPS*32, 1, 1), 0, ctx.stream()),
+        (const float *) w0->data, (const float *) w1->data, (const float *) x->data,
+        (float *) dst->data, K, R, T);
+}
+
 bool ggml_cuda_paw_supported(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_PAW_EXP_MM:
@@ -5296,15 +8792,32 @@ bool ggml_cuda_paw_supported(const ggml_tensor * op) {
                    (op->src[4]->ne[0] == 2) == (op->src[8] == nullptr) &&
                    op->src[4]->type == (op->src[4]->ne[0] == 2 ? GGML_TYPE_F32
                                                                : GGML_TYPE_F16);
-        case GGML_OP_PAW_RT_MM:
-            // rt_u stages n floats (<= 4096) and rt_out m floats (<= 8192 =
-            // 32 KB static shared) per block
-            return op->src[1]->ne[0] <= 4096 && op->src[2]->ne[0] <= 8192 &&
+        case GGML_OP_PAW_RT_MM: {
+            // rt_u stages one rotation block of n (<= 4096) and rt_out one of
+            // m (<= 8192 = 32 KB static shared). Unblocked payloads take the
+            // whole dimension as the block, which is the old bound verbatim.
+            const int64_t n   = op->src[1]->ne[0];
+            const int64_t m   = op->src[2]->ne[0];
+            const int64_t blk = op->op_params[GGML_PAW_RHT_BLK_SLOT];
+            const int64_t bn  = blk ? blk : n;
+            const int64_t bm  = blk ? blk : m;
+            const int64_t words = op->src[0]->ne[0];
+            return bn <= 4096 && bm <= 8192 && n % bn == 0 && m % bm == 0 &&
+                   words % 8 == 0 && words >= 16 && words <= 64 &&
                    op->src[3]->type == GGML_TYPE_F16;
+        }
         case GGML_OP_PAW_RT_MM_BATCH:
-            // per-matrix bounds same as rt_mm; tlut is src[3K]
-            return op->src[3*op->op_params[0]]->type == GGML_TYPE_F16 &&
+            // per-matrix bounds same as rt_mm; tlut is src[3K]. The batched
+            // kernels have not been taught blocked rotations yet, so a blocked
+            // payload falls back to the per-matrix path.
+            return op->op_params[GGML_PAW_RHT_BLK_SLOT] == 0 &&
+                   op->src[3*op->op_params[0]]->type == GGML_TYPE_F16 &&
                    op->src[3*op->op_params[0] + 1]->type == GGML_TYPE_F32;
+        case GGML_OP_PAW_X3_MM:
+            // mul1-v1 sq kernel: K in {2,3}, fp16 side scales; nt == 1 runs
+            // the fused GEMV directly, nt > 1 loops it per token
+            return (op->src[0]->ne[0] == 32 || op->src[0]->ne[0] == 48) &&
+                   op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16;
         case GGML_OP_PAW_NE_MM:
         case GGML_OP_PAW_EMBED_ROWS:
         case GGML_OP_PAW_EXP_BASIS:
@@ -5312,6 +8825,8 @@ bool ggml_cuda_paw_supported(const ggml_tensor * op) {
         case GGML_OP_PAW_EMBED_GATHER:
         case GGML_OP_PAW_EXP_MM_BATCH2:
         case GGML_OP_PAW_MOE_REDUCE:
+        case GGML_OP_PAW_V_REORDER:
+        case GGML_OP_PAW_DUAL_MM:
             // shapes/types are enforced by the ggml builders
             return true;
         default:
@@ -5377,3 +8892,1428 @@ void ggml_cuda_op_paw_moe_reduce(ggml_backend_cuda_context & ctx, ggml_tensor * 
         (float *) dst->data,
         n_embd, n_used);
 }
+
+
+// ---------------------------------------------------------------------------
+// paw_x3 — EXL3-compatible fused decode GEMV (mul1-v1 codec), Phase 4
+// integration. Device code ported verbatim from the Phase 3 standalone port
+// (scripts/exl3_parity/port/paw_int8_gemv.cu), which is itself a verbatim
+// port of MiaAI-Lab/exllamav3 commit 63b32f001d7b2cfed3b3e3aaf25f534ba53cc7ed:
+//   exllamav3_ext/quant/exl3_gemv_int8_kernel.cuh (sq kernel + units + epilogue)
+//   exllamav3_ext/quant/exl3_gemv_int8.cu         (host launch + workspace)
+// Scope: per-slice-scale ("sq") path, m == 1, plain INT8 mode 2, K in {2, 3}.
+// Differences from the reference host side: the workspace comes from the ggml
+// CUDA pool (graph-safe fixed layout, counters memset per launch), the plan
+// is cached per (bits, k, n), and the activation row is cast F32 -> F16
+// (the reference runtime feeds fp16 activations) before the kernel launch.
+// ---------------------------------------------------------------------------
+
+#include <tuple>
+
+namespace paw_x3 {
+
+#define NUM_THREADS 256
+#define GEMV_STAGE_D 4
+#define SQ_KSPLIT_CAP 64
+#define SQ_MINROWS 16
+#define SQ_ROWS_MAX 512
+#define SQ_COUNTERS_CAP 4096
+// qsums holds 4 floats per (slice, row): 4*ksplit*M with ksplit <=
+// SQ_KSPLIT_CAP and M <= 8, i.e. 4*64*8 ints. The old *4 (1024 ints)
+// overflowed into partials whenever ksplit*M > 256 (e.g. ksplit=34 at
+// M=8 gives 272), corrupting slice-0/row-0 outputs of the call.
+#define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP * 8)
+
+// ---------------------------------------------------------------------------------------------------------
+// ptx.cuh primitives
+
+__device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
+{
+    int d;
+    asm ("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
+__device__ __forceinline__ uint32_t fshift(const uint32_t b, const uint32_t a, int shift)
+{
+    // exl3_dq.cuh fshift: plain 64-bit merge+shift (shift may exceed 32, up to
+    // bits*7+16; __funnelshift_r would clamp at 32 and corrupt K=3 windows)
+    uint64_t merged = ((uint64_t) a << 32) | (uint64_t) b;
+    return (uint32_t) (merged >> shift);
+}
+
+#define FSHF_IMM(dst, lo, hi, imm) asm("shf.r.wrap.b32 %0, %1, %2, " #imm ";" : "=r"(dst) : "r"(lo), "r"(hi))
+#define BFE16_IMM(dst, src, imm) asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))
+
+__device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
+{
+    const int bytes = 16;
+    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "{\n"
+        "   cp.async.cg.shared.global [%0], [%1], %2;\n"
+        "}\n" :: "r"(smem), "l"(glob_ptr), "n"(bytes)
+    );
+}
+
+__device__ inline void cp_async_fence()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int n>
+__device__ inline void cp_async_wait()
+{
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// hadamard_inner.cuh (128-point, natural order, 1/sqrt(128) per side)
+
+struct half4 { half2 x, y; };
+
+__device__ inline void shuffle_had_f4x32(float& h0, float& h1, float& h2, float& h3, const int lane_id)
+{
+    #pragma unroll
+    for (int i = 1; i < 32; i <<= 1)
+    {
+        uint32_t i0 = __float_as_uint(h0);
+        uint32_t i1 = __float_as_uint(h1);
+        uint32_t i2 = __float_as_uint(h2);
+        uint32_t i3 = __float_as_uint(h3);
+        uint64_t h01 =  (uint64_t) i0 | (((uint64_t) i1) << 32);
+        uint64_t h23 =  (uint64_t) i2 | (((uint64_t) i3) << 32);
+        uint64_t ph01 = __shfl_xor_sync(0xffffffff, h01, i);
+        uint64_t ph23 = __shfl_xor_sync(0xffffffff, h23, i);
+        float ph0 = __uint_as_float((uint32_t) (ph01 & 0xffffffff));
+        float ph1 = __uint_as_float((uint32_t) (ph01 >> 32));
+        float ph2 = __uint_as_float((uint32_t) (ph23 & 0xffffffff));
+        float ph3 = __uint_as_float((uint32_t) (ph23 >> 32));
+        int32_t sfm = -static_cast<int32_t>(lane_id & i) >> 31;
+        i0 ^= sfm & 0x80000000;
+        i1 ^= sfm & 0x80000000;
+        i2 ^= sfm & 0x80000000;
+        i3 ^= sfm & 0x80000000;
+        h0 = __uint_as_float(i0) + ph0;
+        h1 = __uint_as_float(i1) + ph1;
+        h2 = __uint_as_float(i2) + ph2;
+        h3 = __uint_as_float(i3) + ph3;
+    }
+}
+
+__device__ inline void shuffle_had_f2x32(float& v, float& w, const int lane_id)
+{
+    #pragma unroll
+    for (int i = 1; i < 32; i <<= 1)
+    {
+        uint64_t vw = ((uint64_t) __float_as_uint(v)) | (((uint64_t) __float_as_uint(w)) << 32);
+        uint64_t pvw = __shfl_xor_sync(0xffffffff, vw, i);
+        float pv = __uint_as_float((uint32_t) (pvw & 0xffffffff));
+        float pw = __uint_as_float((uint32_t) (pvw >> 32));
+        uint32_t vi = __float_as_uint(v);
+        uint32_t wi = __float_as_uint(w);
+        int32_t sfm = -static_cast<int16_t>(lane_id & i) >> 31;
+        vi ^= (sfm & 0x80000000);
+        wi ^= (sfm & 0x80000000);
+        v = __uint_as_float(vi) + pv;
+        w = __uint_as_float(wi) + pw;
+    }
+}
+
+// Half vector, half scales (input transform: pre_scale = suh)
+template <bool pre_scale, bool post_scale>
+inline __device__
+void had_hf_r_128_inner(const half* __restrict__ input_ptr, half* __restrict__ output_ptr,
+                        const half* __restrict__ scale, const float r_scale)
+{
+    int t = threadIdx.x & 31;
+    half4 v = ((half4*) input_ptr)[t];
+    if constexpr (pre_scale)
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x = __hmul2(v.x, scales.x);
+        v.y = __hmul2(v.y, scales.y);
+    }
+    float v0 = __half2float(__low2half(v.x));
+    float v1 = __half2float(__high2half(v.x));
+    float v2 = __half2float(__low2half(v.y));
+    float v3 = __half2float(__high2half(v.y));
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    float h0 = s0 + s1;
+    float h1 = d0 + d1;
+    float h2 = s0 - s1;
+    float h3 = d0 - d1;
+    shuffle_had_f4x32(h0, h1, h2, h3, t);
+    v.x = __floats2half2_rn(h0 * r_scale, h1 * r_scale);
+    v.y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
+    if constexpr (post_scale)
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x = __hmul2(v.x, scales.x);
+        v.y = __hmul2(v.y, scales.y);
+    }
+    ((half4*) output_ptr)[t] = v;
+}
+
+// Float vector, half scales (not instantiated by this port's epilogue; kept
+// for completeness with the reference epilogue's c_fp32 branch)
+template <bool pre_scale, bool post_scale>
+inline __device__
+void had_ff_r_128_inner(const float* __restrict__ input_ptr, float* __restrict__ output_ptr,
+                        const half* __restrict__ scale, const float r_scale)
+{
+    int t = threadIdx.x & 31;
+    float4 v = ((float4*) input_ptr)[t];
+    if constexpr (pre_scale)
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x *= __low2float(scales.x);
+        v.y *= __high2float(scales.x);
+        v.z *= __low2float(scales.y);
+        v.w *= __high2float(scales.y);
+    }
+    float v0 = v.x, v1 = v.y, v2 = v.z, v3 = v.w;
+    float s0 = v0 + v1, d0 = v0 - v1, s1 = v2 + v3, d1 = v2 - v3;
+    v.x = s0 + s1;
+    v.y = d0 + d1;
+    v.z = s0 - s1;
+    v.w = d0 - d1;
+    shuffle_had_f2x32(v.x, v.y, t);
+    shuffle_had_f2x32(v.z, v.w, t);
+    v.x *= r_scale;
+    v.y *= r_scale;
+    v.z *= r_scale;
+    v.w *= r_scale;
+    if constexpr (post_scale)
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x *= __low2float(scales.x);
+        v.y *= __high2float(scales.x);
+        v.z *= __low2float(scales.y);
+        v.w *= __high2float(scales.y);
+    }
+    ((float4*) output_ptr)[t] = v;
+}
+
+// Float vector, half scales, half output (epilogue transform: post_scale = svh)
+template <bool pre_scale, bool post_scale>
+inline __device__
+void had_fh_r_128_inner(const float* __restrict__ input_ptr, half* __restrict__ output_ptr,
+                        const half* __restrict__ scale, const float r_scale)
+{
+    int t = threadIdx.x & 31;
+    float4 v = ((float4*) input_ptr)[t];
+    if constexpr (pre_scale)
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x *= __low2float(scales.x);
+        v.y *= __high2float(scales.x);
+        v.z *= __low2float(scales.y);
+        v.w *= __high2float(scales.y);
+    }
+    float v0 = v.x;
+    float v1 = v.y;
+    float v2 = v.z;
+    float v3 = v.w;
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    v.x = s0 + s1;
+    v.y = d0 + d1;
+    v.z = s0 - s1;
+    v.w = d0 - d1;
+    shuffle_had_f2x32(v.x, v.y, t);
+    shuffle_had_f2x32(v.z, v.w, t);
+    v.x *= r_scale;
+    v.y *= r_scale;
+    v.z *= r_scale;
+    v.w *= r_scale;
+    half4 o;
+    o.x = __floats2half2_rn(v.x, v.y);
+    o.y = __floats2half2_rn(v.z, v.w);
+    if constexpr (post_scale)
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        o.x = __hmul2(o.x, scales.x);
+        o.y = __hmul2(o.y, scales.y);
+    }
+    ((half4*) output_ptr)[t] = o;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Window extraction (exl3_dq.cuh / kernel ext8w specializations for K = 2, 3)
+
+template <int bits>
+__device__ __forceinline__ int wrap_idx(int i)
+{
+    constexpr int words = bits * 256 / 32;
+    return i >= words ? i - words : i;
+}
+
+template <int bits>
+__device__ __forceinline__ void ext8w
+(
+    const uint32_t* ptr, int t0,
+    uint32_t& w0, uint32_t& w1, uint32_t& w2, uint32_t& w3,
+    uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7
+)
+{
+    if constexpr (bits == 2)
+    {
+        uint32_t i1 = t0 >> 4;
+        uint32_t i0 = (i1 + 15) & 15;
+        uint32_t a = ptr[i0];
+        uint32_t b = ptr[i1];
+        b = fshift(b, a, ((~t0) & 8) << 1);
+        w7 = b & 0xffff;
+        BFE16_IMM(w6, b, 2);
+        BFE16_IMM(w5, b, 4);
+        BFE16_IMM(w4, b, 6);
+        BFE16_IMM(w3, b, 8);
+        BFE16_IMM(w2, b, 10);
+        BFE16_IMM(w1, b, 12);
+        BFE16_IMM(w0, b, 14);
+    }
+    else if constexpr (bits == 3)
+    {
+        int b1 = (t0 + 257) * bits;
+        int b0 = b1 - 16;
+        int b2 = b1 + bits * 7;
+        int i0 = b0 / 32;
+        int i2 = (b2 - 1) / 32;
+        int s2 = (i2 + 1) * 32 - b2;
+        uint32_t a = ptr[wrap_idx<bits>(i0)];
+        uint32_t b = ptr[wrap_idx<bits>(i2)];
+        w7 = fshift(b, a, s2);
+        w6 = w7 >> bits;
+        w5 = w6 >> bits;
+        w4 = w5 >> bits;
+        w3 = fshift(b, a, s2 + bits * 4);
+        w2 = w3 >> bits;
+        w1 = w2 >> bits;
+        w0 = w1 >> bits;
+        w7 &= 0xffff; w6 &= 0xffff; w5 &= 0xffff; w4 &= 0xffff;
+        w3 &= 0xffff; w2 &= 0xffff; w1 &= 0xffff; w0 &= 0xffff;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// sq kernel building blocks (exl3_gemv_int8_kernel.cuh), M = 1, no residual
+
+#define NUM_THREADS 256
+#define GEMV_STAGE_D 4
+#define SQ_KSPLIT_CAP 64
+#define SQ_MINROWS 16
+#define SQ_ROWS_MAX 512
+#define SQ_COUNTERS_CAP 4096
+// qsums holds 4 floats per (slice, row): 4*ksplit*M with ksplit <=
+// SQ_KSPLIT_CAP and M <= 8, i.e. 4*64*8 ints. The old *4 (1024 ints)
+// overflowed into partials whenever ksplit*M > 256 (e.g. ksplit=34 at
+// M=8 gives 272), corrupting slice-0/row-0 outputs of the call.
+#define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP * 8)
+
+__host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
+{
+    return bits == 3 || bits == 5 || bits == 7;
+}
+
+__host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
+{
+    int cap = (80 * 1024) / (32 + 64 * M * (residual ? 2 : 1));
+    cap &= ~7;
+    return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
+}
+
+// One k-row of an adjacent block pair, generic K: extract + dp4a for both blocks
+template <int bits, int M, bool residual>
+__device__ __forceinline__ void gemv_int8_pair_row
+(
+    const uint32_t* blockA, const uint32_t* blockB,
+    const uint32_t* as_kb,
+    int slice_stride, int c2, int t0,
+    int* ia0, int* ia1, int* ib0, int* ib1,
+    int* ja0, int* ja1, int* jb0, int* jb1
+)
+{
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    ext8w<bits>(blockA, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+    w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
+    w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
+    #pragma unroll
+    for (int r = 0; r < M; ++r)
+    {
+        const uint32_t* as = as_kb + r * slice_stride;
+        uint2 as01 = *(const uint2*) (as + c2);
+        uint2 as89 = *(const uint2*) (as + c2 + 8);
+        ia0[r] = dp4a_us(w0, as01.x, ia0[r]);
+        ia0[r] = dp4a_us(w1, as01.y, ia0[r]);
+        ia0[r] = dp4a_us(w2, as89.x, ia0[r]);
+        ia0[r] = dp4a_us(w3, as89.y, ia0[r]);
+        ia1[r] = dp4a_us(w4, as01.x, ia1[r]);
+        ia1[r] = dp4a_us(w5, as01.y, ia1[r]);
+        ia1[r] = dp4a_us(w6, as89.x, ia1[r]);
+        ia1[r] = dp4a_us(w7, as89.y, ia1[r]);
+    }
+
+    ext8w<bits>(blockB, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+    w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
+    w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
+    #pragma unroll
+    for (int r = 0; r < M; ++r)
+    {
+        const uint32_t* as = as_kb + r * slice_stride;
+        uint2 as01 = *(const uint2*) (as + c2);
+        uint2 as89 = *(const uint2*) (as + c2 + 8);
+        ib0[r] = dp4a_us(w0, as01.x, ib0[r]);
+        ib0[r] = dp4a_us(w1, as01.y, ib0[r]);
+        ib0[r] = dp4a_us(w2, as89.x, ib0[r]);
+        ib0[r] = dp4a_us(w3, as89.y, ib0[r]);
+        ib1[r] = dp4a_us(w4, as01.x, ib1[r]);
+        ib1[r] = dp4a_us(w5, as01.y, ib1[r]);
+        ib1[r] = dp4a_us(w6, as89.x, ib1[r]);
+        ib1[r] = dp4a_us(w7, as89.y, ib1[r]);
+    }
+}
+
+// Shared reduction tail: four lanes share each n; exclusive plain stores for the
+// per-slice partials of the sq kernel (atomic = false)
+template <int M, bool residual, bool atomic = true>
+__device__ __forceinline__ void gemv_int8_pair_tail
+(
+    int* __restrict__ accs, size_t acc_stride, int nbp, int lane, int size_n,
+    int* ia0, int* ia1, int* ib0, int* ib1,
+    int* ja0, int* ja1, int* jb0, int* jb1
+)
+{
+    #pragma unroll
+    for (int r = 0; r < M; ++r)
+    {
+        #pragma unroll
+        for (int o = 1; o < 4; o <<= 1)
+        {
+            ia0[r] += __shfl_xor_sync(0xffffffff, ia0[r], o);
+            ia1[r] += __shfl_xor_sync(0xffffffff, ia1[r], o);
+            ib0[r] += __shfl_xor_sync(0xffffffff, ib0[r], o);
+            ib1[r] += __shfl_xor_sync(0xffffffff, ib1[r], o);
+        }
+    }
+    if ((lane & 3) == 0)
+    {
+        int nA = (nbp * 2) * 16 + (lane >> 2);
+        int nB = nA + 16;
+        #pragma unroll
+        for (int r = 0; r < M; ++r)
+        {
+            int* acc = accs + r * acc_stride;
+            if constexpr (atomic)
+            {
+                atomicAdd(acc + nA, ia0[r]);
+                atomicAdd(acc + nA + 8, ia1[r]);
+                atomicAdd(acc + nB, ib0[r]);
+                atomicAdd(acc + nB + 8, ib1[r]);
+            }
+            else
+            {
+                acc[nA] = ia0[r];
+                acc[nA + 8] = ia1[r];
+                acc[nB] = ib0[r];
+                acc[nB + 8] = ib1[r];
+            }
+        }
+    }
+}
+
+// Narrow generic unit (any K): warp per adjacent block pair, pointer-based
+// extraction straight from global memory
+template <int bits, int M, bool residual, bool atomic = true>
+__device__ __forceinline__ void gemv_int8_unit_narrow
+(
+    const uint16_t* __restrict__ B,
+    int* __restrict__ accs,
+    size_t acc_stride,
+    const uint32_t* __restrict__ sh_as,
+    int slice_stride,
+    int nb256,
+    int kb0,
+    int nrows,
+    int size_n
+)
+{
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int nbp = nb256 * 8 + warp;
+    const int row_stride = size_n * bits / 2;
+    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * (bits * 16);
+    int c2 = 2 * (lane & 3);
+    int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
+    int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
+
+    for (int kb = 0; kb < nrows; ++kb)
+    {
+        const uint32_t* blockA = bp + (size_t) kb * row_stride;
+        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
+            sh_as + (kb << 4), slice_stride, c2, lane << 3,
+            ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+    }
+    gemv_int8_pair_tail<M, residual, atomic>(accs, acc_stride, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+}
+
+// Smem-staged generic unit: warp-private cp.async staging (K = 3, 5, 7)
+template <int bits, int M, bool residual, bool atomic = true>
+__device__ __forceinline__ void gemv_int8_unit_smem
+(
+    const uint16_t* __restrict__ B,
+    int* __restrict__ accs,
+    size_t acc_stride,
+    const uint32_t* __restrict__ sh_as,
+    int slice_stride,
+    uint32_t* __restrict__ sh_b,
+    int nb256,
+    int kb0,
+    int nrows,
+    int size_n
+)
+{
+    constexpr int D = GEMV_STAGE_D;
+    constexpr int pairwords = 16 * bits;
+    constexpr int chunks = pairwords / 4;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int nbp = nb256 * 8 + warp;
+    const int row_stride = size_n * bits / 2;
+    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
+    uint32_t* sb = sh_b + warp * (D * pairwords);
+
+    auto stage_row = [&] (int kb)
+    {
+        if (kb < nrows && lane < chunks)
+            cp_async(sb + (kb % D) * pairwords + lane * 4, bp + (size_t) kb * row_stride + lane * 4);
+        cp_async_fence();
+    };
+    #pragma unroll
+    for (int r = 0; r < D - 1; ++r) stage_row(r);
+
+    int c2 = 2 * (lane & 3);
+    int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
+    int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
+
+    for (int kb = 0; kb < nrows; ++kb)
+    {
+        cp_async_wait<D - 2>();
+        __syncwarp();
+        stage_row(kb + D - 1);
+
+        const uint32_t* blockA = sb + (kb % D) * pairwords;
+        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
+            sh_as + (kb << 4), slice_stride, c2, lane << 3,
+            ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+    }
+    gemv_int8_pair_tail<M, residual, atomic>(accs, acc_stride, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+}
+
+// Stage one slice for M activation rows: Hadamard from A into sh_ah, slice max
+// -> q_s, splats + exact sums per row. Bit-identical in every block.
+template <int M, bool residual>
+__device__ __forceinline__ void gemv_int8_stage_slice
+(
+    const half* __restrict__ A,
+    int size_m,
+    int size_k,
+    const half* __restrict__ suh,
+    float* __restrict__ qs,
+    half* __restrict__ sh_ah,
+    uint32_t* __restrict__ sh_as,
+    int slice_stride,
+    float* __restrict__ sh_red,
+    int kb0,
+    int nrows
+)
+{
+    int t = threadIdx.x;
+    int nel = nrows * 16;
+    #pragma unroll
+    for (int r = 0; r < M; ++r)
+    {
+        uint32_t* as = sh_as + r * slice_stride;
+        uint32_t* as2 = sh_as + (M + r) * slice_stride;
+        float* qsr = qs + 4 * r;
+        __syncthreads();
+        if (r >= size_m)
+        {
+            for (int i = t; i < nel; i += NUM_THREADS)
+            {
+                as[i] = 0;
+                if constexpr (residual) as2[i] = 0;
+            }
+            if (t == 0)
+            {
+                qsr[0] = 1.0f;
+                ((int*) qsr)[1] = 0;
+                ((int*) qsr)[2] = 0;
+            }
+            continue;
+        }
+        const half* Ar = A + (size_t) r * size_k;
+        for (int sp = t >> 5; sp < (nel >> 7); sp += NUM_THREADS >> 5)
+            had_hf_r_128_inner<true, false>(Ar + (kb0 << 4) + (sp << 7), sh_ah + (sp << 7), suh + (kb0 << 4) + (sp << 7), 0.088388347648f);
+        __syncthreads();
+
+        float mx = 0.0f;
+        for (int i = t; i < nel; i += NUM_THREADS) mx = fmaxf(mx, fabsf(__half2float(sh_ah[i])));
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        if ((t & 31) == 0) sh_red[t >> 5] = mx;
+        __syncthreads();
+        if (t < 32)
+        {
+            float v = t < (NUM_THREADS >> 5) ? sh_red[t] : 0.0f;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+            if (t == 0) sh_red[32] = fmaxf(v, 1e-8f) / 127.0f;
+        }
+        __syncthreads();
+        float q_s = sh_red[32];
+
+        float rq = 1.0f / q_s;
+        float rq2 = rq * 254.0f;
+        int l1 = 0, l2 = 0;
+        for (int i = t; i < nel; i += NUM_THREADS)
+        {
+            float a = __half2float(sh_ah[i]);
+            int v = __float2int_rn(a * rq);
+            v = max(-127, min(127, v));
+            as[i] = ((uint32_t)(uint8_t)(int8_t) v) * 0x01010101u;
+            l1 += v;
+            if constexpr (residual)
+            {
+                float rr = a - q_s * (float) v;
+                int v2 = __float2int_rn(rr * rq2);
+                v2 = max(-127, min(127, v2));
+                as2[i] = ((uint32_t)(uint8_t)(int8_t) v2) * 0x01010101u;
+                l2 += v2;
+            }
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            l1 += __shfl_xor_sync(0xffffffff, l1, o);
+            l2 += __shfl_xor_sync(0xffffffff, l2, o);
+        }
+        if ((t & 31) == 0) { ((int*) sh_red)[t >> 5] = l1; sh_red[16 + (t >> 5)] = __int_as_float(l2); }
+        __syncthreads();
+        if (t < 32)
+        {
+            int v1 = t < (NUM_THREADS >> 5) ? ((int*) sh_red)[t] : 0;
+            int v2 = t < (NUM_THREADS >> 5) ? __float_as_int(sh_red[16 + t]) : 0;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+            {
+                v1 += __shfl_xor_sync(0xffffffff, v1, o);
+                v2 += __shfl_xor_sync(0xffffffff, v2, o);
+            }
+            if (t == 0)
+            {
+                qsr[0] = sh_red[32];
+                ((int*) qsr)[1] = v1;
+                ((int*) qsr)[2] = v2;
+            }
+        }
+    }
+    __syncthreads();
+}
+
+// Epilogue for one 256-column group: deterministic fixed-order combine over the
+// per-slice partials, warp per (row, 128-span). __ldcg: contributions arrived
+// from other blocks with no grid-wide barrier.
+template <int M, bool c_fp32, bool residual>
+__device__ __forceinline__ void gemv_int8_epilogue_group_sq
+(
+    const int* __restrict__ partials,
+    const float* __restrict__ qsums,
+    int pstride,
+    int ksplit,
+    int size_m,
+    void* __restrict__ C,
+    const half* __restrict__ svh,
+    float* __restrict__ sh_tmp,
+    int nb256,
+    int size_n
+)
+{
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    float k_inv  = __half2float(__ushort_as_half(0x1eee));
+    float k_bias = __half2float(__ushort_as_half(0xc931));
+    float aff = 1024.0f * k_inv + k_bias;
+
+    float* tmp = sh_tmp + warp * 128;
+    // Cross-block inputs: partials/qsums are written by other CTAs (and the
+    // pool lines may sit stale in this SM's L1 from a previous call), so read
+    // them volatile (L1-bypass, L2-coherent with the contributors' fences).
+    // Plain/__ldcg loads here intermittently fed last-layer's data to M > 1
+    // decode batches (solo nt == 1 usually reuses its own lines: coherent).
+    volatile const int* vpar = (volatile const int*) partials;
+    volatile const float* vqs = (volatile const float*) qsums;
+    volatile const int* vqsi = (volatile const int*) qsums;
+    // 8 warps cover 2 rows each; stride the (row, span) pairs when M > 4
+    // (single-shot warp>=2*M left rows >= 4 unwritten at M = 5..8).
+    for (int p = warp; p < 2 * size_m; p += (NUM_THREADS >> 5))
+    {
+        int row = p >> 1;
+        int base = nb256 * 256 + (p & 1) * 128;
+        float acc[4] = {};
+        float corr = 0.0f;
+        for (int sl = 0; sl < ksplit; ++sl)
+        {
+            int idx = sl * M + row;
+            float q_s = vqs[4 * idx];
+            float suma = q_s * (float) vqsi[4 * idx + 1];
+            volatile const int* q = vpar + (size_t) idx * pstride + base;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                acc[i] += q_s * (float) q[lane * 4 + i];
+            if constexpr (residual)
+            {
+                float q2_s = q_s * (1.0f / 254.0f);
+                suma += q2_s * (float) vqsi[4 * idx + 2];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    acc[i] += q2_s * (float) q[size_n + lane * 4 + i];
+            }
+            corr += aff * suma;
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            tmp[lane * 4 + i] = k_inv * acc[i] + corr;
+        __syncwarp();
+        if constexpr (c_fp32)
+            had_ff_r_128_inner<false, true>(tmp, ((float*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
+        else
+            had_fh_r_128_inner<false, true>(tmp, ((half*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// The sq kernel, m == 1, mode 2 (plain int8), regular launch
+
+template <int bits, int M, bool c_fp32, bool residual>
+__global__ __launch_bounds__(NUM_THREADS)
+void exl3_gemv_int8_sq_kernel
+(
+    const half* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    void* __restrict__ C,
+    const int size_m,
+    const int size_k,
+    const int size_n,
+    int* __restrict__ locks,
+    const half* __restrict__ suh,
+    half* __restrict__ A_had,
+    const half* __restrict__ svh
+)
+{
+    (void) A_had;  // unused in the sq path
+    extern __shared__ uint32_t shmem[];
+
+    int rows_total = size_k >> 4;
+    int nb256_total = size_n / 256;
+    int r = (rows_total * nb256_total + (int) gridDim.x - 1) / (int) gridDim.x;
+    int rows_per = (r > 2 * r ? r : (2 * r < 32 ? 2 * r : 32));
+    rows_per = (rows_per + 7) & ~7;
+    rows_per = rows_per < SQ_MINROWS ? SQ_MINROWS : rows_per;
+    rows_per = rows_per > gemv_int8_sq_rows_max(M, residual) ? gemv_int8_sq_rows_max(M, residual) : rows_per;
+    rows_per = rows_per > ((rows_total + 7) & ~7) ? ((rows_total + 7) & ~7) : rows_per;
+    if constexpr (M > 1) {
+        constexpr int smem_budget = 49152;
+        constexpr int stage = bits == 3 ? 8 * GEMV_STAGE_D * 16 * bits * 4 : 0;
+        int cap = (smem_budget - 1024 * M - stage) / (32 + 64 * M);
+        cap &= ~7;
+        if (cap < SQ_MINROWS) cap = SQ_MINROWS;
+        rows_per = rows_per > cap ? cap : rows_per;
+    }
+    int ksplit = (rows_total + rows_per - 1) / rows_per;
+    int units = nb256_total * ksplit;
+    int slice_stride = rows_per * 16;
+    int pstride = size_n * (residual ? 2 : 1);
+
+    int* counters = locks;
+    float* qsums = (float*) (locks + SQ_COUNTERS_CAP);
+    int* partials = locks + SQ_WS_RESERVED;
+
+    half* sh_ah = (half*) shmem;
+    uint32_t* sh_as = shmem + rows_per * 8;
+    uint32_t* sh_b = sh_as + slice_stride * M * (residual ? 2 : 1);
+    float* sh_tmp = (float*) (sh_b + (gemv_int8_stage_smem(bits) ? 8 * GEMV_STAGE_D * 16 * bits : 0));
+    __shared__ float sh_red[33];
+    __shared__ int sh_last;
+
+    int t = threadIdx.x;
+    int prev_slice = -1;
+    for (int unit = blockIdx.x; unit < units; unit += gridDim.x)
+    {
+        int slice = unit / nb256_total;
+        int nb256 = unit % nb256_total;
+        int kb0 = slice * rows_per;
+        int nrows = rows_per < (rows_total - kb0) ? rows_per : (rows_total - kb0);
+        if (slice != prev_slice)
+        {
+            gemv_int8_stage_slice<M, residual>(A, size_m, size_k, suh, qsums + 4 * slice * M,
+                                               sh_ah, sh_as, slice_stride, sh_red, kb0, nrows);
+            prev_slice = slice;
+        }
+        int* pacc = partials + (size_t) slice * M * pstride;
+        if constexpr (gemv_int8_stage_smem(bits))
+            gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n);
+        else
+            gemv_int8_unit_narrow<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
+
+        // Completion counter: the ksplit-th contributor runs the epilogue
+        __threadfence();
+        __syncthreads();
+        if (t == 0) sh_last = (atomicAdd(&counters[nb256], 1) == ksplit - 1) ? 1 : 0;
+        __syncthreads();
+        if (sh_last)
+        {
+            gemv_int8_epilogue_group_sq<M, c_fp32, residual>(partials, qsums, pstride, ksplit, size_m,
+                                                             C, svh, sh_tmp, nb256, size_n);
+            if (t == 0) counters[nb256] = 0;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Host side (mirror of exl3_gemv_int8.cu, sq path only)
+
+static int g_num_sms = 82;
+
+
+// --- adapted host side: plan cache + pool workspace (exl3_gemv_int8.cu) ---
+
+template <int bits, int M, bool c_fp32>
+static cudaFunction_t sq_kernel_fn()
+{
+    return (cudaFunction_t) exl3_gemv_int8_sq_kernel<bits, M, c_fp32, false>;
+}
+
+static size_t smem_for(int bits, int rows_per, int M)
+{
+    constexpr bool residual = false;
+    size_t stage = gemv_int8_stage_smem(bits) ? (size_t) 8 * GEMV_STAGE_D * 16 * bits * 4 : 0;
+    return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * M * (residual ? 2 : 1)
+           + stage + (size_t) 2 * M * 128 * 4;
+}
+
+struct SqPlan
+{
+    cudaFunction_t fn;
+    int grid, ksplit, rows_per;
+    size_t smem;
+};
+
+// deterministic launch plan per matrix shape; occupancy query once
+// M = batch rows (nt). M == 1 is the decode path; 2..SQ_M_MAX share one
+// launch with the trellis read once. Cache key includes M (rows_max/smem
+// are M-dependent); M > 1 clamps rows_per to the 48 KB smem budget.
+#define SQ_M_MAX 8
+#define SQ_SMEM_BUDGET 49152
+
+static const SqPlan & plan_sq(int bits, int size_k, int size_n, int M)
+{
+    static std::map<std::tuple<int, int, int, int>, SqPlan> cache;
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto key = std::make_tuple(bits, size_k, size_n, M);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    constexpr bool residual = false;
+    int rows_max = gemv_int8_sq_rows_max(M, residual);
+    int rows_total = size_k / 16;
+    int nb256 = size_n / 256;
+
+    auto decomp = [&] (int grid_, int & ksplit, int & rows_per)
+    {
+        int r = (rows_total * nb256 + grid_ - 1) / grid_;
+        rows_per = (r > 2 * r ? r : (2 * r < 32 ? 2 * r : 32));
+        rows_per = (rows_per + 7) & ~7;
+        rows_per = rows_per < SQ_MINROWS ? SQ_MINROWS : rows_per;
+        rows_per = rows_per > rows_max ? rows_max : rows_per;
+        rows_per = rows_per > ((rows_total + 7) & ~7) ? ((rows_total + 7) & ~7) : rows_per;
+        if (M > 1) {
+            // clamp to the 48 KB smem budget (M == 1 keeps legacy behavior)
+            size_t stage = gemv_int8_stage_smem(bits) ? (size_t) 8 * GEMV_STAGE_D * 16 * bits * 4 : 0;
+            int cap = (int)((SQ_SMEM_BUDGET - 1024 * M - stage) / (32 + 64 * M));
+            cap &= ~7;
+            if (cap < SQ_MINROWS) cap = SQ_MINROWS;
+            rows_per = rows_per > cap ? cap : rows_per;
+        }
+        ksplit = (rows_total + rows_per - 1) / rows_per;
+    };
+
+    SqPlan plan;
+    if (bits == 2) {
+        switch (M) {
+            case 1: plan.fn = sq_kernel_fn<2, 1, true>(); break;
+            case 2: plan.fn = sq_kernel_fn<2, 2, true>(); break;
+            case 3: plan.fn = sq_kernel_fn<2, 3, true>(); break;
+            case 4: plan.fn = sq_kernel_fn<2, 4, true>(); break;
+            case 5: plan.fn = sq_kernel_fn<2, 5, true>(); break;
+            case 6: plan.fn = sq_kernel_fn<2, 6, true>(); break;
+            case 7: plan.fn = sq_kernel_fn<2, 7, true>(); break;
+            default: plan.fn = sq_kernel_fn<2, 8, true>(); break;
+        }
+    } else {
+        switch (M) {
+            case 1: plan.fn = sq_kernel_fn<3, 1, true>(); break;
+            case 2: plan.fn = sq_kernel_fn<3, 2, true>(); break;
+            case 3: plan.fn = sq_kernel_fn<3, 3, true>(); break;
+            case 4: plan.fn = sq_kernel_fn<3, 4, true>(); break;
+            case 5: plan.fn = sq_kernel_fn<3, 5, true>(); break;
+            case 6: plan.fn = sq_kernel_fn<3, 6, true>(); break;
+            case 7: plan.fn = sq_kernel_fn<3, 7, true>(); break;
+            default: plan.fn = sq_kernel_fn<3, 8, true>(); break;
+        }
+    }
+    decomp(6 * g_num_sms, plan.ksplit, plan.rows_per);
+    size_t smem_guess = smem_for(bits, plan.rows_per, M);
+    int maxb;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, plan.fn, NUM_THREADS, smem_guess));
+    plan.grid = (maxb * g_num_sms) < 1024 ? (maxb * g_num_sms) : 1024;
+    decomp(plan.grid, plan.ksplit, plan.rows_per);
+    // debug: clamp the launch grid (GGML_PAW_SQ_GRID_MAX=1 serializes all
+    // units through one CTA: no cross-block partials/counters traffic)
+    {
+        const char * e = getenv("GGML_PAW_SQ_GRID_MAX");
+        if (e && atoi(e) > 0 && plan.grid > atoi(e)) {
+            plan.grid = atoi(e);
+            decomp(plan.grid, plan.ksplit, plan.rows_per);
+        }
+    }
+    plan.smem = smem_for(bits, plan.rows_per, M);
+    GGML_ASSERT(plan.ksplit <= SQ_KSPLIT_CAP);
+    GGML_ASSERT(nb256 <= SQ_COUNTERS_CAP);
+
+    auto res = cache.emplace(key, plan);
+    return res.first->second;
+}
+
+static void launch_sq(const SqPlan & plan, int bits, int M,
+                      const half * A, const uint16_t * B, float * C,
+                      int size_k, int size_n,
+                      const half * suh, const half * svh,
+                      int * locks, cudaStream_t stream)
+{
+    int g_size_m = M;                      // fused batch rows (was hardcoded 1)
+    static half * const g_null_a_had = nullptr;  // residual-only operand
+    void * args[] =
+    {
+        (void *) &A, (void *) &B, (void *) &C,
+        (void *) &g_size_m, (void *) &size_k, (void *) &size_n,
+        (void *) &locks, (void *) &suh, (void *) &g_null_a_had, (void *) &svh
+    };
+    CUDA_CHECK(cudaLaunchKernel(plan.fn, dim3(plan.grid), dim3(NUM_THREADS), args, plan.smem, stream));
+}
+
+__global__ static void x3_cast_f32_f16_kernel(half * dst, const float * src, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __float2half(src[i]);
+    }
+}
+
+static int x3_num_sms()
+{
+    static int n_sms = [] ()
+    {
+        int dev = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        cudaDeviceProp prop;
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+        return prop.multiProcessorCount;
+    }();
+    return n_sms;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// EXL3 reconstruct_had_slice device port (x3 prefill path: trellis -> ORIGINAL-basis fp16 W).
+// Verbatim logic from exllamav3_ext (ref 63b32f0)
+//   quant/reconstruct.cu (reconstruct_had_kernel), quant/exl3_dq.cuh (dq8, dq8_aligned_2bits),
+//   quant/codebook.cuh (decode fns, unions), quant/hadamard_inner.cuh (shuffle_had_h2x32).
+// Only torch host wrappers are omitted; K is restricted to {2,3} and cb to mul1 (2).
+// Already-defined paw_x3 names are reused, not redefined: fshift, FSHF_IMM, BFE16_IMM, half4.
+
+union half2_uint32 { half2 as_half2; uint32_t as_uint32; };
+union half_uint16 { half as_half; uint16_t as_uint16; __device__ half_uint16(uint16_t x) : as_uint16(x) {} };
+
+struct FragB { half2 v[2]; __device__ half2 & operator[](int i) { return v[i]; } };
+
+// Decode two mul1 codebook entries from precomputed products x0 = idx0 * 0x83DCD12D,
+// x1 = idx1 * 0x83DCD12D
+__device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
+{
+    const uint32_t acc = 0x6400u;
+    uint32_t sum0 = __dp4a(x0, 0x01010101u, acc);
+    uint32_t sum1 = __dp4a(x1, 0x01010101u, acc);
+    half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));  //  0.00677 = 1/147.7
+    half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));  // -10.39
+    half_uint16 h0((uint16_t) sum0);
+    half_uint16 h1((uint16_t) sum1);
+    return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+}
+
+template <int cb>
+__device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
+{
+    static_assert(cb == 2, "x3 reconstruct supports mul1 only");
+    x0 *= 0x83DCD12Du;
+    x1 *= 0x83DCD12Du;
+    return decode_mul1_product_2(x0, x1);
+}
+
+template <int bits, int cb, int align>
+__device__ __forceinline__ void dq8(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+{
+    int b1 = (t_offset + 257) * bits;
+    int b0 = b1 - 16;
+    int b2 = b1 + bits * 7;
+    int i0 = b0 / 32;
+    int i2 = (b2 - 1) / 32;
+    int s2 = (i2 + 1) * 32 - b2;
+
+    uint32_t a = ptr[i0 % (bits * 256 / 32)];
+    uint32_t b = ptr[i2 % (bits * 256 / 32)];
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    if constexpr (align == 1)
+    {
+        w7 = fshift(b, a, s2);
+        w6 = fshift(b, a, s2 + bits);
+        w5 = fshift(b, a, s2 + bits * 2);
+        w4 = fshift(b, a, s2 + bits * 3);
+        w3 = fshift(b, a, s2 + bits * 4);
+        w2 = fshift(b, a, s2 + bits * 5);
+        w1 = fshift(b, a, s2 + bits * 6);
+        w0 = fshift(b, a, s2 + bits * 7);
+    }
+    if constexpr (align == 2)
+    {
+        w7 = fshift(b, a, s2);
+        w6 = w7 >> bits;
+        w5 = fshift(b, a, s2 + bits * 2);
+        w4 = w5 >> bits;
+        w3 = fshift(b, a, s2 + bits * 4);
+        w2 = w3 >> bits;
+        w1 = fshift(b, a, s2 + bits * 6);
+        w0 = w1 >> bits;
+    }
+    if constexpr (align == 4)
+    {
+        w7 = fshift(b, a, s2);
+        w6 = w7 >> bits;
+        w5 = w6 >> bits;
+        w4 = w5 >> bits;
+        w3 = fshift(b, a, s2 + bits * 4);
+        w2 = w3 >> bits;
+        w1 = w2 >> bits;
+        w0 = w1 >> bits;
+    }
+    if constexpr (align == 8)
+    {
+        w7 = fshift(b, a, s2);
+        w6 = w7 >> bits;
+        w5 = w6 >> bits;
+        w4 = w5 >> bits;
+        w3 = w4 >> bits;
+        w2 = w3 >> bits;
+        w1 = w2 >> bits;
+        w0 = w1 >> bits;
+    }
+    half2 d0d1 = decode_3inst_2<cb>(w0 & 0xffff, w1 & 0xffff);
+    half2 d2d3 = decode_3inst_2<cb>(w2 & 0xffff, w3 & 0xffff);
+    half2 d4d5 = decode_3inst_2<cb>(w4 & 0xffff, w5 & 0xffff);
+    half2 d6d7 = decode_3inst_2<cb>(w6 & 0xffff, w7 & 0xffff);
+    frag0[0] = d0d1;
+    frag0[1] = d2d3;
+    frag1[0] = d4d5;
+    frag1[1] = d6d7;
+}
+
+template <int cb>
+__device__ __forceinline__ void dq8_aligned_2bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+{
+    uint32_t i0, i1, a, b, w0, w1, w2, w3, w4, w5, w6, w7;
+    i1 = t_offset >> 4;
+    i0 = (i1 + 15) & 15;
+    a = ptr[i0];
+    b = ptr[i1];
+    b = fshift(b, a, ((~t_offset) & 8) << 1);
+    w7 = b & 0xffff;
+    BFE16_IMM(w6, b, 2);
+    BFE16_IMM(w5, b, 4);
+    BFE16_IMM(w4, b, 6);
+    BFE16_IMM(w3, b, 8);
+    BFE16_IMM(w2, b, 10);
+    BFE16_IMM(w1, b, 12);
+    BFE16_IMM(w0, b, 14);
+    frag0[0] = decode_3inst_2<cb>(w0, w1);
+    frag0[1] = decode_3inst_2<cb>(w2, w3);
+    frag1[0] = decode_3inst_2<cb>(w4, w5);
+    frag1[1] = decode_3inst_2<cb>(w6, w7);
+}
+
+template <int bits, int cb>
+__device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB& frag0, FragB& frag1)
+{
+    static_assert((bits == 2 || bits == 3) && cb == 2, "x3 reconstruct supports K=2,3 mul1 only");
+    if constexpr (bits == 2)
+    {
+        dq8_aligned_2bits<cb>(ptr, idx, frag0, frag1);
+    }
+    else
+    {
+        dq8<bits, cb, 4>(ptr, idx, frag0, frag1);
+    }
+}
+
+__device__ inline half2 shuffle_had_h2x32(half2 v, int lane_id)
+{
+    for (int i = 1; i < 32; i <<= 1)
+    {
+        half2 pv = __shfl_xor_sync(0xffffffff, v, i);
+        uint32_t* vi = reinterpret_cast<uint32_t*>(&v);
+        int32_t sfm = -static_cast<int16_t>(lane_id & i) >> 31;
+        *vi ^= (sfm & 0x80008000);
+        v = __hadd2(v, pv);
+    }
+    return v;
+}
+
+// Fused reconstruct + both-side Hadamard: emits W = diag(suh) . H128 . W_hat . H128 . diag(svh)
+// (per 128x128 tile, 1/sqrt(128) per side), i.e. ORIGINAL-basis weights. See reconstruct.cu.
+#define RH_THREADS 256
+
+template <int K, int cb>
+__global__ __launch_bounds__(RH_THREADS)
+void reconstruct_had_kernel
+(
+    half* __restrict__ g_unpacked,
+    const uint16_t* __restrict__ g_packed,
+    const half* __restrict__ suh,
+    const half* __restrict__ svh,
+    int packed_blocks_n,
+    int packed_n_offset
+)
+{
+    constexpr int packed_size = 256 * K / 16;
+    constexpr float r_scale = 0.08838834764831845f;
+
+    int t = threadIdx.x;
+    int lane_id = t % 32;
+    int warp_id = t / 32;
+    int kb = blockIdx.y;
+    int nb = blockIdx.x;
+    int n = nb * 8;
+    int row_len = gridDim.x * 128;
+
+    __shared__ uint32_t s_packed[8][8][packed_size / 2];
+    __shared__ half2 stile[128 * 64];
+
+    auto tix = [&] (int R, int q, int p)
+    {
+        return R * 64 + (q ^ ((R >> 2) & 31)) * 2 + p;
+    };
+
+    constexpr int j_int4 = packed_size / 8;
+    for (int u = t; u < 8 * 8 * j_int4; u += RH_THREADS)
+    {
+        int j = u / (8 * j_int4);
+        int r = u % (8 * j_int4);
+        const uint16_t* gp = g_packed +
+            ((size_t) ((kb * 8 + j) * packed_blocks_n + packed_n_offset + n)) * packed_size;
+        ((int4*) s_packed[j])[r] = ((const int4*) gp)[r];
+    }
+    __syncthreads();
+
+    for (int jj = 0; jj < 8 * 8 / (RH_THREADS / 32); ++jj)
+    {
+        int j = (warp_id / 8) * (8 / (RH_THREADS / 256)) + jj;
+        int wn = warp_id % 8;
+        register FragB frag[2];
+        dq_dispatch<K, cb>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
+
+        half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
+        half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
+        half2 n2 = __shfl_down_sync(0xFFFFFFFF, frag[1][0], 4, 32);
+        half2 n3 = __shfl_down_sync(0xFFFFFFFF, frag[1][1], 4, 32);
+
+        if (!(lane_id & 4))
+        {
+            half2 m0 = __halves2half2(__low2half(frag[0][0]), __low2half(n0));
+            half2 m1 = __halves2half2(__high2half(frag[0][0]), __high2half(n0));
+            half2 m2 = __halves2half2(__low2half(frag[0][1]), __low2half(n1));
+            half2 m3 = __halves2half2(__high2half(frag[0][1]), __high2half(n1));
+            half2 m4 = __halves2half2(__low2half(frag[1][0]), __low2half(n2));
+            half2 m5 = __halves2half2(__high2half(frag[1][0]), __high2half(n2));
+            half2 m6 = __halves2half2(__low2half(frag[1][1]), __low2half(n3));
+            half2 m7 = __halves2half2(__high2half(frag[1][1]), __high2half(n3));
+            int r0 = j * 16 + (lane_id % 4) * 2;
+            int r1 = r0 + 1;
+            int r2 = r0 + 8;
+            int r3 = r0 + 9;
+            int c0 = lane_id / 8;
+            int q0 = (wn * 8 + c0) >> 1, p0 = c0 & 1;
+            int q1 = (wn * 8 + c0 + 4) >> 1, p1 = c0 & 1;
+            stile[tix(r0, q0, p0)] = m0;
+            stile[tix(r1, q0, p0)] = m1;
+            stile[tix(r2, q0, p0)] = m2;
+            stile[tix(r3, q0, p0)] = m3;
+            stile[tix(r0, q1, p1)] = m4;
+            stile[tix(r1, q1, p1)] = m5;
+            stile[tix(r2, q1, p1)] = m6;
+            stile[tix(r3, q1, p1)] = m7;
+        }
+    }
+    __syncthreads();
+
+    const half2 rs2 = __float2half2_rn(r_scale);
+    constexpr int CHUNKS_PW = 32 / (RH_THREADS / 32);
+    #pragma unroll
+    for (int qq = 0; qq < CHUNKS_PW; ++qq)
+    {
+        int q = warp_id * CHUNKS_PW + qq;
+        int qs = q ^ lane_id;
+        half2 a[4], b[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            half4 v = *((const half4*) (stile + (lane_id * 4 + i) * 64 + qs * 2));
+            a[i] = v.x;
+            b[i] = v.y;
+        }
+        #pragma unroll
+        for (int x = 0; x < 2; ++x)
+        {
+            half2* v = x == 0 ? a : b;
+            half2 s0 = __hadd2(v[0], v[1]), d0 = __hsub2(v[0], v[1]);
+            half2 s1 = __hadd2(v[2], v[3]), d1 = __hsub2(v[2], v[3]);
+            v[0] = __hmul2(__hadd2(s0, s1), rs2);
+            v[1] = __hmul2(__hadd2(d0, d1), rs2);
+            v[2] = __hmul2(__hsub2(s0, s1), rs2);
+            v[3] = __hmul2(__hsub2(d0, d1), rs2);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                v[i] = shuffle_had_h2x32(v[i], lane_id);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            half4 v;
+            v.x = a[i];
+            v.y = b[i];
+            *((half4*) (stile + (lane_id * 4 + i) * 64 + qs * 2)) = v;
+        }
+    }
+    __syncthreads();
+
+    constexpr int ROWS_PW = 128 / (RH_THREADS / 32);
+    const half4 sv4 = ((const half4*) svh)[nb * 32 + lane_id];
+    #pragma unroll
+    for (int rr = 0; rr < ROWS_PW; ++rr)
+    {
+        int R = warp_id * ROWS_PW + rr;
+        int base = R * 64 + (lane_id ^ ((R >> 2) & 31)) * 2;
+        half2 v01 = stile[base];
+        half2 v23 = stile[base + 1];
+        float v0 = __low2float(v01), v1 = __high2float(v01);
+        float v2 = __low2float(v23), v3 = __high2float(v23);
+        float s0 = v0 + v1, d0 = v0 - v1;
+        float s1 = v2 + v3, d1 = v2 - v3;
+        half2 h01 = __hmul2(__floats2half2_rn(s0 + s1, d0 + d1), rs2);
+        half2 h23 = __hmul2(__floats2half2_rn(s0 - s1, d0 - d1), rs2);
+        h01 = shuffle_had_h2x32(h01, lane_id);
+        h23 = shuffle_had_h2x32(h23, lane_id);
+        half2 su2 = __half2half2(suh[kb * 128 + R]);
+        half4 v;
+        v.x = __hmul2(__hmul2(h01, su2), sv4.x);
+        v.y = __hmul2(__hmul2(h23, su2), sv4.y);
+        *((half4*) (g_unpacked + (size_t) (kb * 128 + R) * row_len + nb * 128 + lane_id * 4)) = v;
+    }
+}
+
+// Host launcher: W is (n, m) row-major fp16 (ORIGINAL basis); T is the
+// (n//16, m//16, 16*bits) trellis; n and m must be multiples of 128.
+static void x3r_reconstruct_ws(half * W, const uint16_t * T,
+                               const half * suh, const half * svh,
+                               int n, int m, int bits, cudaStream_t stream)
+{
+    GGML_ASSERT(n % 128 == 0 && m % 128 == 0);
+    dim3 grid((m + 127) / 128, (n + 127) / 128);
+    if (bits == 2) {
+        reconstruct_had_kernel<2, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
+    } else {
+        reconstruct_had_kernel<3, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
+    }
+}
+
+} // namespace paw_x3
+
+void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    using namespace paw_x3;
+
+    const ggml_tensor * trellis = dst->src[0];
+    const ggml_tensor * suh     = dst->src[1];
+    const ggml_tensor * svh     = dst->src[2];
+    const ggml_tensor * x       = dst->src[3];
+
+    GGML_ASSERT(trellis->type == GGML_TYPE_I16);
+    GGML_ASSERT(suh->type == GGML_TYPE_F16);
+    GGML_ASSERT(svh->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(trellis) && ggml_is_contiguous(suh) &&
+                ggml_is_contiguous(svh) && ggml_is_contiguous(x) && ggml_is_contiguous(dst));
+
+    const int bits = (int) trellis->ne[0] / 16;   // words-per-tile = 16*K
+    GGML_ASSERT(bits == 2 || bits == 3);
+
+    const int n = (int) x->ne[0];
+    const int m = (int) dst->ne[0];
+    GGML_ASSERT((int64_t) trellis->ne[1] == (m / 16) * (n / 16));
+    const int64_t nt64 = x->ne[1] * x->ne[2] * x->ne[3];
+    GGML_ASSERT(nt64 <= INT_MAX);
+    const int nt = (int) nt64;
+
+    static bool sms_init = false;
+    if (!sms_init) {
+        g_num_sms = x3_num_sms();
+        sms_init = true;
+    }
+
+    cudaStream_t stream = ctx.stream();
+
+    // fp16 activation rows (the reference runtime feeds fp16 activations)
+    ggml_cuda_pool_alloc<half> xh(ctx.pool(), (size_t) n * nt);
+    x3_cast_f32_f16_kernel<<<((size_t) n * nt + 255) / 256, 256, 0, stream>>>(
+        (half *) xh.get(), (const float *) x->data, (int) ((size_t) n * nt));
+
+    // EXL3-style prefill switch: at nt >= GGML_PAW_X3_PREFILL_NT (default 16)
+    // reconstruct W once and run one batched hgemm instead of looping the
+    // single-row kernel per token. W is emitted in ORIGINAL basis (both
+    // Hadamards + suh/svh folded), so the hgemm runs on the raw rows.
+    static const int x3_prefill_nt = []() {
+        const char * e = getenv("GGML_PAW_X3_PREFILL_NT");
+        return e ? atoi(e) : 9;
+    }();
+    if (nt >= x3_prefill_nt) {
+        char shp[64];
+        snprintf(shp, sizeof(shp), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
+        paw_timed(stream, std::string("x3_hgemm") + shp, [&]() {
+            ggml_cuda_pool_alloc<half> wmat(ctx.pool(), (size_t) n * m);
+            x3r_reconstruct_ws(wmat.get(), (const uint16_t *) trellis->data,
+                               (const half *) suh->data, (const half *) svh->data,
+                               n, m, bits, stream);
+            // Y(nt,m) = X(nt,n) @ W(n,m), all row-major: column-major view is
+            // Y_col(m,nt) = W_col(m,n) @ X_col(n,nt) with identical bytes.
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasHandle_t h = ctx.cublas_handle();
+            CUBLAS_CHECK(cublasSetStream(h, stream));
+            cublasGemmAlgo_t algo = (m % 8 == 0 && n % 8 == 0 && nt % 8 == 0)
+                ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
+            CUBLAS_CHECK(cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                                      m, nt, n, &alpha,
+                                      wmat.get(), CUDA_R_16F, m,
+                                      xh.get(), CUDA_R_16F, n,
+                                      &beta, (float *) dst->data, CUDA_R_32F, m,
+                                      CUBLAS_COMPUTE_32F, algo));
+        });
+    } else {
+    // small-nt fused path: one launch over all nt rows (trellis read once).
+    // nt == 1 keeps the exact legacy single-row behavior.
+    GGML_ASSERT(nt <= SQ_M_MAX);
+    const SqPlan & plan = plan_sq(bits, n, m, nt);
+
+    // fixed-layout workspace: [counters | qsums | partials]. The counters must
+    // be zero at kernel start; they self-reset before return (graph-safe).
+    // partials scale with the fused batch: ksplit slices x nt rows x output cols.
+    // qsums needs 4 floats per (slice, row): 4*ksplit*nt must fit the
+    // reserved qsums region (4*SQ_KSPLIT_CAP*8 ints).
+    GGML_ASSERT((size_t) 4 * plan.ksplit * nt <= (size_t) 4 * SQ_KSPLIT_CAP * 8);
+    ggml_cuda_pool_alloc<int> ws(ctx.pool(), SQ_WS_RESERVED + (size_t) plan.ksplit * nt * m);
+
+    {
+        char shp[64];
+        snprintf(shp, sizeof(shp), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
+        paw_timed(stream, std::string("x3_sq") + shp, [&]() {
+            CUDA_CHECK(cudaMemsetAsync(ws.get(), 0, SQ_COUNTERS_CAP * sizeof(int), stream));
+            launch_sq(plan, bits, nt,
+                      (const half *) xh.get(),
+                      (const uint16_t *) trellis->data,
+                      (float *) dst->data,
+                      n, m,
+                      (const half *) suh->data, (const half *) svh->data,
+                      ws.get(), stream);
+        });
+    }
+    }
+
+    // debug: dump the I/O of the first calls for offline verification against
+    // the Phase-1 oracle (GGML_PAW_X3_DUMP=<dir>)
+    if (const char * dump_dir = getenv("GGML_PAW_X3_DUMP")) {
+        static int dump_count = 0;
+        static const int dump_skip = []() {
+            const char * e = getenv("GGML_PAW_X3_DUMP_SKIP");
+            return e ? atoi(e) : 0;
+        }();
+        static const int dump_cap = []() {
+            const char * e = getenv("GGML_PAW_X3_DUMP_CAP");
+            return e ? atoi(e) : 64;
+        }();
+        if (dump_count >= dump_skip && dump_count < dump_skip + dump_cap) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            char path[512];
+            snprintf(path, sizeof(path), "%s/dump%02d", dump_dir, dump_count - dump_skip);
+            FILE * fmeta = fopen((std::string(path) + "_meta.txt").c_str(), "w");
+            fprintf(fmeta, "n %d m %d K %d nt %d\n", n, m, bits, nt);
+            fclose(fmeta);
+            const size_t tbytes = (size_t) trellis->ne[0] * trellis->ne[1] * 2;
+            size_t hneed = (size_t) m * nt * sizeof(float);
+            if ((size_t) n * nt * sizeof(float) > hneed) hneed = (size_t) n * nt * sizeof(float);
+            if (tbytes > hneed) hneed = tbytes;
+            std::vector<char> host(hneed);
+            auto dump_dev = [&] (const std::string & suffix, const void * dev, size_t bytes) {
+                CUDA_CHECK(cudaMemcpy(host.data(), dev, bytes, cudaMemcpyDeviceToHost));
+                FILE * f = fopen((std::string(path) + suffix).c_str(), "wb");
+                fwrite(host.data(), 1, bytes, f);
+                fclose(f);
+            };
+            dump_dev("_A.f32", x->data, (size_t) n * nt * sizeof(float));
+            dump_dev("_Ah.u16", xh.get(), (size_t) n * nt * 2);
+            dump_dev("_B.u16", trellis->data, tbytes);
+            dump_dev("_suh.u16", suh->data, (size_t) n * 2);
+            dump_dev("_svh.u16", svh->data, (size_t) m * 2);
+            dump_dev("_y.f32", dst->data, (size_t) m * nt * sizeof(float));
+        }
+        ++dump_count;
+    }
+}
+
+// scoped macros from the ported section; do not leak into the rest of paw.cu
+#undef NUM_THREADS
+#undef GEMV_STAGE_D
+#undef SQ_KSPLIT_CAP
+#undef SQ_MINROWS
+#undef SQ_ROWS_MAX
+#undef SQ_COUNTERS_CAP
+#undef SQ_WS_RESERVED

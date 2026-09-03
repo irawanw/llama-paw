@@ -1184,7 +1184,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             // the codec kernels run on that backend), else fall back to the
             // LAST entry — the plain CPU type. Intermediate host entries can be
             // extra (repack) bufts whose supports_op veto rejects the paw ops.
-            const bool is_m1_sidecar = tn.suffix != nullptr && strncmp(tn.suffix, "m1_", 3) == 0;
+            const bool is_m1_sidecar = tn.suffix != nullptr &&
+                (strncmp(tn.suffix, "m1_", 3) == 0 || strncmp(tn.suffix, "m3_", 3) == 0);
             if (is_m1_sidecar) {
                 // note: a device-type check, not is_host — the CPU repack extra
                 // buft reports non-host and would repack (crash on) raw streams

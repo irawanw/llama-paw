@@ -25,29 +25,60 @@
 // hparams come verbatim from llama_model_qwen35moe::load_arch_hparams (the
 // exporter re-prefixes qwen35moe.* KVs to paw.*).
 
+// packed sidecar with shape taken from the GGUF metadata (kept/demoted
+// expert counts vary per layer, so shapes cannot be derived from hparams)
+ggml_tensor * llama_model_paw::m1_create(llama_model_loader & ml, const LLM_TN_IMPL & tnv, bool required) {
+    const std::string name = tnv.str();
+    ggml_tensor * meta = ml.get_tensor_meta(name.c_str());
+    if (meta == nullptr) {
+        if (!required) {
+            return nullptr;
+        }
+        throw std::runtime_error("paw: missing required tensor '" + name + "'");
+    }
+    switch (ggml_n_dims(meta)) {
+        case 1: return create_tensor(tnv, { meta->ne[0] }, 0);
+        case 2: return create_tensor(tnv, { meta->ne[0], meta->ne[1] }, 0);
+        case 3: return create_tensor(tnv, { meta->ne[0], meta->ne[1], meta->ne[2] }, 0);
+        default:
+            throw std::runtime_error("paw: unexpected rank for tensor '" + name + "'");
+    }
+}
+
+llama_model_paw::m1_ne llama_model_paw::m1_create_ne(llama_model_loader & ml, llm_tensor base, int il) {
+    m1_ne w;
+    if (m1_version >= 3) {
+        // rt (rotated int-lattice) and x3 (mul1-v1 rewrite) are co-optional:
+        // a full x3 checkpoint ships only m3_*, the mixed A/B file ships both
+        w.rt_trellis = m1_create(ml, tn(base, "m1_rt_trellis", il), false);
+        if (w.rt_trellis) {
+            w.rt_su = m1_create(ml, tn(base, "m1_rt_su", il), true);
+            w.rt_sv = m1_create(ml, tn(base, "m1_rt_sv", il), true);
+        }
+        w.x3_trellis = m1_create(ml, tn(base, "m3_trellis", il), false);
+        if (w.x3_trellis) {
+            w.x3_suh = m1_create(ml, tn(base, "m3_suh", il), true);
+            w.x3_svh = m1_create(ml, tn(base, "m3_svh", il), true);
+        }
+        if (!w.rt_trellis && !w.x3_trellis) {
+            throw std::runtime_error("paw: missing required tensor '" +
+                                     tn(base, "m1_rt_trellis", il).str() + "'");
+        }
+        return w;
+    }
+    w.packed = m1_create(ml, tn(base, "m1_packed", il), true);
+    w.gscale = m1_create(ml, tn(base, "m1_gscale", il), true);
+    w.lut    = m1_create(ml, tn(base, "m1_lut",    il), true);
+    return w;
+}
+
 void llama_model_paw::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     GGML_ASSERT(hparams.n_layer_nextn == 0 && "paw checkpoints do not ship the MTP head");
 
-    // packed sidecar with shape taken from the GGUF metadata (kept/demoted
-    // expert counts vary per layer, so shapes cannot be derived from hparams)
-    auto create_m1 = [&](const LLM_TN_IMPL & tnv, bool required) -> ggml_tensor * {
-        const std::string name = tnv.str();
-        ggml_tensor * meta = ml.get_tensor_meta(name.c_str());
-        if (meta == nullptr) {
-            if (!required) {
-                return nullptr;
-            }
-            throw std::runtime_error("paw: missing required tensor '" + name + "'");
-        }
-        switch (ggml_n_dims(meta)) {
-            case 1: return create_tensor(tnv, { meta->ne[0] }, 0);
-            case 2: return create_tensor(tnv, { meta->ne[0], meta->ne[1] }, 0);
-            case 3: return create_tensor(tnv, { meta->ne[0], meta->ne[1], meta->ne[2] }, 0);
-            default:
-                throw std::runtime_error("paw: unexpected rank for tensor '" + name + "'");
-        }
+    auto create_m1 = [&](const LLM_TN_IMPL & tnv, bool required) {
+        return m1_create(ml, tnv, required);
     };
     // payload version: 2 = QTIP V2 tiers, 3 = additive (V8 experts, rotated
     // NE spine, int5-g64 head, nibble-LUT embed)
@@ -55,38 +86,44 @@ void llama_model_paw::load_arch_tensors(llama_model_loader & ml) {
     if (!ml.get_key("paw.format_version", m1_version, false)) {
         ml.get_key("mach1.format_version", m1_version, false);
     }
+    // absent on every pre-dense checkpoint, which is exactly the 0 default
+    ml.get_key(LLM_KV_PAW_RHT_BLOCK, m1_rht_blk, false);
 
-    auto create_m1_ne = [&](llm_tensor base, int il) -> m1_ne {
-        m1_ne w;
-        if (m1_version >= 3) {
-            w.rt_trellis = create_m1(tn(base, "m1_rt_trellis", il), true);
-            w.rt_su      = create_m1(tn(base, "m1_rt_su",      il), true);
-            w.rt_sv      = create_m1(tn(base, "m1_rt_sv",      il), true);
-            return w;
-        }
-        w.packed = create_m1(tn(base, "m1_packed", il), true);
-        w.gscale = create_m1(tn(base, "m1_gscale", il), true);
-        w.lut    = create_m1(tn(base, "m1_lut",    il), true);
-        return w;
+    auto create_m1_ne = [&](llm_tensor base, int il) {
+        return m1_create_ne(ml, base, il);
     };
 
     m1_layers.resize(n_layer);
 
-    // global: shared expert trellis codebook + packed embedding + packed lm_head
-    m1_tlut = create_m1(tn(LLM_TENSOR_PAW_TLUT), true);
+    // global: shared expert trellis codebook + packed embedding + packed lm_head.
+    // A dense checkpoint has no V=8 expert tier and ships embed/head as stock
+    // k-quants (measured: q4_K and q5_K beat both PAW tiers on bits and error),
+    // so it wants only the NE table and the ordinary tok_embd/output tensors.
+    if (uses_paw_experts()) {
+        m1_tlut = create_m1(tn(LLM_TENSOR_PAW_TLUT), true);
+    }
 
     if (m1_version >= 3) {
-        m1_ne_tlut    = create_m1(tn(LLM_TENSOR_PAW_NE_TLUT), true);
-        m1_embed_codes = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_codes"), true);
-        m1_embed_lut   = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_lut"),   true);
+        m1_ne_tlut = create_m1(tn(LLM_TENSOR_PAW_NE_TLUT), true);
+    }
+
+    if (uses_paw_embed()) {
+        if (m1_version >= 3) {
+            m1_embed_codes = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_codes"), true);
+            m1_embed_lut   = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_lut"),   true);
+        } else {
+            m1_embed_q  = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_q"),  true);
+            m1_embed_mn = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_mn"), true);
+            m1_embed_mx = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_mx"), true);
+        }
     } else {
-        m1_embed_q  = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_q"),  true);
-        m1_embed_mn = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_mn"), true);
-        m1_embed_mx = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_mx"), true);
+        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
     }
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    if (m1_version >= 3) {
+    if (!uses_paw_head()) {
+        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, 0);
+    } else if (m1_version >= 3) {
         m1_head_qp     = create_m1(tn(LLM_TENSOR_OUTPUT, "m1_qp"),     true);
         m1_head_gscale = create_m1(tn(LLM_TENSOR_OUTPUT, "m1_gscale"), true);
     } else {
@@ -102,7 +139,6 @@ void llama_model_paw::load_arch_tensors(llama_model_loader & ml) {
         auto & layer = layers[il];
         auto & m1l   = m1_layers[il];
 
-        const int64_t n_ff_exp   = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
         const int64_t n_v_heads  = hparams.ssm_dt_rank;
         const int64_t head_v_dim = hparams.ssm_d_state;
         const int64_t key_dim    = hparams.ssm_d_state * hparams.ssm_n_group;
@@ -134,35 +170,44 @@ void llama_model_paw::load_arch_tensors(llama_model_loader & ml) {
             m1l.ssm_out   = create_m1_ne(LLM_TENSOR_SSM_OUT,   il);
         }
 
-        // router (dense)
-        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", il), { n_embd, n_expert }, 0);
-
-        if (m1_stock_experts) {
-            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
-            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
-            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
-        } else {
-            m1l.remap = create_m1(tn(LLM_TENSOR_FFN_GATE_INP, "m1_remap", il), true);
-            const llm_tensor exps[3] = { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_UP_EXPS, LLM_TENSOR_FFN_DOWN_EXPS };
-            for (int p = 0; p < 3; ++p) {
-                auto & e = m1l.exps[p];
-                e.kept_trellis = create_m1(tn(exps[p], "m1_kept_trellis", il), true);
-                e.dem_trellis  = create_m1(tn(exps[p], "m1_dem_trellis",  il), m1_version < 3);
-                e.su           = create_m1(tn(exps[p], "m1_su", il), true);
-                e.sv           = create_m1(tn(exps[p], "m1_sv", il), true);
-                e.basis_a      = create_m1(tn(exps[p], "m1_basis_a", il), false);
-                e.basis_b      = create_m1(tn(exps[p], "m1_basis_b", il), false);
-                e.basis_c      = create_m1(tn(exps[p], "m1_basis_c", il), false);
-                e.wave_gamma   = create_m1(tn(exps[p], "m1_wave_gamma", il), m1_version >= 3);
-            }
-        }
-
-        // shared expert (dense gate + packed projections)
-        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
-        m1l.gate_shexp = create_m1_ne(LLM_TENSOR_FFN_GATE_SHEXP, il);
-        m1l.up_shexp   = create_m1_ne(LLM_TENSOR_FFN_UP_SHEXP,   il);
-        m1l.down_shexp = create_m1_ne(LLM_TENSOR_FFN_DOWN_SHEXP, il);
+        load_arch_ffn_tensors(ml, il);
     }
+}
+
+void llama_model_paw::load_arch_ffn_tensors(llama_model_loader & ml, int il) {
+    LLAMA_LOAD_LOCALS;
+    auto & layer = layers[il];
+    auto & m1l   = m1_layers[il];
+    const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
+
+    // router (dense)
+    layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", il), { n_embd, n_expert }, 0);
+
+    if (m1_stock_experts) {
+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
+    } else {
+        m1l.remap = m1_create(ml, tn(LLM_TENSOR_FFN_GATE_INP, "m1_remap", il), true);
+        const llm_tensor exps[3] = { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_UP_EXPS, LLM_TENSOR_FFN_DOWN_EXPS };
+        for (int p = 0; p < 3; ++p) {
+            auto & e = m1l.exps[p];
+            e.kept_trellis = m1_create(ml, tn(exps[p], "m1_kept_trellis", il), true);
+            e.dem_trellis  = m1_create(ml, tn(exps[p], "m1_dem_trellis",  il), m1_version < 3);
+            e.su           = m1_create(ml, tn(exps[p], "m1_su", il), true);
+            e.sv           = m1_create(ml, tn(exps[p], "m1_sv", il), true);
+            e.basis_a      = m1_create(ml, tn(exps[p], "m1_basis_a", il), false);
+            e.basis_b      = m1_create(ml, tn(exps[p], "m1_basis_b", il), false);
+            e.basis_c      = m1_create(ml, tn(exps[p], "m1_basis_c", il), false);
+            e.wave_gamma   = m1_create(ml, tn(exps[p], "m1_wave_gamma", il), m1_version >= 3);
+        }
+    }
+
+    // shared expert (dense gate + packed projections)
+    layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
+    m1l.gate_shexp = m1_create_ne(ml, LLM_TENSOR_FFN_GATE_SHEXP, il);
+    m1l.up_shexp   = m1_create_ne(ml, LLM_TENSOR_FFN_UP_SHEXP,   il);
+    m1l.down_shexp = m1_create_ne(ml, LLM_TENSOR_FFN_DOWN_SHEXP, il);
 }
 
 std::unique_ptr<llm_graph_context> llama_model_paw::build_arch_graph(const llm_graph_params & params) const {
@@ -178,12 +223,22 @@ std::unique_ptr<llm_graph_context> llama_model_paw::build_arch_graph(const llm_g
 // stay diffable.
 // ---------------------------------------------------------------------------
 
+// Route decode (nt == 1) matmuls of x3-rewritten matrices through the fused
+// mul1-v1 GEMV (defined below; used by ne_mm).
+static bool paw_x3_on();
+
 ggml_tensor * llama_model_paw::graph::ne_mm(const m1_ne & w, ggml_tensor * x) {
     if (!ggml_is_contiguous(x)) {
         x = ggml_cont(ctx0, x);
     }
+    if (w.x3_trellis && paw_x3_on()) {
+        // fused mul1-v1 decode GEMV (H128 baked into the kernel); the sq
+        // kernel loops per token for nt > 1, so this handles prefill too
+        return ggml_paw_x3_mm(ctx0, w.x3_trellis, w.x3_suh, w.x3_svh, x);
+    }
     if (w.rt_trellis) {   // payload v3: rotated int-lattice spine
-        return ggml_paw_rt_mm(ctx0, w.rt_trellis, w.rt_su, w.rt_sv, model.m1_ne_tlut, x);
+        return ggml_paw_rt_mm(ctx0, w.rt_trellis, w.rt_su, w.rt_sv, model.m1_ne_tlut, x,
+                              (int) model.m1_rht_blk);
     }
     return ggml_paw_ne_mm(ctx0, w.packed, w.gscale, w.lut, x);
 }
@@ -229,18 +284,35 @@ static bool paw_rt_batch_site(int bit) {
 // runtime shape for routed experts.
 static bool paw_exp_batch2_on() {
     const char * v = paw_getenv("GGML_PAW_EXP_BATCH2");
-    return v != nullptr && atoi(v) != 0;
+    return v == nullptr || atoi(v) != 0;
 }
 
 // Fold the shared-expert sigmoid gate and residual add into the RT down
 // projection's output transform. Decode-only; prompt graphs stay unchanged.
 static bool paw_shared_epilogue_on() {
     const char * v = paw_getenv("GGML_PAW_SHARED_EPILOGUE");
-    return v != nullptr && atoi(v) != 0;
+    return v == nullptr || atoi(v) != 0;
 }
 
 static bool paw_shared_gate_dot_on() {
     const char * v = paw_getenv("GGML_PAW_SHARED_GATE_DOT");
+    return v == nullptr || atoi(v) != 0;
+}
+
+// Route decode (nt == 1) matmuls of x3-rewritten matrices through the fused
+// mul1-v1 GEMV. On by default when the GGUF carries m3_* tensors; GGML_PAW_X3=0
+// keeps the whole graph on the legacy rt path (same weights, A/B switch).
+static bool paw_x3_on() {
+    const char * v = paw_getenv("GGML_PAW_X3");
+    return v == nullptr || atoi(v) != 0;
+}
+
+// The legacy rt codec emits GDN V rows grouped by K head and needs the
+// grouped->tiled conversion.  The x3 payload is encoded from the parent GGUF
+// matrix whose outputs are already in PAW's tiled order, so active x3 must not
+// be converted again.  The environment override exists only for diagnosis.
+static bool paw_x3_v_reorder_on() {
+    const char * v = paw_getenv("GGML_PAW_X3_V_REORDER");
     return v != nullptr && atoi(v) != 0;
 }
 
@@ -250,7 +322,11 @@ static bool paw_shared_gate_dot_on() {
 // overhead. Bit-exact: the fused kernel accumulates in the same slot order.
 static bool paw_moe_reduce_on() {
     const char * v = paw_getenv("GGML_PAW_MOE_REDUCE");
-    return v != nullptr && atoi(v) != 0;
+    return v == nullptr || atoi(v) != 0;
+}
+
+bool llama_model_paw::graph::rt_batch_site(int bit) {
+    return paw_rt_batch_site(bit);
 }
 
 ggml_tensor * llama_model_paw::graph::ne_mm_batch(
@@ -265,7 +341,8 @@ ggml_tensor * llama_model_paw::graph::ne_mm_batch(
         su[i]      = ws[i].rt_su;
         sv[i]      = ws[i].rt_sv;
     }
-    return ggml_paw_rt_mm_batch(ctx0, n_matrices, trellis, su, sv, model.m1_ne_tlut, x);
+    return ggml_paw_rt_mm_batch(ctx0, n_matrices, trellis, su, sv, model.m1_ne_tlut, x,
+                                (int) model.m1_rht_blk);
 }
 
 // grouped -> tiled V-head row reorder on an activation vector segment
@@ -304,7 +381,10 @@ ggml_tensor * llama_model_paw::graph::build_inp_embd_paw() {
     std::array<ggml_tensor *, 2> inps;
     inps[0] = model.m1_embed_codes
         ? ggml_paw_embed_gather(ctx0, model.m1_embed_codes, model.m1_embed_lut, inp->tokens)
-        : ggml_paw_embed_rows(ctx0, model.m1_embed_q, model.m1_embed_mn, model.m1_embed_mx, inp->tokens);
+        : model.m1_embed_q
+        ? ggml_paw_embed_rows(ctx0, model.m1_embed_q, model.m1_embed_mn, model.m1_embed_mx, inp->tokens)
+        // stock k-quant embedding (paw-dense): ordinary row gather
+        : ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
     inps[1] = inp->embd;
 
     GGML_ASSERT(ggml_are_same_shape(inps[0], inps[1]));
@@ -317,8 +397,17 @@ ggml_tensor * llama_model_paw::graph::build_inp_embd_paw() {
     return cur;
 }
 
-llama_model_paw::graph::graph(const llama_model_paw & model, const llm_graph_params & params) :
+llama_model_paw::graph::graph(const llama_model_paw & model, const llm_graph_params & params,
+                              defer_build_t) :
     llm_build_delta_net_base(params), model(model) {
+}
+
+llama_model_paw::graph::graph(const llama_model_paw & model, const llm_graph_params & params) :
+    graph(model, params, defer_build_t{}) {
+    build();
+}
+
+void llama_model_paw::graph::build() {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -398,8 +487,11 @@ llama_model_paw::graph::graph(const llama_model_paw & model, const llm_graph_par
             cur = ggml_cont(ctx0, cur);
         }
         cur = ggml_paw_head_mm(ctx0, model.m1_head_qp, model.m1_head_gscale, cur);
-    } else {
+    } else if (model.m1_output.packed) {
         cur = ne_mm(model.m1_output, cur);
+    } else {
+        // stock k-quant head (paw-dense)
+        cur = build_lora_mm(model.output, cur);
     }
 
     cb(cur, "result_output", -1);
@@ -418,7 +510,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_paw::graph::build_qkvz(
     ggml_tensor * z;
     bool rt_rows_mapped = false;
     if (paw_rt_batch_site(0) &&
-            model.m1_layers[il].wqkv.rt_trellis && model.m1_layers[il].wqkv_gate.rt_trellis) {
+            model.m1_layers[il].wqkv.rt_trellis && model.m1_layers[il].wqkv_gate.rt_trellis &&
+            !(model.m1_layers[il].wqkv.x3_trellis && model.m1_layers[il].wqkv_gate.x3_trellis)) {
         const m1_ne ws[2] = { model.m1_layers[il].wqkv, model.m1_layers[il].wqkv_gate };
         ggml_tensor * cat = ne_mm_batch(ws, 2, input);
         cat->op_params[8]  = 1;
@@ -440,23 +533,35 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_paw::graph::build_qkvz(
         qkv_mixed = ne_mm(model.m1_layers[il].wqkv, input);
         z         = ne_mm(model.m1_layers[il].wqkv_gate, input);
     }
-    if (model.m1_layers[il].wqkv.rt_trellis && !rt_rows_mapped) {
+    const bool qkv_x3_active = model.m1_layers[il].wqkv.x3_trellis && paw_x3_on();
+    const bool qkv_rt_active = model.m1_layers[il].wqkv.rt_trellis && !qkv_x3_active;
+    if ((qkv_rt_active || (qkv_x3_active && paw_x3_v_reorder_on())) &&
+            !rt_rows_mapped) {
         // v3: the grouped->tiled V-row reorder is not baked into the rotated
-        // codec, so permute the V segment of the output activations here
+        // codec (nor the x3 mul1 rewrite), so permute the V segment of the
+        // output activations here.
+        // One fused row-permutation launch replaces the old
+        // cont + cont + permute + concat chain (the head rows copy through).
         const int64_t key_dim = hparams.ssm_d_state * hparams.ssm_n_group;
         const int64_t val_dim = hparams.ssm_d_state * hparams.ssm_dt_rank;
         const int64_t T = qkv_mixed->ne[1];
-        ggml_tensor * qk = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_mixed, 2*key_dim, T,
-                                                        qkv_mixed->nb[1], 0));
-        ggml_tensor * v  = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_mixed, val_dim, T,
-                                                        qkv_mixed->nb[1], 2*key_dim*sizeof(float)));
-        qkv_mixed = ggml_concat(ctx0, qk, v_tiled(v), 0);
+        const int64_t hd = hparams.ssm_d_state;
+        const int64_t Kg = hparams.ssm_n_group;
+        const int64_t rv = hparams.ssm_dt_rank / Kg;
+        ggml_tensor * qkv_seg = ggml_view_2d(ctx0, qkv_mixed, 2*key_dim + val_dim, T,
+                                             qkv_mixed->nb[1], 0);
+        qkv_mixed = ggml_paw_v_reorder(ctx0, qkv_seg, (int)(2*key_dim), (int)hd, (int)Kg, (int)rv);
     }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
-    if (model.m1_layers[il].wqkv_gate.rt_trellis && !rt_rows_mapped) {
-        z = v_tiled(z);   // v3: same reorder on the z gate rows
+    const bool z_x3_active = model.m1_layers[il].wqkv_gate.x3_trellis && paw_x3_on();
+    const bool z_rt_active = model.m1_layers[il].wqkv_gate.rt_trellis && !z_x3_active;
+    if ((z_rt_active || (z_x3_active && paw_x3_v_reorder_on())) &&
+            !rt_rows_mapped) {
+        z = ggml_paw_v_reorder(ctx0, z, 0,
+                (int) hparams.ssm_d_state, (int) hparams.ssm_n_group,
+                (int)(hparams.ssm_dt_rank / hparams.ssm_n_group));   // v3: same reorder on the z gate rows
     }
     cb(z, "z", il);
 
@@ -489,7 +594,10 @@ ggml_tensor * llama_model_paw::graph::build_layer_attn(
     if (paw_rt_batch_site(1) &&
             model.m1_layers[il].wq.rt_trellis &&
             model.m1_layers[il].wk.rt_trellis &&
-            model.m1_layers[il].wv.rt_trellis) {
+            model.m1_layers[il].wv.rt_trellis &&
+            !(model.m1_layers[il].wq.x3_trellis &&
+              model.m1_layers[il].wk.x3_trellis &&
+              model.m1_layers[il].wv.x3_trellis)) {
         const m1_ne ws[3] = { model.m1_layers[il].wq, model.m1_layers[il].wk, model.m1_layers[il].wv };
         ggml_tensor * cat = ne_mm_batch(ws, 3, cur);
         ggml_build_forward_expand(gf, cat);
@@ -594,15 +702,40 @@ ggml_tensor * llama_model_paw::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    // alpha and beta share the input and shape; one fused launch instead of
+    // two tiny GEMV launches per layer (60 -> 30 launches per decode token).
+    // The halves are addressed as strided views of the packed [2R, T] output
+    // (a plain view_2d slice would be non-contiguous in the row dimension).
+    // decode-only: the fused kernel stages x in shared per block, which does
+    // not pay off at prefill widths (measured pp regression)
+    // the fused kernel stages x in fixed shared arrays of 4096 floats and
+    // pays off only at decode widths (measured pp regression at prefill)
+    const bool dual_ab = model.layers[il].ssm_beta_s == nullptr &&
+                         model.layers[il].ssm_alpha_s == nullptr &&
+                         ggml_is_contiguous(cur) &&
+                         ubatch.n_tokens == 1 &&
+                         cur->ne[0] <= 4096;
+    ggml_tensor * alpha = nullptr;
+    ggml_tensor * beta  = nullptr;
+    if (dual_ab) {
+        ggml_tensor * ba = ggml_paw_dual_mm(ctx0,
+                model.layers[il].ssm_alpha, model.layers[il].ssm_beta, cur);
+        alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_seq_tokens, n_seqs,
+                             ba->nb[0], ba->nb[1], 0);
+        beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
+                             ba->nb[0], ba->nb[1], ba->nb[1]*cur->ne[1],
+                             num_v_heads*sizeof(float));
+    } else {
+        beta  = build_lora_mm(model.layers[il].ssm_beta,  cur, model.layers[il].ssm_beta_s);
+        beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+        alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+    }
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
@@ -681,13 +814,15 @@ ggml_tensor * llama_model_paw::graph::build_layer_attn_linear(
 
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    // The packed ssm_out stream keeps the HF column order, where V heads are
-    // GROUPED by K head; the graph runs in ggml's TILED order (the exporter
-    // row-reorders every other v-indexed tensor). A trellis stream's columns
-    // cannot be permuted at export, so convert the activations tiled->grouped
-    // here: heads [hd, r*K (k fastest)] -> [hd, K*r (v fastest)].
+    // The legacy rt ssm_out stream keeps the HF input-column order, where V
+    // heads are GROUPED by K head, while the graph runs internally TILED.
+    // The x3/mul1 rewrite has already moved those input channels into PAW's
+    // tiled basis (verified by the reconstructed-weight permutation audit),
+    // so applying this conversion to an active x3 stream would permute it a
+    // second time and corrupt the recurrent residual.
     ggml_tensor * final_output;
-    if (num_k_heads != num_v_heads) {
+    const bool out_x3_active = model.m1_layers[il].ssm_out.x3_trellis && paw_x3_on();
+    if (num_k_heads != num_v_heads && !out_x3_active) {
         const int64_t r = num_v_heads / num_k_heads;
         ggml_tensor * t = ggml_reshape_4d(ctx0, attn_out_norm, head_v_dim, num_k_heads, r, n_seq_tokens*n_seqs);
         t = ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3));   // [hd, r, K, T]
@@ -741,7 +876,9 @@ ggml_tensor * llama_model_paw::graph::build_layer_ffn(ggml_tensor * cur, const i
         ggml_tensor * probs = ggml_soft_max(ctx0, logits);
         cb(probs, "ffn_moe_probs", il);
 
-        ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, probs, n_expert_used); // [n_expert_used, n_tokens]
+        // partial top-k (GGML_OP_TOP_K) instead of a full 256-wide argsort:
+        // the routing only needs the n_expert_used best ids
+        ggml_tensor * selected_experts = ggml_top_k(ctx0, probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts, "ffn_moe_topk", il);
 
         ggml_tensor * weights = ggml_get_rows(ctx0,
@@ -878,17 +1015,20 @@ ggml_tensor * llama_model_paw::graph::build_layer_ffn(ggml_tensor * cur, const i
     }
     ggml_tensor * shared_inp = ggml_mul(ctx0, ggml_silu(ctx0, g), u);
     if (paw_shared_epilogue_on() && n_tokens == 1 &&
-            model.m1_layers[il].down_shexp.rt_trellis) {
+            model.m1_layers[il].down_shexp.rt_trellis &&
+            !model.m1_layers[il].down_shexp.x3_trellis) {
         const m1_ne & w = model.m1_layers[il].down_shexp;
         if (paw_shared_gate_dot_on()) {
             cur = ggml_paw_rt_mm_epilogue_dot(ctx0, w.rt_trellis, w.rt_su, w.rt_sv,
                     model.m1_ne_tlut, shared_inp,
-                    model.layers[il].ffn_gate_inp_shexp, cur, moe_out);
+                    model.layers[il].ffn_gate_inp_shexp, cur, moe_out,
+                    (int) model.m1_rht_blk);
         } else {
             ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
             cb(shared_gate, "shared_expert_gate", il);
             cur = ggml_paw_rt_mm_epilogue(ctx0, w.rt_trellis, w.rt_su, w.rt_sv,
-                                            model.m1_ne_tlut, shared_inp, shared_gate, moe_out);
+                                            model.m1_ne_tlut, shared_inp, shared_gate, moe_out,
+                                            (int) model.m1_rht_blk);
         }
     } else {
         ggml_tensor * ffn_shexp = ne_mm(model.m1_layers[il].down_shexp, shared_inp);
