@@ -24,6 +24,19 @@ What this fork adds on top: fused and batched codec kernels (worth **+35%**
 end to end, output-identical), DFlash speculative-decoding support for packed
 embeddings and head, and a multi-token vocabulary head.
 
+Additional projects that informed the codec and runtime work:
+
+- [ExLlamaV3](https://github.com/turboderp-org/exllamav3), including its EXL3
+  format and reference quantization/inference implementation.
+- [EschaLabs Qwen3.8-27B Escha-W2](https://huggingface.co/EschaLabs/Qwen3.8-27B-Escha-W2),
+  a related packed-weight reference artifact.
+- [SyzygyResearch’s llama.cpp-mach1](https://github.com/SyzygyResearch/llama.cpp-mach1)
+  and the [SyzygyResearch organization](https://github.com/SyzygyResearch),
+  whose Mach-1 work established the PAW codec lineage noted above.
+- [PrismML Bonsai](https://github.com/PrismML-Eng/Bonsai-demo) and its
+  [llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp), for the Bonsai
+  model and runtime work.
+
 ## Quick start
 
 ```sh
