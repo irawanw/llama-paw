@@ -9168,7 +9168,23 @@ __device__ __forceinline__ void ext8w
     uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7
 )
 {
-    if constexpr (bits == 2)
+    if constexpr (bits == 1)
+    {
+        uint32_t i1 = t0 >> 5;
+        uint32_t i0 = (i1 + 7) & 7;
+        uint32_t a = ptr[i0];
+        uint32_t b = ptr[i1];
+        b = fshift(b, a, ((~t0) & 24));
+        w7 = b & 0xffff;
+        BFE16_IMM(w6, b, 1);
+        BFE16_IMM(w5, b, 2);
+        BFE16_IMM(w4, b, 3);
+        BFE16_IMM(w3, b, 4);
+        BFE16_IMM(w2, b, 5);
+        BFE16_IMM(w1, b, 6);
+        BFE16_IMM(w0, b, 7);
+    }
+    else if constexpr (bits == 2)
     {
         uint32_t i1 = t0 >> 4;
         uint32_t i0 = (i1 + 15) & 15;
@@ -9204,6 +9220,23 @@ __device__ __forceinline__ void ext8w
         w0 = w1 >> bits;
         w7 &= 0xffff; w6 &= 0xffff; w5 &= 0xffff; w4 &= 0xffff;
         w3 &= 0xffff; w2 &= 0xffff; w1 &= 0xffff; w0 &= 0xffff;
+    }
+    else if constexpr (bits == 4)
+    {
+        uint32_t i1 = t0 >> 3;
+        uint32_t i0 = (i1 + 31) & 31;
+        uint32_t a = ptr[i0];
+        uint32_t b = ptr[i1];
+        uint32_t s;
+        FSHF_IMM(s, b, a, 20);
+        w7 = b & 0xffff;
+        BFE16_IMM(w6, b, 4);
+        BFE16_IMM(w5, b, 8);
+        BFE16_IMM(w4, b, 12);
+        BFE16_IMM(w3, b, 16);
+        w2 = s & 0xffff;
+        BFE16_IMM(w1, s, 4);
+        BFE16_IMM(w0, s, 8);
     }
 }
 
@@ -9763,7 +9796,29 @@ static const SqPlan & plan_sq(int bits, int size_k, int size_n, int M)
     };
 
     SqPlan plan;
-    if (bits == 2) {
+    if (bits == 1) {
+        switch (M) {
+            case 1: plan.fn = sq_kernel_fn<1, 1, true>(); break;
+            case 2: plan.fn = sq_kernel_fn<1, 2, true>(); break;
+            case 3: plan.fn = sq_kernel_fn<1, 3, true>(); break;
+            case 4: plan.fn = sq_kernel_fn<1, 4, true>(); break;
+            case 5: plan.fn = sq_kernel_fn<1, 5, true>(); break;
+            case 6: plan.fn = sq_kernel_fn<1, 6, true>(); break;
+            case 7: plan.fn = sq_kernel_fn<1, 7, true>(); break;
+            default: plan.fn = sq_kernel_fn<1, 8, true>(); break;
+        }
+    } else if (bits == 4) {
+        switch (M) {
+            case 1: plan.fn = sq_kernel_fn<4, 1, true>(); break;
+            case 2: plan.fn = sq_kernel_fn<4, 2, true>(); break;
+            case 3: plan.fn = sq_kernel_fn<4, 3, true>(); break;
+            case 4: plan.fn = sq_kernel_fn<4, 4, true>(); break;
+            case 5: plan.fn = sq_kernel_fn<4, 5, true>(); break;
+            case 6: plan.fn = sq_kernel_fn<4, 6, true>(); break;
+            case 7: plan.fn = sq_kernel_fn<4, 7, true>(); break;
+            default: plan.fn = sq_kernel_fn<4, 8, true>(); break;
+        }
+    } else if (bits == 2) {
         switch (M) {
             case 1: plan.fn = sq_kernel_fn<2, 1, true>(); break;
             case 2: plan.fn = sq_kernel_fn<2, 2, true>(); break;
@@ -9973,13 +10028,72 @@ __device__ __forceinline__ void dq8_aligned_2bits(const uint32_t* ptr, int t_off
     frag1[1] = decode_3inst_2<cb>(w6, w7);
 }
 
+// K=4 and K=1 use their own aligned extractors, NOT dq8<bits,cb,4>: at 4 bits
+// the 8 values span 32 stream bits, which straddles three 32-bit words at the
+// offsets the generic path loads only two of. Ported verbatim from
+// exllamav3 quant/exl3_dq.cuh (dq8_aligned_4bits, dq8_aligned_1bit).
+template <int cb>
+__device__ __forceinline__ void dq8_aligned_4bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+{
+    uint32_t i0, i1, a, b, s, w0, w1, w2, w3, w4, w5, w6, w7;
+    i1 = t_offset >> 3;
+    i0 = (i1 + 31) & 31;
+    a = ptr[i0];
+    b = ptr[i1];
+    FSHF_IMM(s, b, a, 20);
+    w7 = b & 0xffff;
+    BFE16_IMM(w6, b, 4);
+    BFE16_IMM(w5, b, 8);
+    BFE16_IMM(w4, b, 12);
+    BFE16_IMM(w3, b, 16);
+    w2 = s & 0xffff;
+    BFE16_IMM(w1, s, 4);
+    BFE16_IMM(w0, s, 8);
+    frag0[0] = decode_3inst_2<cb>(w0, w1);
+    frag0[1] = decode_3inst_2<cb>(w2, w3);
+    frag1[0] = decode_3inst_2<cb>(w4, w5);
+    frag1[1] = decode_3inst_2<cb>(w6, w7);
+}
+
+template <int cb>
+__device__ __forceinline__ void dq8_aligned_1bit(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+{
+    uint32_t i0, i1, a, b, w0, w1, w2, w3, w4, w5, w6, w7;
+    i1 = t_offset >> 5;
+    i0 = (i1 + 7) & 7;
+    a = ptr[i0];
+    b = ptr[i1];
+    b = fshift(b, a, ((~t_offset) & 24));
+    w7 = b & 0xffff;
+    BFE16_IMM(w6, b, 1);
+    BFE16_IMM(w5, b, 2);
+    BFE16_IMM(w4, b, 3);
+    BFE16_IMM(w3, b, 4);
+    BFE16_IMM(w2, b, 5);
+    BFE16_IMM(w1, b, 6);
+    BFE16_IMM(w0, b, 7);
+    frag0[0] = decode_3inst_2<cb>(w0, w1);
+    frag0[1] = decode_3inst_2<cb>(w2, w3);
+    frag1[0] = decode_3inst_2<cb>(w4, w5);
+    frag1[1] = decode_3inst_2<cb>(w6, w7);
+}
+
 template <int bits, int cb>
 __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB& frag0, FragB& frag1)
 {
-    static_assert((bits == 2 || bits == 3) && cb == 2, "x3 reconstruct supports K=2,3 mul1 only");
-    if constexpr (bits == 2)
+    static_assert((bits == 1 || bits == 2 || bits == 3 || bits == 4) && cb == 2,
+                  "x3 reconstruct supports K=1,2,3,4 mul1 only");
+    if constexpr (bits == 1)
+    {
+        dq8_aligned_1bit<cb>(ptr, idx, frag0, frag1);
+    }
+    else if constexpr (bits == 2)
     {
         dq8_aligned_2bits<cb>(ptr, idx, frag0, frag1);
+    }
+    else if constexpr (bits == 4)
+    {
+        dq8_aligned_4bits<cb>(ptr, idx, frag0, frag1);
     }
     else
     {
@@ -10160,8 +10274,12 @@ static void x3r_reconstruct_ws(half * W, const uint16_t * T,
 {
     GGML_ASSERT(n % 128 == 0 && m % 128 == 0);
     dim3 grid((m + 127) / 128, (n + 127) / 128);
-    if (bits == 2) {
+    if (bits == 1) {
+        reconstruct_had_kernel<1, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
+    } else if (bits == 2) {
         reconstruct_had_kernel<2, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
+    } else if (bits == 4) {
+        reconstruct_had_kernel<4, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
     } else {
         reconstruct_had_kernel<3, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
     }
@@ -10186,7 +10304,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                 ggml_is_contiguous(svh) && ggml_is_contiguous(x) && ggml_is_contiguous(dst));
 
     const int bits = (int) trellis->ne[0] / 16;   // words-per-tile = 16*K
-    GGML_ASSERT(bits == 2 || bits == 3);
+    GGML_ASSERT(bits == 1 || bits == 2 || bits == 3 || bits == 4);
 
     const int n = (int) x->ne[0];
     const int m = (int) dst->ne[0];
