@@ -51,13 +51,14 @@ namespace paw_spec_time {
     }
     struct acc {
         double ckpt_save = 0, ckpt_load = 0, seq_rm = 0, sample = 0, dft_ckpt = 0, decode_tgt = 0;
+        double emit = 0;   // post-sample bookkeeping: detokenize + emit accepted tokens
         double t_round_prev = 0, round_wall = 0;
         int64_t n = 0;
         void report() {
-            const double tot = ckpt_save + ckpt_load + seq_rm + sample + dft_ckpt + decode_tgt;
-            LOG_INF("spec-host: %lld rounds | round %.3f | ckpt_save %.3f  ckpt_load %.3f  dft_ckpt %.3f  seq_rm %.3f  sample %.3f  decode_tgt %.3f  ms/round (sum %.3f)\n",
+            const double tot = ckpt_save + ckpt_load + seq_rm + sample + dft_ckpt + decode_tgt + emit;
+            LOG_INF("spec-host: %lld rounds | round %.3f | ckpt_save %.3f  ckpt_load %.3f  dft_ckpt %.3f  seq_rm %.3f  sample %.3f  decode_tgt %.3f  emit %.3f  ms/round (sum %.3f)\n",
                     (long long) n, round_wall / 1e3 / n, ckpt_save / 1e3 / n, ckpt_load / 1e3 / n,
-                    dft_ckpt / 1e3 / n, seq_rm / 1e3 / n, sample / 1e3 / n, decode_tgt / 1e3 / n, tot / 1e3 / n);
+                    dft_ckpt / 1e3 / n, seq_rm / 1e3 / n, sample / 1e3 / n, decode_tgt / 1e3 / n, emit / 1e3 / n, tot / 1e3 / n);
             (void) tot;
             *this = {};
         }
@@ -3918,6 +3919,8 @@ private:
                 slot.spec_draft = std::move(accepted);
             }
 
+            const double t_e0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
+
             const int64_t t_now = ggml_time_us();
 
             const auto ids = std::move(slot.spec_draft);
@@ -3967,6 +3970,8 @@ private:
                     return;
                 }
             }
+
+            if (paw_spec_time::on()) paw_spec_time::g.emit += paw_spec_time::us() - t_e0;
 
             slot.print_timings_tg();
 
