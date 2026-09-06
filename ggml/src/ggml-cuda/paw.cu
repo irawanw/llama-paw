@@ -10923,6 +10923,338 @@ void x3g_gemm_kernel(X3G_ARGS)
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------------------
+// Small-m GEMV path, ported from exllamav3 quant/exl3_gemv_kernel.cuh + quant/exl3_gemv.cu.
+// QTIP-style structure on the unmodified EXL3 trellis format:
+//
+//   * warps split k and never synchronize in the main loop -- no block-wide pipeline barriers;
+//     B streams straight to registers with ld.global.cs behind a register prefetch ring
+//   * the two-word bit windows are resolved in-warp by lane shuffles, so the kernel needs NO
+//     dynamic shared memory (only sh_red, ~16 KB static).  That is the whole point: x3g_gemm_kernel
+//     asks for 90 KB dynamic and gets 1 block/SM on sm_86; this gets 4-6.
+//   * one m16n8k16 MMA pair per 16x16 tile with fp16 accumulation, folded to fp32 on a cadence
+//
+// Same argument list as x3g_gemm_kernel, so the launch path is interchangeable.
+// CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention-projection sizes;
+// CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes.
+// MMODE 0 is the m == 1 fast path, MMODE 1 covers 2 <= m <= 8.
+
+#define X3V_MAX_M 8
+
+// mma.m16n8k16 with the A operand supplied as two FragB halves, fp16 accumulate
+__device__ __forceinline__ void x3v_mma_ab_h(const FragB & a01, const FragB & a23,
+                                             const FragB & b, X3G_FragCh & c)
+{
+    const uint32_t * a0 = reinterpret_cast<const uint32_t *>(&a01);
+    const uint32_t * a1 = reinterpret_cast<const uint32_t *>(&a23);
+    const uint32_t * bb = reinterpret_cast<const uint32_t *>(&b);
+    uint32_t * cc = reinterpret_cast<uint32_t *>(&c);
+    asm(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+        : "+r"(cc[0]), "+r"(cc[1])
+        :  "r"(a0[0]), "r"(a0[1]), "r"(a1[0]), "r"(a1[1]),
+           "r"(bb[0]), "r"(bb[1])
+    );
+}
+
+template <int cb>
+__device__ __forceinline__ void x3v_decode8(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3,
+                                            uint32_t w4, uint32_t w5, uint32_t w6, uint32_t w7,
+                                            FragB & f0, FragB & f1)
+{
+    // decode_3inst_2<2> is bit-identical to exllamav3's decode_pair_cb2_dp4a_
+    f0[0] = decode_3inst_2<cb>(w0, w1);
+    f0[1] = decode_3inst_2<cb>(w2, w3);
+    f1[0] = decode_3inst_2<cb>(w4, w5);
+    f1[1] = decode_3inst_2<cb>(w6, w7);
+}
+
+// Register forms of the dq8 window extraction: same word order as ext8w<bits>, but the two
+// source words arrive in registers (shuffled from a neighbour lane) rather than through smem.
+template <int cb>
+__device__ __forceinline__ void x3v_dq8_regs_4bits(uint32_t a, uint32_t b, FragB & f0, FragB & f1)
+{
+    uint32_t s, w0, w1, w2, w3, w4, w5, w6, w7;
+    FSHF_IMM(s, b, a, 20);
+    w7 = b & 0xffff;
+    BFE16_IMM(w6, b, 4);
+    BFE16_IMM(w5, b, 8);
+    BFE16_IMM(w4, b, 12);
+    BFE16_IMM(w3, b, 16);
+    w2 = s & 0xffff;
+    BFE16_IMM(w1, s, 4);
+    BFE16_IMM(w0, s, 8);
+    x3v_decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
+}
+
+template <int cb>
+__device__ __forceinline__ void x3v_dq8_regs_2bits(uint32_t a, uint32_t b, int t_offset,
+                                                   FragB & f0, FragB & f1)
+{
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    b = fshift(b, a, ((~t_offset) & 8) << 1);
+    w7 = b & 0xffff;
+    BFE16_IMM(w6, b, 2);
+    BFE16_IMM(w5, b, 4);
+    BFE16_IMM(w4, b, 6);
+    BFE16_IMM(w3, b, 8);
+    BFE16_IMM(w2, b, 10);
+    BFE16_IMM(w1, b, 12);
+    BFE16_IMM(w0, b, 14);
+    x3v_decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
+}
+
+template <int cb>
+__device__ __forceinline__ void x3v_dq8_regs_3bits(uint32_t a, uint32_t b, int s2,
+                                                   FragB & f0, FragB & f1)
+{
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    w7 = fshift(b, a, s2);
+    w6 = w7 >> 3;
+    w5 = w6 >> 3;
+    w4 = w5 >> 3;
+    w3 = fshift(b, a, s2 + 12);
+    w2 = w3 >> 3;
+    w1 = w2 >> 3;
+    w0 = w1 >> 3;
+    x3v_decode8<cb>(w0 & 0xffff, w1 & 0xffff, w2 & 0xffff, w3 & 0xffff,
+                    w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
+}
+
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG>
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256)
+void x3v_gemv_kernel(X3G_ARGS)
+{
+    static_assert(bits == 2 || bits == 3 || bits == 4, "x3v_gemv_kernel supports 2, 3 and 4 bpw");
+    namespace cg_ = cooperative_groups;
+
+    constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
+    constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
+    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
+    constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
+    constexpr int THREADS = WK * 32;
+    constexpr int ROWS = MMODE == 0 ? 1 : X3V_MAX_M;
+    constexpr int COLS = WNT * 16;
+
+    constexpr int TWORDS  = 8 * bits;                       // uint32 per 16x16 tile
+    constexpr int LOADS   = bits == 2 ? WNT / 2 : WNT;      // warp loads per k-slice
+    constexpr int LSTRIDE = bits == 3 ? 24 : 32;            // uint32 per load
+    static_assert(bits != 2 || WNT % 2 == 0, "2 bpw packs two tiles per warp load");
+
+    auto grid = cg_::this_grid();
+
+    // suh (input Hadamard scale) folded into A once, exactly as x3g_gemm_kernel does
+    {
+        int total_warps = size_m * size_k / 128;
+        int warps_grid = gridDim.x * blockDim.x / 32;
+        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+        for (; this_warp < total_warps; this_warp += warps_grid)
+            had_hf_r_128_inner<true, false>(A + this_warp * 128, A_had + this_warp * 128,
+                                            suh + (this_warp * 128) % size_k, 0.088388347648f);
+        grid.sync();
+        A = A_had;
+    }
+
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    const int ntiles     = size_n / 16;
+    const int kslices    = size_k / 16;
+    const int num_groups = size_n / COLS;
+
+    const int chunk = X3G_CEIL_DIVIDE(kslices, WK);
+    const int ks0   = warp * chunk;
+    const int myn   = max(0, min(chunk, kslices - ks0));
+
+    const uint32_t * B32 = (const uint32_t *) B;
+    const size_t slice_stride = (size_t) ntiles * TWORDS;
+    const half2 * A2 = (const half2 *) A;
+    const half2 hzero = __half2half2(__ushort_as_half(0));
+
+    // A fragment row indices for this lane
+    const int r0 = lane >> 2;
+    const size_t a_row0 = (size_t) r0 * (size_k / 2);
+    const bool r0_ok = MMODE == 0 ? lane < 4 : r0 < size_m;
+
+    // Per-lane extraction constants (mirror ext8w<bits>)
+    int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+    (void) x_s2;
+    if constexpr (bits == 2)
+    {
+        int i1 = lane >> 1;
+        x_src_b = i1;
+        x_src_a = (i1 + 15) & 15;
+    }
+    if constexpr (bits == 3)
+    {
+        int t_offset = lane << 3;
+        int b1 = (t_offset + 257) * 3;
+        int b2 = b1 + 21;
+        int i0 = (b1 - 16) / 32;
+        int i2 = (b2 - 1) / 32;
+        x_s2 = (i2 + 1) * 32 - b2;
+        x_src_a = i0 % 24;
+        x_src_b = i2 % 24;
+    }
+
+    __shared__ float sh_red[WK][ROWS][COLS];
+
+    for (int group = blockIdx.x; group < num_groups; group += gridDim.x)
+    {
+        const uint32_t * bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
+
+        auto ld_b = [&] (int i, int l) -> uint32_t
+        {
+            if constexpr (bits == 3)
+                return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0u;
+            else
+                return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+        };
+
+        uint32_t pf[PF][LOADS];
+        #pragma unroll
+        for (int d = 0; d < PF; ++d)
+            if (d < myn)
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l)
+                    pf[d][l] = ld_b(d, l);
+
+        X3G_FragCh ch[WNT][2] = {};
+        float2 acc0[WNT][2] = {};
+
+        for (int ib = 0; ib < myn; ib += PF)
+        {
+        #pragma unroll
+        for (int d = 0; d < PF; ++d)
+        {
+            const int i = ib + d;
+            if (i >= myn) break;
+
+            uint32_t bw[LOADS];
+            #pragma unroll
+            for (int l = 0; l < LOADS; ++l)
+                bw[l] = pf[d][l];
+
+            if (i + PF < myn)
+            {
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l)
+                    pf[d][l] = ld_b(i + PF, l);
+            }
+
+            // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
+            const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
+            FragB a01, a23;
+            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
+            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+            a01[1] = hzero;
+            a23[1] = hzero;
+
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+            {
+                FragB f0, f1;
+                if constexpr (bits == 4)
+                {
+                    uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
+                    x3v_dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
+                }
+                else if constexpr (bits == 2)
+                {
+                    // two tiles per loaded word group: tile t lives in lanes (t&1)*16 .. +15
+                    const uint32_t w = bw[t >> 1];
+                    const int base = (t & 1) << 4;
+                    uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
+                    uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
+                    x3v_dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
+                }
+                else  // bits == 3
+                {
+                    uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
+                    uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
+                    x3v_dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
+                }
+
+                x3v_mma_ab_h(a01, a23, f0, ch[t][0]);
+                x3v_mma_ab_h(a01, a23, f1, ch[t][1]);
+            }
+
+            if ((d + 1) % FOLD == 0 || i + 1 == myn)
+            {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int f = 0; f < 2; ++f)
+                    {
+                        acc0[t][f].x += __low2float(ch[t][f][0]);
+                        acc0[t][f].y += __high2float(ch[t][f][0]);
+                        ch[t][f][0] = hzero;
+                    }
+            }
+        }
+        }
+
+        // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
+        // tile*16 + frag*8 + 2*(l%4) (+1)
+        {
+            const int c0 = 2 * (lane & 3);
+            const bool store0 = MMODE == 0 ? lane < 4 : r0 < ROWS;
+            const int sr0 = MMODE == 0 ? 0 : r0;
+            if (store0)
+            {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int f = 0; f < 2; ++f)
+                    {
+                        const int col = t * 16 + f * 8 + c0;
+                        sh_red[warp][sr0][col + 0] = acc0[t][f].x;
+                        sh_red[warp][sr0][col + 1] = acc0[t][f].y;
+                    }
+            }
+        }
+        __syncthreads();
+
+        const int rows_out = MMODE == 0 ? 1 : min(size_m, ROWS);
+        for (int idx = threadIdx.x; idx < COLS * rows_out; idx += THREADS)
+        {
+            const int r = idx / COLS;
+            const int c = idx % COLS;
+            float sum = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < WK; ++j)
+                sum += sh_red[j][r][c];
+            const int col = group * COLS + c;
+            if constexpr (c_fp32) ((float *) C)[(size_t) r * size_n + col] = sum;
+            else                  ((half  *) C)[(size_t) r * size_n + col] = __float2half_rn(sum);
+        }
+        __syncthreads();
+    }
+
+    // svh (output Hadamard scale), same semantics as the GEMM epilogue
+    {
+        grid.sync();
+
+        int total_warps = size_m * size_n / 128;
+        int warps_grid = gridDim.x * blockDim.x / 32;
+        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+
+        for (; this_warp < total_warps; this_warp += warps_grid)
+        {
+            if constexpr (c_fp32)
+                had_ff_r_128_inner<false, true>(((const float *) C) + this_warp * 128,
+                                                ((float *) C) + this_warp * 128,
+                                                svh + (this_warp * 128) % size_n, 0.088388347648f);
+            else
+                had_hf_r_128_inner<false, true>(((const half *) C) + this_warp * 128,
+                                                ((half *) C) + this_warp * 128,
+                                                svh + (this_warp * 128) % size_n, 0.088388347648f);
+        }
+    }
+}
+
 // Shape table, mirrored from exllamav3 exl3_kernel_map.cuh (TILESIZE_M is always 16)
 //                                   TS_M  TS_K  TS_N  SH  FRAG
 #define X3G_SHAPE_1                    16,   16,  128,   6,   5
@@ -11041,6 +11373,112 @@ static const X3gPlan * plan_x3g(int bits, int size_k, int size_n)
     return res.first->second.fn ? &res.first->second : nullptr;
 }
 
+
+// Kernel table: [bits][mmode][cfg].  cb is always 2 (mul1) and C is always fp32 here.
+template <int bits, int mmode, int cfg>
+static inline fp_x3g_kernel x3v_kernel_of() { return x3v_gemv_kernel<bits, true, 2, mmode, cfg>; }
+
+static fp_x3g_kernel x3v_select_kernel(int bits, int mmode, int cfg)
+{
+    #define X3V_SEL(b_, m_, c_) if (bits == b_ && mmode == m_ && cfg == c_) return x3v_kernel_of<b_, m_, c_>();
+    X3V_SEL(2, 0, 0) X3V_SEL(2, 0, 1) X3V_SEL(2, 1, 0) X3V_SEL(2, 1, 1)
+    X3V_SEL(3, 0, 0) X3V_SEL(3, 0, 1) X3V_SEL(3, 1, 0) X3V_SEL(3, 1, 1)
+    X3V_SEL(4, 0, 0) X3V_SEL(4, 0, 1) X3V_SEL(4, 1, 0) X3V_SEL(4, 1, 1)
+    #undef X3V_SEL
+    return nullptr;
+}
+
+// GGML_PAW_X3_GEMV: 0 = off (default), 1 = exllamav3's Ampere heuristic,
+// 2 = take the path whenever eligible, 3 = force narrow, 4 = force wide.
+static int x3v_mode()
+{
+    static const int v = []() {
+        const char * e = getenv("GGML_PAW_X3_GEMV");
+        return e ? atoi(e) : 0;
+    }();
+    return v;
+}
+
+// exl3_gemv_cfg, restricted to cb == 2 (mul1) and Ampere.  Returns the config index or -1.
+static int x3v_cfg(int size_m, int size_k, int size_n, int bits, int mode, int narrow_coresident)
+{
+    if (mode == 0) return -1;
+    if (bits < 2 || bits > 4) return -1;
+    if (size_m > X3V_MAX_M) return -1;
+    if (size_k % 128 || size_n % 128) return -1;
+    if (mode == 2) return size_n <= 8192 ? 0 : 1;
+    if (mode == 3) return 0;
+    if (mode == 4) return 1;
+
+    // The narrow config wins whenever its grid fits in a single co-resident wave; in the
+    // 1..2-wave zone the trailing partial wave costs more than the kernel gains unless
+    // per-group work is small.  The wide config covers large-n with small-to-mid k.
+    if (bits == 2) return size_n <= 8192 ? 0 : 1;
+    if (size_n / 32 <= narrow_coresident) return 0;
+    if (size_k <= 2048 && size_n <= 8192) return 0;
+    if (bits == 3) return -1;
+    if (size_n >= 8192 && size_k <= 4096) return 1;
+    if (size_n >= 8192 && size_n <= 10240 && size_k <= 5120) return 1;
+    return -1;
+}
+
+// Returns true if the GEMV path was launched.
+static bool x3v_try_launch(const half * A, const uint16_t * B, float * C,
+                           int size_m, int size_k, int size_n,
+                           const half * suh, half * A_had, const half * svh,
+                           int bits, cudaStream_t stream)
+{
+    const int mode = x3v_mode();
+    if (mode == 0) return false;
+    if (bits < 2 || bits > 4) return false;
+    if (size_m > X3V_MAX_M) return false;
+    if (size_k % 128 || size_n % 128) return false;
+
+    const int mmode = size_m == 1 ? 0 : 1;
+
+    // Cooperative launch: grid capped at full co-residency (cached per kernel).  The narrow
+    // config's co-residency also feeds the shape heuristic, so resolve it first.
+    static std::map<const void *, int> occ_cache;
+    static std::mutex occ_mtx;
+    auto occupancy = [&](const void * fn, int block_dim) -> int {
+        std::lock_guard<std::mutex> lock(occ_mtx);
+        auto it = occ_cache.find(fn);
+        if (it != occ_cache.end()) return it->second;
+        int blocks_per_sm = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, fn, block_dim, 0));
+        occ_cache[fn] = blocks_per_sm;
+        return blocks_per_sm;
+    };
+
+    fp_x3g_kernel narrow = x3v_select_kernel(bits, mmode, 0);
+    if (!narrow) return false;
+    const int narrow_coresident = occupancy((const void *) narrow, 512) * g_num_sms;
+
+    const int cfg = x3v_cfg(size_m, size_k, size_n, bits, mode, narrow_coresident);
+    if (cfg < 0) return false;
+
+    fp_x3g_kernel fn = cfg == 0 ? narrow : x3v_select_kernel(bits, mmode, cfg);
+    if (!fn) return false;
+
+    const int block_dim = cfg == 0 ? 512 : 256;
+    const int cols      = cfg == 0 ? 32  : 64;
+
+    const int max_blocks = occupancy((const void *) fn, block_dim) * g_num_sms;
+    const int grid = X3G_MIN(size_n / cols, max_blocks);
+    if (grid < 1) return false;
+
+    int * locks = nullptr;   // unused by the GEMV path, but kept in the arg list
+    void * Cv = (void *) C;
+    void * args[] = {
+        (void *) &A, (void *) &B, (void *) &Cv,
+        (void *) &size_m, (void *) &size_k, (void *) &size_n,
+        (void *) &locks, (void *) &suh, (void *) &A_had, (void *) &svh
+    };
+    CUDA_CHECK(cudaLaunchCooperativeKernel((const void *) fn, dim3(grid), dim3(block_dim),
+                                           args, 0, stream));
+    return true;
+}
+
 static void launch_x3g(const X3gPlan & plan,
                        const half * A, const uint16_t * B, float * C,
                        int size_m, int size_k, int size_n,
@@ -11129,6 +11567,25 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     }();
     const X3gPlan * gplan = (x3_gemm_nt > 0 && nt >= x3_gemm_nt && nt <= x3_gemm_nt_max)
                           ? plan_x3g(bits, n, m) : nullptr;
+
+    // Small-m GEMV path, ported from exllamav3 exl3_gemv and tried before the GEMM exactly
+    // as exl3_gemm does.  Uses no dynamic shared memory, so it gets 4-6 blocks/SM against the
+    // GEMM's 1.  Gated OFF by default: GGML_PAW_X3_GEMV=1 enables their Ampere heuristic.
+    if (x3v_mode() != 0 && nt <= X3V_MAX_M) {
+        char shpv[64];
+        snprintf(shpv, sizeof(shpv), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
+        bool launched = false;
+        paw_timed(stream, std::string("x3_gemv") + shpv, [&]() {
+            ggml_cuda_pool_alloc<half> a_had(ctx.pool(), (size_t) n * nt);
+            launched = x3v_try_launch((const half *) xh.get(),
+                                      (const uint16_t *) trellis->data,
+                                      (float *) dst->data,
+                                      nt, n, m,
+                                      (const half *) suh->data, a_had.get(),
+                                      (const half *) svh->data, bits, stream);
+        });
+        if (launched) return;
+    }
 
     if (gplan) {
         char shp[64];
