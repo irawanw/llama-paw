@@ -11400,12 +11400,26 @@ static int x3v_mode()
 }
 
 // exl3_gemv_cfg, restricted to cb == 2 (mul1) and Ampere.  Returns the config index or -1.
+// Upper bound on size_n for the GEMV path.  The 248320-wide LM head is 14x larger than any
+// body tensor and measured slower through the GEMV than through the GEMM; capping keeps the
+// head on the GEMM.  0 disables the cap.
+static int x3v_nmax()
+{
+    static const int v = []() {
+        const char * e = getenv("GGML_PAW_X3_GEMV_NMAX");
+        return e ? atoi(e) : 0;
+    }();
+    return v;
+}
+
 static int x3v_cfg(int size_m, int size_k, int size_n, int bits, int mode, int narrow_coresident)
 {
     if (mode == 0) return -1;
     if (bits < 2 || bits > 4) return -1;
     if (size_m > X3V_MAX_M) return -1;
     if (size_k % 128 || size_n % 128) return -1;
+    const int nmax = x3v_nmax();
+    if (nmax > 0 && size_n > nmax) return -1;
     if (mode == 2) return size_n <= 8192 ? 0 : 1;
     if (mode == 3) return 0;
     if (mode == 4) return 1;
