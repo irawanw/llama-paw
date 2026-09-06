@@ -15,6 +15,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1000,6 +1001,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
                 block_size = std::atoi(buf);
+            }
+            // Must mirror the override applied in llama_model_dflash::load_arch_hparams --
+            // this clamp reads the raw metadata key, not hparams, so without this the model
+            // would run a wider block while n_max stayed clamped to the advertised one.
+            if (const char * env = std::getenv("GGML_DFLASH2_BLOCK_SIZE_OVERRIDE")) {
+                const int override_bs = std::atoi(env);
+                if (override_bs >= 3 && override_bs <= 64) {
+                    block_size = override_bs;
+                }
             }
         }
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);

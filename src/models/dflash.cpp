@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cstdlib>
+
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -12,6 +14,21 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
 
     ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,       hparams.dflash_block_size,       false);
+
+    // The block geometry is not a hard architectural limit: the encoder convolutions are
+    // local and the selector walks adjacent candidates, so a block wider than the trained
+    // one extrapolates. buun-llama-cpp measured anchor+12 (block 13) beating the released
+    // Qwen3.8 sidecar's advertised 8 on an RTX 3090. Opt-in here -- the default stays at
+    // whatever the checkpoint advertises until we have our own measurement.
+    if (const char * env = std::getenv("GGML_DFLASH2_BLOCK_SIZE_OVERRIDE")) {
+        const int override_bs = std::atoi(env);
+        if (override_bs < 3 || override_bs > 64) {
+            throw std::runtime_error("GGML_DFLASH2_BLOCK_SIZE_OVERRIDE must be between 3 and 64");
+        }
+        LLAMA_LOG_WARN("%s: overriding DFlash2 block size %u -> %d (experimental)\n",
+                __func__, hparams.dflash_block_size, override_bs);
+        hparams.dflash_block_size = (uint32_t) override_bs;
+    }
     ml.get_key(LLM_KV_DFLASH_CONV_KERNEL_SIZE, hparams.dflash_conv_kernel_size, false);
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
