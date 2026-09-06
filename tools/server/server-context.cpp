@@ -1,3 +1,4 @@
+#include <chrono>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -33,7 +34,36 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+
 #endif
+
+// GGML_PAW_SPEC_TIME=1: where the speculative round's host time goes. The
+// drafter lane accounts for ~1 ms/round (measured with the same env var in
+// common/speculative.cpp), so anything large here is the real overhead.
+namespace paw_spec_time {
+    static bool on() {
+        static const bool v = [] { const char * e = getenv("GGML_PAW_SPEC_TIME"); return e && atoi(e); }();
+        return v;
+    }
+    static double us() {
+        return (double) std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    struct acc {
+        double ckpt_save = 0, ckpt_load = 0, seq_rm = 0, sample = 0, dft_ckpt = 0, decode_tgt = 0;
+        double t_round_prev = 0, round_wall = 0;
+        int64_t n = 0;
+        void report() {
+            const double tot = ckpt_save + ckpt_load + seq_rm + sample + dft_ckpt + decode_tgt;
+            LOG_INF("spec-host: %lld rounds | round %.3f | ckpt_save %.3f  ckpt_load %.3f  dft_ckpt %.3f  seq_rm %.3f  sample %.3f  decode_tgt %.3f  ms/round (sum %.3f)\n",
+                    (long long) n, round_wall / 1e3 / n, ckpt_save / 1e3 / n, ckpt_load / 1e3 / n,
+                    dft_ckpt / 1e3 / n, seq_rm / 1e3 / n, sample / 1e3 / n, decode_tgt / 1e3 / n, tot / 1e3 / n);
+            (void) tot;
+            *this = {};
+        }
+    };
+    static acc g;
+}
 
 using json = nlohmann::ordered_json;
 
@@ -2995,10 +3025,14 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
+                    const double t_d0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (paw_spec_time::on()) paw_spec_time::g.dft_ckpt += paw_spec_time::us() - t_d0;
                 }
 
+                const double t_r0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                 common_context_seq_rm(ctx_dft, slot.id, ckpt.pos_max + 1, -1);
+                if (paw_spec_time::on()) paw_spec_time::g.seq_rm += paw_spec_time::us() - t_r0;
             }
 
             if (!draft.empty()) {
@@ -3012,7 +3046,9 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
+                    const double t_c0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (paw_spec_time::on()) paw_spec_time::g.ckpt_save += paw_spec_time::us() - t_c0;
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3024,7 +3060,9 @@ private:
                 }
 
                 if (use_ckpt_dft) {
+                    const double t_d1 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (paw_spec_time::on()) paw_spec_time::g.dft_ckpt += paw_spec_time::us() - t_d1;
                 }
             }
         });
@@ -3589,7 +3627,9 @@ private:
             n_empty_consecutive = 0;
         }
 
+        const double t_dec0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
         const int ret = llama_decode(ctx_tgt, batch_view);
+        if (paw_spec_time::on()) paw_spec_time::g.decode_tgt += paw_spec_time::us() - t_dec0;
 
         metrics.on_decoded(slots);
 
@@ -3812,7 +3852,18 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                const double t_s0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                if (paw_spec_time::on()) {
+                    paw_spec_time::g.sample += paw_spec_time::us() - t_s0;
+                    const double t_now_r = paw_spec_time::us();
+                    if (paw_spec_time::g.t_round_prev > 0) {
+                        paw_spec_time::g.round_wall += t_now_r - paw_spec_time::g.t_round_prev;
+                    }
+                    paw_spec_time::g.t_round_prev = t_now_r;
+                    paw_spec_time::g.n++;
+                    if (paw_spec_time::g.n >= 100) paw_spec_time::g.report();
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3838,7 +3889,9 @@ private:
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
                         {
+                            const double t_l0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                             ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            if (paw_spec_time::on()) paw_spec_time::g.ckpt_load += paw_spec_time::us() - t_l0;
 
                             common_context_seq_rm(slot.ctx_tgt, slot.id, ckpt.pos_max + 1, -1);
                         }

@@ -1,3 +1,4 @@
+#include <chrono>
 #include "speculative.h"
 
 #include "common.h"
@@ -930,6 +931,50 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
 
+    // GGML_PAW_SPEC_TIME=1: per-phase wall clock for the drafter lane. Each of
+    // the three phases below is a separate graph launch on ctx_dft with a host
+    // round trip around it; the split is what says which one is worth fusing.
+    struct phase_time {
+        double sync_us   = 0;   // llama_get_embeddings_layer_inp() -> ctx_tgt->synchronize()
+        double gather_us = 0;   // memcpy the tap rows into features_buf
+        double encode_us = 0;   // llama_encode(ctx_dft)  -- fc + hidden_norm
+        double inject_us = 0;   // llama_decode(ctx_dft)  -- KV-only write
+        double noise_us  = 0;   // llama_decode(ctx_dft)  -- the actual draft
+        double sel_us    = 0;   // selector lattice sync + walk
+        int64_t n_process = 0;
+        int64_t n_draft   = 0;
+    } tm;
+
+    static bool spec_time_on() {
+        static const bool on = [] { const char * e = getenv("GGML_PAW_SPEC_TIME"); return e && atoi(e); }();
+        return on;
+    }
+    static double now_us() {
+        return (double) std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void report_time() {
+        if (!spec_time_on() || tm.n_process == 0) return;
+        const double tot = tm.sync_us + tm.gather_us + tm.encode_us + tm.inject_us + tm.noise_us + tm.sel_us;
+        LOG_INF("dflash-time: %lld process / %lld draft calls, total %.1f ms\n",
+                (long long) tm.n_process, (long long) tm.n_draft, tot / 1e3);
+        const int64_t nd = tm.n_draft > 0 ? tm.n_draft : 1;
+        LOG_INF("dflash-time:   sync   %8.1f ms (%4.1f%%)  %6.3f ms/round\n",
+                tm.sync_us / 1e3, 100.0 * tm.sync_us / tot, tm.sync_us / 1e3 / tm.n_process);
+        LOG_INF("dflash-time:   gather %8.1f ms (%4.1f%%)  %6.3f ms/round\n",
+                tm.gather_us / 1e3, 100.0 * tm.gather_us / tot, tm.gather_us / 1e3 / tm.n_process);
+        LOG_INF("dflash-time:   encode %8.1f ms (%4.1f%%)  %6.3f ms/round\n",
+                tm.encode_us / 1e3, 100.0 * tm.encode_us / tot, tm.encode_us / 1e3 / tm.n_process);
+        LOG_INF("dflash-time:   inject %8.1f ms (%4.1f%%)  %6.3f ms/round\n",
+                tm.inject_us / 1e3, 100.0 * tm.inject_us / tot, tm.inject_us / 1e3 / tm.n_process);
+        LOG_INF("dflash-time:   noise  %8.1f ms (%4.1f%%)  %6.3f ms/round\n",
+                tm.noise_us  / 1e3, 100.0 * tm.noise_us  / tot, tm.noise_us  / 1e3 / nd);
+        LOG_INF("dflash-time:   select %8.1f ms (%4.1f%%)  %6.3f ms/round\n",
+                tm.sel_us    / 1e3, 100.0 * tm.sel_us    / tot, tm.sel_us    / 1e3 / nd);
+        tm = {};
+    }
+
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, n_seq)
         , params(params.draft)
@@ -1061,9 +1106,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
                 // gather this chunk's target features, interleaved by extract layer
+                const double t_gather0 = spec_time_on() ? now_us() : 0.0;
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
+                double t_sync_acc = 0.0;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    const double t_s0 = spec_time_on() ? now_us() : 0.0;
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    if (spec_time_on()) { t_sync_acc += now_us() - t_s0; }
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
@@ -1085,12 +1134,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     /*.logits   =*/ nullptr,
                 };
 
+                if (spec_time_on()) { tm.sync_us += t_sync_acc; tm.gather_us += now_us() - t_gather0 - t_sync_acc; }
+
+                const double t_enc0 = spec_time_on() ? now_us() : 0.0;
                 int32_t rc = llama_encode(ctx_dft, enc_batch);
                 if (rc != 0) {
                     LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
+                if (spec_time_on()) { tm.encode_us += now_us() - t_enc0; }
 
                 const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
@@ -1105,12 +1158,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                const double t_inj0 = spec_time_on() ? now_us() : 0.0;
                 rc = llama_decode(ctx_dft, batch_inject);
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
+                if (spec_time_on()) { tm.inject_us += now_us() - t_inj0; tm.n_process++; }
             }
         }
 
@@ -1155,7 +1210,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        const double t_noise0 = spec_time_on() ? now_us() : 0.0;
         int ret = llama_decode(ctx_dft, batch);
+        if (spec_time_on()) {
+            tm.noise_us += now_us() - t_noise0;
+            tm.n_draft++;
+            if (tm.n_draft >= 100) { report_time(); }
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
@@ -1177,7 +1238,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dflash2) {
                 // walk the selector lattice: each row is [top-k candidate ids,
                 // then top_k x top_k transition scores from the predecessor slot]
+                const double t_sel0 = spec_time_on() ? now_us() : 0.0;
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                if (spec_time_on()) { tm.sel_us += now_us() - t_sel0; }
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 int32_t predecessor = 0;

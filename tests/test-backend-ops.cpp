@@ -9614,6 +9614,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // wide rows with the small k values a DFlash2-style selector actually uses;
+    // these are the shapes the CUDA small-k top-k kernel handles (k in {8,16,32},
+    // ncols > 4096), including a ties case and the real 248320-wide vocab row.
+    for (int k : {8, 16, 32}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4097, 2, 1, 3}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 1, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {65536, 2, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 6, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 2, 1, 1}, k, true));
+    }
+
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {60, 10, 10, 10}, k));
