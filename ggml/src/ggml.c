@@ -6657,7 +6657,7 @@ struct ggml_tensor * ggml_paw_x3_mm(
     const int64_t words = trellis->ne[0];
     const int64_t k     = words / 16;
     GGML_ASSERT(words % 16 == 0);
-    GGML_ASSERT(k == 2 || k == 3);   // Plan D rates; more later
+    GGML_ASSERT(k == 1 || k == 2 || k == 3 || k == 4);   // Plan D rates + K1/K4 sweep
 
     const int64_t n = x->ne[0];
     GGML_ASSERT(suh->ne[0] == n);
