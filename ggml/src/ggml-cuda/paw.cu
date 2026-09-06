@@ -10286,6 +10286,778 @@ static void x3r_reconstruct_ws(half * W, const uint16_t * T,
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------------------
+// x3 tensor-core trellis GEMM (port of exllamav3 exl3_gemm_kernel / exl3_gemm_inner)
+//
+// Why this exists: the sq int8 GEMV above is only used by exllamav3 for m <= 2
+// (`exl3_gemv_int8.cu: if (size_m > 2) return false;`). llama-paw widened it to
+// M = 1..8 and paid for it: measured on RTX 3090 with nsys, the trellis matmul
+// total for one B3.5 forward goes 17.95 ms (nt=1) -> 53.98 ms (nt=8), 3.01x,
+// while exllamav3 on the same GPU goes 16.70 -> 21.29 ms, 1.27x. The two engines
+// agree to within 0.6% at nt=2 (same kernel) and diverge from nt=4 (different
+// kernel). This is that kernel: activations stay in mma fragments and the
+// trellis is decoded straight into B fragments, so extra tokens ride the idle
+// tensor pipe instead of re-running a dp4a pass per row.
+// ---------------------------------------------------------------------------------------------------------
+
+#define X3G_MIN(a, b) ((a) < (b) ? (a) : (b))
+#define X3G_MAX(a, b) ((a) > (b) ? (a) : (b))
+#define X3G_CEIL_DIVIDE(a, b) (((a) + (b) - 1) / (b))
+#define X3G_BASE_THREADS 256
+#define X3G_SMEM_MAX (90 * 1024)   // max opt-in dynamic shared memory, compute capability 8.6
+
+// GA10x runs HMMA with fp32 accumulation at half rate; accumulate in fp16 and fold into the fp32
+// accumulators once per k-slice (exllamav3 measures ~14% at bsz 1 on RTX 3090, error ~1% of output
+// RMS at k=4096, well under quantization noise). Only enabled for sm_86, as upstream.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860)
+    #define X3G_H_ACC 1
+#else
+    #define X3G_H_ACC 0
+#endif
+
+struct X3G_FragA { half2 v[4]; __device__ half2 & operator[](int i) { return v[i]; } };
+struct X3G_FragC { float  v[4]; __device__ float  & operator[](int i) { return v[i]; } };
+struct X3G_FragCh{ half2 v[2]; __device__ half2 & operator[](int i) { return v[i]; } };
+
+// FP16 @ FP16 + FP32 -> FP32
+__device__ inline void x3g_mma_m16n8k16(const X3G_FragA & frag_a, const FragB & frag_b, X3G_FragC & frag_c)
+{
+    const uint32_t * a = reinterpret_cast<const uint32_t *>(&frag_a);
+    const uint32_t * b = reinterpret_cast<const uint32_t *>(&frag_b);
+    float * c = reinterpret_cast<float *>(&frag_c);
+    const float * d = reinterpret_cast<const float *>(&frag_c);
+    asm(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        :  "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+           "r"(b[0]), "r"(b[1]),
+           "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]));
+}
+
+// FP16 @ FP16 + FP16 -> FP16
+__device__ inline void x3g_mma_m16n8k16(const X3G_FragA & frag_a, const FragB & frag_b, X3G_FragCh & frag_c)
+{
+    const uint32_t * a = reinterpret_cast<const uint32_t *>(&frag_a);
+    const uint32_t * b = reinterpret_cast<const uint32_t *>(&frag_b);
+    uint32_t * c = reinterpret_cast<uint32_t *>(&frag_c);
+    const uint32_t * d = reinterpret_cast<const uint32_t *>(&frag_c);
+    asm(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%9};\n"
+        : "=r"(c[0]), "=r"(c[1])
+        :  "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+           "r"(b[0]), "r"(b[1]),
+           "r"(d[0]), "r"(d[1]));
+}
+
+__device__ inline void x3g_barrier_acquire(int * lock, int stage)
+{
+    if (threadIdx.x == 0) {
+        volatile int state = -1;
+        do {
+            asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock));
+        } while (state != stage);
+    }
+    __syncthreads();
+}
+
+__device__ inline void x3g_barrier_release(int * lock, int val, bool reset)
+{
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        if (reset) { *lock = 0; return; }
+        asm volatile ("fence.acq_rel.gpu;\n");
+        asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val));
+    }
+}
+
+// Load 16x16 matrix fragment from shared memory, directly in tensor core layout
+__device__ inline void x3g_ldsm4(X3G_FragA & frag_a, const void * smem_ptr)
+{
+    uint32_t * a = reinterpret_cast<uint32_t *>(&frag_a);
+    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile (
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem));
+}
+
+#define X3G_T_ARGS \
+    const int bits, \
+    const bool c_fp32, \
+    const int cb, \
+    const int TILESIZE_M, \
+    const int TILESIZE_K, \
+    const int TILESIZE_N, \
+    const int SH_STAGES, \
+    const int FRAG_STAGES
+
+#define X3G_ARGS \
+    const half * __restrict__ A, \
+    const uint16_t * __restrict__ B, \
+    void * __restrict__ C, \
+    const int size_m, \
+    const int size_k, \
+    const int size_n, \
+    int * __restrict__ locks, \
+    const half * __restrict__ suh, \
+    half * __restrict__ A_had, \
+    const half * __restrict__ svh
+
+typedef void (*fp_x3g_kernel) (X3G_ARGS);
+
+template <X3G_T_ARGS, bool shmem_out_had>
+inline __device__ void x3g_gemm_inner
+(
+    const half * __restrict__ A,
+    const uint16_t * __restrict__ B,
+    void * __restrict__ C,
+    const int size_m,
+    const int size_k,
+    const int size_n,
+    int * __restrict__ locks,
+    const half * post_scale
+)
+{
+    const int TILEBLOCKS_M = TILESIZE_M / 16;
+    const int TILEBLOCKS_K = TILESIZE_K / 16;
+    const int TILEBLOCKS_N = TILESIZE_N / 16;
+    const int FRAGS_N_PER_WARP = 2 * TILEBLOCKS_N / (X3G_BASE_THREADS / 32);
+
+    const int sh_a_stage_size = TILESIZE_M * TILESIZE_K;                        // in halfs
+    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;  // in uint16s
+    const int sh_c_size = X3G_MAX(4 * X3G_BASE_THREADS * FRAGS_N_PER_WARP,
+                                  shmem_out_had ? TILESIZE_N * TILESIZE_M : 0);
+
+    // XOR-swizzle constants for bank-conflict-free A fragment loads
+    const int A_COLS = TILESIZE_K / 8;
+    const int A_SWIZZLE_MASK = A_COLS - 1;
+    const int A_SWIZZLE_SHIFT = (A_COLS <= 2) ? 2 : 1;
+
+    static_assert(X3G_BASE_THREADS == 256);
+    static_assert(TILESIZE_M == 16, "Invalid kernel params");
+    static_assert(TILESIZE_K % 16 == 0, "Invalid kernel params");
+    static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
+    static_assert(X3G_SMEM_MAX >= SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
+                  "Invalid kernel params (insufficient shared memory for shape)");
+
+    extern __shared__ half shared_x3g[];
+    half * sh_a = shared_x3g;
+    uint16_t * sh_b = (uint16_t *) (sh_a + SH_STAGES * sh_a_stage_size);
+    float * sh_c = (float *) (sh_b + sh_b_stage_size * SH_STAGES);
+
+    int t = threadIdx.x % X3G_BASE_THREADS;
+    int sub_k = threadIdx.x / X3G_BASE_THREADS;
+    int warp_id = t / 32;
+    int lane_id = t % 32;
+
+    int tiles_k = size_k / TILESIZE_K;
+    int tiles_n = size_n / TILESIZE_N;
+    int blocks_n = tiles_n * TILEBLOCKS_N;
+
+    int num_slices = gridDim.x;
+    int slice_beg = tiles_k * tiles_n * blockIdx.x / num_slices;
+    int slice_end = tiles_k * tiles_n * (blockIdx.x + 1) / num_slices;
+    int slice_len = slice_end - slice_beg;
+    if (slice_len < 1) return;
+
+    auto index_k = [&] (int slice_i) { return (slice_i % tiles_k); };
+    auto index_n = [&] (int slice_i) { return (slice_i / tiles_k); };
+
+    const int slice_m = 0;
+
+    int slice0_k = index_k(slice_beg);
+    int slice0_n = index_n(slice_beg);
+    int slice0_iters = slice_len;
+
+    int gl_a_stride_m = TILESIZE_M * size_k;
+    const int gl_a_stride_k = TILESIZE_K;
+    const int sh0_a_stride_m = TILESIZE_M * TILESIZE_K;
+    const half * gl_a_ptr = A + slice_m * gl_a_stride_m + slice0_k * gl_a_stride_k;
+    half * sh0_a_ptr = sh_a + (slice0_iters % SH_STAGES) * sh_a_stage_size;
+
+    const int load_a_iters = X3G_CEIL_DIVIDE(sh0_a_stride_m / 8, X3G_BASE_THREADS);
+    bool pred_a_gl[load_a_iters];
+    int load_a_gl[load_a_iters];
+    int load_a_sh[load_a_iters];
+    for (int i = 0; i < load_a_iters; ++i) {
+        int k = (i * X3G_BASE_THREADS + t) % (gl_a_stride_k / 8);
+        int m = (i * X3G_BASE_THREADS + t) / (gl_a_stride_k / 8);
+        load_a_gl[i] = m * size_k / 8 + k;
+        load_a_sh[i] = m * A_COLS + (k ^ ((m >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK));
+        pred_a_gl[i] = m < size_m;
+    }
+
+    int gl_b_stride_k = blocks_n * TILEBLOCKS_K * 256 / 16 * bits;
+    const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
+    const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;
+    const uint16_t * gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
+    uint16_t * sh0_b_ptr = sh_b + (slice0_iters % SH_STAGES) * sh_b_stage_size;
+
+    const int load_b_iters = X3G_CEIL_DIVIDE(sh0_b_stride_k / 8, X3G_BASE_THREADS);
+    bool pred_b_gl[load_b_iters];
+    int load_b_gl[load_b_iters];
+    for (int i = 0; i < load_b_iters; ++i) {
+        int n = (i * X3G_BASE_THREADS + t) % (gl_b_stride_n / 8);
+        int k = (i * X3G_BASE_THREADS + t) / (gl_b_stride_n / 8);
+        load_b_gl[i] = k * (blocks_n * 256 / 16 * bits / 8) + n;
+        pred_b_gl[i] = i * X3G_BASE_THREADS + t < sh0_b_stride_k / 8;
+    }
+
+    auto advance0 = [&] ()
+    {
+        slice0_k++;
+        slice0_iters--;
+        int stage = slice0_iters % SH_STAGES;
+        sh0_a_ptr = sh_a + stage * sh_a_stage_size;
+        sh0_b_ptr = sh_b + stage * sh_b_stage_size;
+        if (slice0_k >= tiles_k) {
+            slice0_k = 0;
+            slice0_n++;
+            gl_a_ptr = A + slice_m * gl_a_stride_m + slice0_k * gl_a_stride_k;
+            gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
+        } else {
+            gl_a_ptr += gl_a_stride_k;
+            gl_b_ptr += gl_b_stride_k;
+        }
+    };
+
+    int slice1_k = slice0_k;
+    int slice1_iters = slice0_iters;
+
+    half * sh1_a_ptr = sh_a + (slice1_iters % SH_STAGES) * sh_a_stage_size;
+    uint16_t * sh1_b_ptr = sh_b + (slice1_iters % SH_STAGES) * sh_b_stage_size;
+
+    auto advance1 = [&] ()
+    {
+        slice1_k++;
+        slice1_iters--;
+        int stage = slice1_iters % SH_STAGES;
+        sh1_a_ptr = sh_a + stage * sh_a_stage_size;
+        sh1_b_ptr = sh_b + stage * sh_b_stage_size;
+        if (slice1_k >= tiles_k) slice1_k = 0;
+    };
+
+    int slice2_k = slice0_k;
+    int slice2_k0 = slice0_k;
+    int slice2_n = slice0_n;
+    int slice2_iters = slice0_iters;
+
+    int gl_c_stride_n = TILESIZE_N;
+    int gl_c_stride_m = TILESIZE_M * size_n;
+
+    half * gl_c_ptr_16 = ((half *) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
+    float * gl_c_ptr_32 = ((float *) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
+
+    X3G_FragA frag_a[FRAG_STAGES];
+    FragB     frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
+    X3G_FragC frag_c[FRAGS_N_PER_WARP];
+    #if X3G_H_ACC
+        X3G_FragCh frag_c_h[FRAGS_N_PER_WARP];
+    #endif
+
+    auto advance2 = [&] ()
+    {
+        slice2_k++;
+        slice2_iters--;
+        if (slice2_k >= tiles_k) {
+            slice2_k = 0;
+            slice2_k0 = 0;
+            slice2_n++;
+            if constexpr (c_fp32) gl_c_ptr_32 += gl_c_stride_n;
+            else                  gl_c_ptr_16 += gl_c_stride_n;
+        }
+    };
+
+    auto async_load_gl = [&] ()
+    {
+        if (sub_k) { cp_async_fence(); return; }
+        if (slice0_iters) {
+            {
+                const int4 * gl = (const int4 *) gl_a_ptr;
+                int4 * sh = (int4 *) sh0_a_ptr;
+                #pragma unroll
+                for (int i = 0; i < load_a_iters; ++i)
+                    if (pred_a_gl[i]) cp_async(sh + load_a_sh[i], gl + load_a_gl[i]);
+            }
+            {
+                const int4 * gl = (const int4 *) gl_b_ptr;
+                int4 * sh = (int4 *) sh0_b_ptr;
+                #pragma unroll
+                for (int i = 0; i < load_b_iters; ++i)
+                    if (pred_b_gl[i]) cp_async(sh + X3G_BASE_THREADS * i + t, gl + load_b_gl[i]);
+            }
+            advance0();
+        }
+        cp_async_fence();
+    };
+
+    auto load_frags = [&] (int buf)
+    {
+        if (!slice1_iters) return;
+        {
+            int r = (lane_id % 8) + 8 * ((lane_id / 8) % 2);
+            int base_c = lane_id / 16 + sub_k * 2;
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m) {
+                int R = r + m * 16;
+                int c_swizzled = base_c ^ ((R >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
+                x3g_ldsm4(frag_a[buf], (int4 *) sh1_a_ptr + R * A_COLS + c_swizzled);
+            }
+        }
+        #pragma unroll
+        for (int n2 = 0; n2 < FRAGS_N_PER_WARP; n2 += 2) {
+            int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
+            const uint32_t * shb = (const uint32_t *) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits);
+            dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
+        }
+        __syncthreads();
+        advance1();
+    };
+
+    auto clear_frag_c = [&] ()
+    {
+        #pragma unroll
+        for (int n = 0; n < FRAGS_N_PER_WARP; ++n) frag_c[n] = {};
+        #if X3G_H_ACC
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n) frag_c_h[n] = {};
+        #endif
+    };
+
+    auto threadblock_reduce = [&] ()
+    {
+        auto store = [&] (int i)
+        {
+            if (sub_k == i) {
+                float * sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) *sh_red++ = frag_c[n][j];
+            }
+            __syncthreads();
+        };
+        auto add = [&] (int i)
+        {
+            if (sub_k == i) {
+                float * sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) frag_c[n][j] += *sh_red++;
+            }
+        };
+        auto store_small = [&] (int i)
+        {
+            if (sub_k == i && lane_id / 4 < size_m) {
+                float * sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n) {
+                    *sh_red++ = frag_c[n][0];
+                    *sh_red++ = frag_c[n][1];
+                }
+            }
+            __syncthreads();
+        };
+        auto add_small = [&] (int i)
+        {
+            if (sub_k == i && lane_id / 4 < size_m) {
+                float * sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n) {
+                    frag_c[n][0] += *sh_red++;
+                    frag_c[n][1] += *sh_red++;
+                }
+            }
+        };
+
+        if (size_m <= 8) {
+            if constexpr (TILEBLOCKS_K == 2) { store_small(1); add_small(0); }
+            if constexpr (TILEBLOCKS_K == 3) { store_small(1); add_small(0); store_small(2); add_small(0); }
+            if constexpr (TILEBLOCKS_K == 4) { store_small(3); add_small(2); store_small(1); add_small(0); store_small(2); add_small(0); }
+        } else {
+            if constexpr (TILEBLOCKS_K == 2) { store(1); add(0); }
+            if constexpr (TILEBLOCKS_K == 3) { store(1); add(0); store(2); add(0); }
+            if constexpr (TILEBLOCKS_K == 4) { store(3); add(2); store(1); add(0); store(2); add(0); }
+        }
+    };
+
+    auto write_sum_tile_sh = [&] ()
+    {
+        const int n0 = warp_id * FRAGS_N_PER_WARP;
+        const int r0 = lane_id / 4;
+        const int r1 = r0 + 8;
+        if (r0 < size_m) {
+            const int c = (lane_id % 4) * 2;
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n) {
+                float * c_ptr = ((float *) sh_c) + r0 * TILESIZE_N + (n0 + n) * 8 + c;
+                *c_ptr++ = frag_c[n][0];
+                *c_ptr++ = frag_c[n][1];
+            }
+        }
+        if (r1 < size_m) {
+            const int c = (lane_id % 4) * 2;
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n) {
+                float * c_ptr = ((float *) sh_c) + r1 * TILESIZE_N + (n0 + n) * 8 + c;
+                *c_ptr++ = frag_c[n][2];
+                *c_ptr++ = frag_c[n][3];
+            }
+        }
+    };
+
+    auto output_had_sh_gl = [&] ()
+    {
+        int sh_warp = warp_id;
+        constexpr int active_warps = X3G_BASE_THREADS / 32;
+        for (;; sh_warp += active_warps) {
+            int col = sh_warp % (TILESIZE_N / 128);
+            int row = sh_warp / (TILESIZE_N / 128);
+            if (row >= size_m) break;
+            const float * had_in = sh_c + row * TILESIZE_N + col * 128;
+            const half * post_scale_c = post_scale + slice2_n * gl_c_stride_n + col * 128;
+            if constexpr (c_fp32) {
+                float * had_out = gl_c_ptr_32 + row * size_n + col * 128;
+                had_ff_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
+            } else {
+                half * had_out = gl_c_ptr_16 + row * size_n + col * 128;
+                had_fh_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
+            }
+        }
+    };
+
+    auto read_sum_gl = [&] ()
+    {
+        int n0 = warp_id * FRAGS_N_PER_WARP;
+        #pragma unroll
+        for (int n = 0; n < FRAGS_N_PER_WARP; ++n) {
+            int r0 = lane_id / 4;
+            int r1 = r0 + 8;
+            int c = (lane_id % 4) * 2;
+            if (r0 < size_m) {
+                if constexpr (c_fp32) {
+                    float * c_ptr = gl_c_ptr_32 + r0 * size_n + (n0 + n) * 8 + c;
+                    frag_c[n][0] += *c_ptr++;
+                    frag_c[n][1] += *c_ptr++;
+                } else {
+                    half2 * c_ptr = (half2 *) (gl_c_ptr_16 + r0 * size_n + (n0 + n) * 8 + c);
+                    float2 interm = __half22float2(*c_ptr);
+                    frag_c[n][0] += interm.x;
+                    frag_c[n][1] += interm.y;
+                }
+            }
+            if (r1 < size_m) {
+                if constexpr (c_fp32) {
+                    float * c_ptr = gl_c_ptr_32 + r1 * size_n + (n0 + n) * 8 + c;
+                    frag_c[n][2] += *c_ptr++;
+                    frag_c[n][3] += *c_ptr++;
+                } else {
+                    half2 * c_ptr = (half2 *) (gl_c_ptr_16 + r1 * size_n + (n0 + n) * 8 + c);
+                    float2 interm = __half22float2(*c_ptr);
+                    frag_c[n][2] += interm.x;
+                    frag_c[n][3] += interm.y;
+                }
+            }
+        }
+    };
+
+    auto write_sum_gl = [&] ()
+    {
+        int n0 = warp_id * FRAGS_N_PER_WARP;
+        #pragma unroll
+        for (int n = 0; n < FRAGS_N_PER_WARP; ++n) {
+            int r0 = lane_id / 4;
+            int r1 = r0 + 8;
+            int c = (lane_id % 4) * 2;
+            if (r0 < size_m) {
+                if constexpr (c_fp32) {
+                    float * c_ptr = gl_c_ptr_32 + r0 * size_n + (n0 + n) * 8 + c;
+                    *c_ptr++ = frag_c[n][0];
+                    *c_ptr++ = frag_c[n][1];
+                } else {
+                    half2 * c_ptr = (half2 *) (gl_c_ptr_16 + r0 * size_n + (n0 + n) * 8 + c);
+                    *c_ptr = __floats2half2_rn(frag_c[n][0], frag_c[n][1]);
+                }
+            }
+            if (r1 < size_m) {
+                if constexpr (c_fp32) {
+                    float * c_ptr = gl_c_ptr_32 + r1 * size_n + (n0 + n) * 8 + c;
+                    *c_ptr++ = frag_c[n][2];
+                    *c_ptr++ = frag_c[n][3];
+                } else {
+                    half2 * c_ptr = (half2 *) (gl_c_ptr_16 + r1 * size_n + (n0 + n) * 8 + c);
+                    *c_ptr = __floats2half2_rn(frag_c[n][2], frag_c[n][3]);
+                }
+            }
+        }
+    };
+
+    auto reduce = [&] ()
+    {
+        #if X3G_H_ACC
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n) {
+                float2 f0 = __half22float2(frag_c_h[n][0]);
+                float2 f1 = __half22float2(frag_c_h[n][1]);
+                frag_c[n][0] += f0.x; frag_c[n][1] += f0.y;
+                frag_c[n][2] += f1.x; frag_c[n][3] += f1.y;
+            }
+        #endif
+
+        threadblock_reduce();
+
+        int lock_i = tiles_k - slice2_k - 1;
+        int lock_d = slice2_k - slice2_k0 + 1;
+        int * lock = &locks[slice_m * blocks_n + slice2_n];
+
+        x3g_barrier_acquire(lock, lock_i);
+
+        bool first = lock_i == 0;
+        bool last = lock_i + lock_d == tiles_k;
+
+        if (!sub_k && !first) read_sum_gl();
+        if (!sub_k && !last)  write_sum_gl();
+        if (!sub_k && last) {
+            if constexpr (shmem_out_had) write_sum_tile_sh();
+            else                         write_sum_gl();
+        }
+        if constexpr (shmem_out_had) {
+            if (last) __syncthreads();
+            if (!sub_k && last) output_had_sh_gl();
+        }
+
+        x3g_barrier_release(lock, lock_d, last);
+        clear_frag_c();
+    };
+
+    auto wait_stage = [&] ()
+    {
+        cp_async_wait<SH_STAGES - 2>();
+        __syncthreads();
+    };
+
+    auto matmul = [&] (int buf)
+    {
+        #pragma unroll
+        for (int n = 0; n < FRAGS_N_PER_WARP; ++n) {
+            #if X3G_H_ACC
+                x3g_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c_h[n]);
+            #else
+                x3g_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c[n]);
+            #endif
+        }
+    };
+
+    #pragma unroll
+    for (int i = 0; i < SH_STAGES - 1; ++i) async_load_gl();
+    wait_stage();
+
+    clear_frag_c();
+    if constexpr (FRAG_STAGES > 1) load_frags(0);
+
+    #define X3G_FSTAGE_OLD(_load, _mul) \
+        async_load_gl(); \
+        wait_stage(); \
+        load_frags(_load); \
+        matmul(_mul); \
+        if (slice2_k == tiles_k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; } \
+        advance2(); \
+        if (!slice2_iters) break;
+
+    #define X3G_FSTAGE(_load, _mul) \
+        async_load_gl(); \
+        wait_stage(); \
+        matmul(_mul); \
+        if (slice2_k == tiles_k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; } \
+        advance2(); \
+        if (!slice2_iters) break; \
+        load_frags(_load);
+
+    if constexpr (FRAG_STAGES == 1) { while (true) { X3G_FSTAGE_OLD(0, 0); } }
+    if constexpr (FRAG_STAGES == 2) { while (true) { X3G_FSTAGE(1, 0); X3G_FSTAGE(0, 1); } }
+    if constexpr (FRAG_STAGES == 3) { while (true) { X3G_FSTAGE(1, 0); X3G_FSTAGE(2, 1); X3G_FSTAGE(0, 2); } }
+    if constexpr (FRAG_STAGES == 4) { while (true) { X3G_FSTAGE(1, 0); X3G_FSTAGE(2, 1); X3G_FSTAGE(3, 2); X3G_FSTAGE(0, 3); } }
+    if constexpr (FRAG_STAGES == 5) { while (true) { X3G_FSTAGE(1, 0); X3G_FSTAGE(2, 1); X3G_FSTAGE(3, 2); X3G_FSTAGE(4, 3); X3G_FSTAGE(0, 4); } }
+
+    #undef X3G_FSTAGE_OLD
+    #undef X3G_FSTAGE
+}
+
+template <X3G_T_ARGS>
+__global__ __launch_bounds__(X3G_BASE_THREADS * TILESIZE_K / 16)
+void x3g_gemm_kernel(X3G_ARGS)
+{
+    namespace cg_ = cooperative_groups;
+    auto grid = cg_::this_grid();
+
+    // suh (input Hadamard scale) folded into A once, cooperatively, before the tiles are read
+    {
+        int total_warps = size_m * size_k / 128;
+        int warps_grid = gridDim.x * blockDim.x / 32;
+        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+        for (; this_warp < total_warps; this_warp += warps_grid)
+            had_hf_r_128_inner<true, false>(A + this_warp * 128, A_had + this_warp * 128,
+                                            suh + (this_warp * 128) % size_k, 0.088388347648f);
+        grid.sync();
+        A = A_had;
+    }
+
+    int size_m_ = size_m;
+    const half * A_ = A;
+    void * C_ = C;
+
+    while (size_m_ > 0)
+    {
+        x3g_gemm_inner<bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
+            (A_, B, C_, X3G_MIN(size_m_, 16), size_k, size_n, locks, svh);
+
+        A_ += 16 * size_k;
+        if constexpr (c_fp32) C_ = (void *) (((float *) C_) + 16 * size_n);
+        else                  C_ = (void *) (((half  *) C_) + 16 * size_n);
+        size_m_ -= 16;
+
+        if (size_m_ > 0 || svh) grid.sync();
+    }
+}
+
+// Shape table, mirrored from exllamav3 exl3_kernel_map.cuh (TILESIZE_M is always 16)
+//                                   TS_M  TS_K  TS_N  SH  FRAG
+#define X3G_SHAPE_1                    16,   16,  128,   6,   5
+#define X3G_SHAPE_2                    16,   32,  128,   4,   3
+#define X3G_SHAPE_3                    16,   32,  256,   4,   3
+#define X3G_SHAPE_4                    16,   16,  512,   4,   3
+
+static const int x3g_tilesize_k[5] = { 0, 16, 32, 32, 16 };
+static const int x3g_tilesize_n[5] = { 0, 128, 128, 256, 512 };
+static const int x3g_blockdim  [5] = { 0, 256, 512, 512, 256 };
+
+template <int bits>
+static fp_x3g_kernel x3g_kernel_for_shape(int shape_idx)
+{
+    switch (shape_idx) {
+        case 1: return x3g_gemm_kernel<bits, true, 2, X3G_SHAPE_1>;
+        case 2: return x3g_gemm_kernel<bits, true, 2, X3G_SHAPE_2>;
+        case 3: return x3g_gemm_kernel<bits, true, 2, X3G_SHAPE_3>;
+        case 4: return x3g_gemm_kernel<bits, true, 2, X3G_SHAPE_4>;
+    }
+    return nullptr;
+}
+
+static fp_x3g_kernel x3g_kernel_ptr(int bits, int shape_idx)
+{
+    switch (bits) {
+        case 1: return x3g_kernel_for_shape<1>(shape_idx);
+        case 2: return x3g_kernel_for_shape<2>(shape_idx);
+        case 3: return x3g_kernel_for_shape<3>(shape_idx);
+        case 4: return x3g_kernel_for_shape<4>(shape_idx);
+    }
+    return nullptr;
+}
+
+// exllamav3's Ampere branch of select_gemm_shape(), K <= 4 only (our codec's range)
+static int x3g_select_shape(int size_k, int size_n, int bits)
+{
+    bool mod_256 = (size_n % 256 == 0);
+    bool mod_512 = (size_n % 512 == 0);
+    if (mod_256 && bits <= 4) {
+        if (size_n <= 2048 || size_k <= 2048) return 2;
+        return 3;
+    }
+    if (mod_256 && size_n < 4096) return size_k > 8192 ? 3 : 2;
+    if (mod_512 && (size_t) size_n * size_k > (size_t) 4096 * 4096 && bits <= 6) return 4;
+    if (mod_256) return 3;
+    return 2;
+}
+
+static bool x3g_shape_compat(int shape_idx, int size_k, int size_n)
+{
+    return (size_k % x3g_tilesize_k[shape_idx] == 0) && (size_n % x3g_tilesize_n[shape_idx] == 0);
+}
+
+struct X3gPlan
+{
+    fp_x3g_kernel fn;
+    int shape_idx;
+    int block_dim;
+    int grid;
+    int lock_ints;
+};
+
+// deterministic plan per (bits, size_k, size_n); shape from exllamav3's Ampere
+// rule, overridable with GGML_PAW_X3_GEMM_SHAPE for A/B measurement.
+static const X3gPlan * plan_x3g(int bits, int size_k, int size_n)
+{
+    static std::map<std::tuple<int, int, int>, X3gPlan> cache;
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto key = std::make_tuple(bits, size_k, size_n);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second.fn ? &it->second : nullptr;
+    }
+
+    static const int force_shape = []() {
+        const char * e = getenv("GGML_PAW_X3_GEMM_SHAPE");
+        return e ? atoi(e) : 0;
+    }();
+
+    X3gPlan plan = {};
+    int shape_idx = force_shape > 0 ? force_shape : x3g_select_shape(size_k, size_n, bits);
+    if (shape_idx < 1 || shape_idx > 4 || !x3g_shape_compat(shape_idx, size_k, size_n)) {
+        // fall back to any compatible shape before giving up on the tensor-core path
+        shape_idx = 0;
+        for (int s = 4; s >= 1; --s) {
+            if (x3g_shape_compat(s, size_k, size_n)) { shape_idx = s; break; }
+        }
+    }
+    if (shape_idx == 0 || size_k % 128 != 0) {
+        auto res = cache.emplace(key, plan);   // fn == nullptr: remembered as unsupported
+        return res.first->second.fn ? &res.first->second : nullptr;
+    }
+
+    plan.fn        = x3g_kernel_ptr(bits, shape_idx);
+    plan.shape_idx = shape_idx;
+    plan.block_dim = x3g_blockdim[shape_idx];
+    int max_slices = (size_k / x3g_tilesize_k[shape_idx]) * (size_n / x3g_tilesize_n[shape_idx]);
+    plan.grid      = X3G_MAX(X3G_MIN(max_slices, g_num_sms), 1);
+    // one lock per 16-wide output block column
+    plan.lock_ints = size_n / 16;
+
+    if (plan.fn) {
+        CUDA_CHECK(cudaFuncSetAttribute((const void *) plan.fn,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, X3G_SMEM_MAX));
+        // cooperative launch may not exceed the co-resident block count
+        int maxb = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, (const void *) plan.fn,
+                                                                 plan.block_dim, X3G_SMEM_MAX));
+        int cap = X3G_MAX(maxb * g_num_sms, 1);
+        if (plan.grid > cap) plan.grid = cap;
+    }
+
+    auto res = cache.emplace(key, plan);
+    return res.first->second.fn ? &res.first->second : nullptr;
+}
+
+static void launch_x3g(const X3gPlan & plan,
+                       const half * A, const uint16_t * B, float * C,
+                       int size_m, int size_k, int size_n,
+                       const half * suh, half * A_had, const half * svh,
+                       int * locks, cudaStream_t stream)
+{
+    void * args[] =
+    {
+        (void *) &A, (void *) &B, (void *) &C,
+        (void *) &size_m, (void *) &size_k, (void *) &size_n,
+        (void *) &locks, (void *) &suh, (void *) &A_had, (void *) &svh
+    };
+    CUDA_CHECK(cudaLaunchCooperativeKernel((const void *) plan.fn,
+                                           dim3(plan.grid), dim3(plan.block_dim),
+                                           args, X3G_SMEM_MAX, stream));
+}
+
 } // namespace paw_x3
 
 void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -10335,7 +11107,45 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         const char * e = getenv("GGML_PAW_X3_PREFILL_NT");
         return e ? atoi(e) : 9;
     }();
-    if (nt >= x3_prefill_nt) {
+
+    // Tensor-core trellis GEMM for nt >= GGML_PAW_X3_GEMM_NT (default 3).
+    // exllamav3 abandons the int8 GEMV at exactly the same point
+    // (exl3_gemv_int8.cu: `if (size_m > 2) return false;`); measured here, the
+    // two engines' trellis-matmul cost agrees to 0.6% at nt=2 and diverges from
+    // nt=4 (1.25x vs 1.66x), which is the whole speculative-verify gap.
+    // GGML_PAW_X3_GEMM_NT=0 disables the path and restores the sq/hgemm split.
+    static const int x3_gemm_nt = []() {
+        const char * e = getenv("GGML_PAW_X3_GEMM_NT");
+        return e ? atoi(e) : 3;
+    }();
+    // Upper cutoff: past ~128 rows the tile loop's grid.sync per 16 rows costs
+    // more than reconstructing W once and handing the whole batch to cuBLAS.
+    // Measured on B3.5 / RTX 3090 (t/s, gemm vs reconstruct+cuBLAS):
+    //   nt=8 201.7/111.7  nt=16 362.4/78.0  nt=32 413.8/154.1
+    //   nt=128 469.1/463.7 (tie)  nt=256 479.7/624.9  nt=512 482.4/798.3
+    static const int x3_gemm_nt_max = []() {
+        const char * e = getenv("GGML_PAW_X3_GEMM_NT_MAX");
+        return e ? atoi(e) : 128;
+    }();
+    const X3gPlan * gplan = (x3_gemm_nt > 0 && nt >= x3_gemm_nt && nt <= x3_gemm_nt_max)
+                          ? plan_x3g(bits, n, m) : nullptr;
+
+    if (gplan) {
+        char shp[64];
+        snprintf(shp, sizeof(shp), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
+        paw_timed(stream, std::string("x3_gemm") + shp, [&]() {
+            ggml_cuda_pool_alloc<half> a_had(ctx.pool(), (size_t) n * nt);
+            ggml_cuda_pool_alloc<int>  locks(ctx.pool(), (size_t) gplan->lock_ints);
+            CUDA_CHECK(cudaMemsetAsync(locks.get(), 0, (size_t) gplan->lock_ints * sizeof(int), stream));
+            launch_x3g(*gplan,
+                       (const half *) xh.get(),
+                       (const uint16_t *) trellis->data,
+                       (float *) dst->data,
+                       nt, n, m,
+                       (const half *) suh->data, a_had.get(), (const half *) svh->data,
+                       locks.get(), stream);
+        });
+    } else if (nt >= x3_prefill_nt) {
         char shp[64];
         snprintf(shp, sizeof(shp), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
         paw_timed(stream, std::string("x3_hgemm") + shp, [&]() {
