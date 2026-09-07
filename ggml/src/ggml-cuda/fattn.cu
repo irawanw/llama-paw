@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-dq4.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -330,8 +331,9 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE    =   0,
-    BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
+    BEST_FATTN_KERNEL_TILE    = 200,
+    BEST_FATTN_KERNEL_DQ4     = 300,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
@@ -353,6 +355,42 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         default:
             return false;
     }
+}
+
+// Direct-q4 speculative-verify attention (fattn-dq4.cu): Ampere only, the PAW-27B
+// production verify shape.  The kernel consumes q4_0 K/V in place, so unlike MMA it
+// needs no f16 KV scratch and reads the cache at near-ceiling bandwidth.
+static bool ggml_cuda_fattn_dq4_use(const ggml_tensor * dst) {
+    static int mode = -1;
+    if (mode == -1) {
+        const char * env = getenv("GGML_PAW_DQ4");
+        mode = (env && env[0] == '1') ? 1 : 0;
+    }
+    if (mode == 0) {
+        return false;
+    }
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    return cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE
+        && Q->ne[0] == 256
+        && Q->ne[1] >= 2 && Q->ne[1] <= 8
+        && Q->ne[2] == 6*K->ne[2]
+        && Q->ne[3] == 1
+        && K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0
+        && K->ne[1] >= 8192 && K->ne[1] % 256 == 0
+        && mask != nullptr && mask->ne[2] == 1 && dst->src[4] == nullptr
+        && max_bias == 0.0f && logit_softcap == 0.0f;
 }
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -473,6 +511,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     if (Q->ne[1] == 1) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
+                    if (ggml_cuda_fattn_dq4_use(dst)) {
+                        return BEST_FATTN_KERNEL_DQ4;
+                    }
                 }
             }
             if (!gqa_opt_applies && Q->ne[1] == 1) {
@@ -557,6 +598,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
+        case BEST_FATTN_KERNEL_DQ4:
+            need_f16_K = false;
+            need_f16_V = false;
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -577,6 +622,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_DQ4:
+            ggml_cuda_flash_attn_ext_dq4(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
