@@ -2362,6 +2362,18 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
 
+    // Batch sizes are inherited from the target unless overridden. See the note
+    // on these fields in common_params_speculative_draft.
+    if (params_spec.n_batch > 0) {
+        result.n_batch = params_spec.n_batch;
+    }
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
+    if (result.n_ubatch > result.n_batch) {
+        result.n_ubatch = result.n_batch;
+    }
+
     return result;
 }
 

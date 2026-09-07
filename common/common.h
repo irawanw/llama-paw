@@ -340,6 +340,15 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
+    // Logical/physical batch for the draft context. 0 = inherit the target's.
+    // The draft context is built from the target's params, so without these the
+    // drafter allocates a compute buffer sized by the target's prefill ubatch --
+    // and a drafter with no output tensor borrows the target's vocab-wide head,
+    // so that buffer is n_ubatch * n_vocab * 4 bytes it can never fill (it emits
+    // n_max+1 rows per round). At -ub 2048 on a 248k vocab that is 2.0 GiB.
+    int32_t n_batch  = 0;
+    int32_t n_ubatch = 0;
+
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
