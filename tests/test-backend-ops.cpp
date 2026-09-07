@@ -9845,6 +9845,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
 
+    // GQA head batching in the CUDA FA vector kernel (ncols2 > 1).  The stock cases above never
+    // combine a 256-wide head with a quantized KV cache, and never use an odd-multiple GQA ratio,
+    // so they miss the shape that PAW-27B actually decodes with: 24 Q heads over 4 KV heads
+    // (gqa_ratio 6) at hsk == hsv == 256.  kv is a multiple of FATTN_KQ_STRIDE here because that
+    // is a precondition of the optimization; the fallbacks below are the cases that must not take
+    // it (ALiBi has a per-head slope, and no mask / unpadded kv break the shared-KV assumption).
+    for (ggml_type kvt : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int64_t kv : {256, 512, 1024}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        }
+        // more than one sequence: exercises the sequence/K-V-head/Q-head-tile split of blockIdx.z
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 3}, 512, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        // attention sinks are read per Q head, so they must follow the batched heads
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 1, true, true,  0, 0, GGML_PREC_F32, kvt, kvt));
+        // other GQA ratios and head sizes on the same path
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {6, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        // nb > 1 keeps the token-tiling path (ncols2 == 1) -- regression guard, must be unchanged
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 2, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        // must fall back: ALiBi slope varies per head
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 1, true, false, 8, 0, GGML_PREC_F32, kvt, kvt));
+        // must fall back: no mask, and kv not padded to FATTN_KQ_STRIDE
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 1, false, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 384, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        // logit softcap shares the instantiation set
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 1, true, false, 0, 10, GGML_PREC_F32, kvt, kvt));
+        // past GGML_CUDA_FATTN_VEC_GQA_MIN_KV, i.e. the length at which the batching turns itself
+        // on by default -- everything above is reached only with GGML_PAW_FA_GQA=1
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
