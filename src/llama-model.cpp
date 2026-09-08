@@ -2305,6 +2305,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
 
+    // model-graph greedy argmax ids (GGML_PAW_GREEDY_IDS=1 only, not backend sampling)
+    llm->build_greedy_ids();
+
     // add backend sampling layers (if any)
     llm->build_sampling();
 

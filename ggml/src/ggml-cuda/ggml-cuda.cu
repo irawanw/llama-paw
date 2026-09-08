@@ -1831,6 +1831,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // SPEC100v2 output head (GGML_PAW_MMQ_HEAD=1): route only the 5120x248320 Q5_K
+    // head matmul to the MMQ kernel. Measured 1.40 ms vs 2.71 ms MMVQ at ne11=6
+    // on RTX 3090 with bit-identical top-16 candidates. Default off.
+    static const bool paw_mmq_head = [] {
+        const char * e = getenv("GGML_PAW_MMQ_HEAD");
+        return e && e[0] == '1';
+    }();
+    if (paw_mmq_head && src0->type == GGML_TYPE_Q5_K && src0->ne[0] == 5120 && src0->ne[1] == 248320 &&
+        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)

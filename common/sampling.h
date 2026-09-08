@@ -85,6 +85,28 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// true when the sampler chain is provably equivalent to raw argmax on the logits rows:
+// greedy temperature sampler present with temp <= 0 and every other stage neutral or
+// argmax-preserving. Used to route the speculative verify through the model-graph
+// argmax ids (GGML_PAW_GREEDY_IDS=1) instead of copying full logits to the CPU.
+bool common_sampler_is_plain_greedy(const struct common_sampler * gsmpl);
+
+// GGML_PAW_GREEDY_IDS=1 and the chain is plain greedy: the verify may use the
+// model-graph argmax ids instead of copying full logits to the CPU
+bool common_sampler_use_device_greedy(const struct common_sampler * gsmpl);
+
+// device-greedy verify: same accept/mismatch/bonus semantics as
+// common_sampler_sample_and_accept_n, but the per-row token comes from the model-graph
+// argmax ids. Falls back to raw argmax comparison only for parity counting.
+// when parity != nullptr, each row is additionally compared against the CPU argmax of
+// the copied logits row (parity->rows++, mismatch -> parity->mism++).
+struct common_greedy_parity {
+    uint64_t rows = 0;
+    uint64_t mism = 0;
+};
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_device(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, common_greedy_parity * parity = nullptr);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

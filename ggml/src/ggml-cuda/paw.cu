@@ -9061,7 +9061,52 @@ void had_hf_r_128_inner(const half* __restrict__ input_ptr, half* __restrict__ o
     ((half4*) output_ptr)[t] = v;
 }
 
-// Float vector, half scales (not instantiated by this port's epilogue; kept
+// Fused f32-input variant of had_hf_r_128_inner for the x3v/x3_sq input prologue:
+// each element is converted with round-to-nearest (__floats2half2_rn matches the
+// scalar __float2half used by x3_cast_f32_f16_kernel), then the body is identical
+// (fp16 pre-scale, fp32 Hadamard, rn pack-back). Output is bit-identical to
+// cast-then-transform, so the separate cast pass can be skipped.
+template <bool pre_scale, bool post_scale>
+inline __device__
+void had_hf_r_128_inner_f32(const float* __restrict__ input_ptr, half* __restrict__ output_ptr,
+                        const half* __restrict__ scale, const float r_scale)
+{
+    int t = threadIdx.x & 31;
+    float4 f = ((float4*) input_ptr)[t];
+    half4 v;
+    v.x = __floats2half2_rn(f.x, f.y);
+    v.y = __floats2half2_rn(f.z, f.w);
+    if constexpr (pre_scale)
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x = __hmul2(v.x, scales.x);
+        v.y = __hmul2(v.y, scales.y);
+    }
+    float v0 = __half2float(__low2half(v.x));
+    float v1 = __half2float(__high2half(v.x));
+    float v2 = __half2float(__low2half(v.y));
+    float v3 = __half2float(__high2half(v.y));
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    float h0 = s0 + s1;
+    float h1 = d0 + d1;
+    float h2 = s0 - s1;
+    float h3 = d0 - d1;
+    shuffle_had_f4x32(h0, h1, h2, h3, t);
+    v.x = __floats2half2_rn(h0 * r_scale, h1 * r_scale);
+    v.y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
+    if constexpr (post_scale)
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x = __hmul2(v.x, scales.x);
+        v.y = __hmul2(v.y, scales.y);
+    }
+    ((half4*) output_ptr)[t] = v;
+}
 // for completeness with the reference epilogue's c_fp32 branch)
 template <bool pre_scale, bool post_scale>
 inline __device__
@@ -9470,7 +9515,8 @@ __device__ __forceinline__ void gemv_int8_stage_slice
     int slice_stride,
     float* __restrict__ sh_red,
     int kb0,
-    int nrows
+    int nrows,
+    const int a_f32
 )
 {
     int t = threadIdx.x;
@@ -9497,9 +9543,18 @@ __device__ __forceinline__ void gemv_int8_stage_slice
             }
             continue;
         }
-        const half* Ar = A + (size_t) r * size_k;
-        for (int sp = t >> 5; sp < (nel >> 7); sp += NUM_THREADS >> 5)
-            had_hf_r_128_inner<true, false>(Ar + (kb0 << 4) + (sp << 7), sh_ah + (sp << 7), suh + (kb0 << 4) + (sp << 7), 0.088388347648f);
+        // A holds f32 rows when a_f32 is set (cast folds into the prologue below),
+        // fp16 rows otherwise: row stride differs, so resolve the base accordingly
+        const half* Ar = a_f32
+            ? (const half *) ((const float *) A + (size_t) r * size_k)
+            : A + (size_t) r * size_k;
+        for (int sp = t >> 5; sp < (nel >> 7); sp += NUM_THREADS >> 5) {
+            if (a_f32) {
+                had_hf_r_128_inner_f32<true, false>((const float *) Ar + (kb0 << 4) + (sp << 7), sh_ah + (sp << 7), suh + (kb0 << 4) + (sp << 7), 0.088388347648f);
+            } else {
+                had_hf_r_128_inner<true, false>(Ar + (kb0 << 4) + (sp << 7), sh_ah + (sp << 7), suh + (kb0 << 4) + (sp << 7), 0.088388347648f);
+            }
+        }
         __syncthreads();
 
         float mx = 0.0f;
@@ -9653,7 +9708,8 @@ void exl3_gemv_int8_sq_kernel
     int* __restrict__ locks,
     const half* __restrict__ suh,
     half* __restrict__ A_had,
-    const half* __restrict__ svh
+    const half* __restrict__ svh,
+    const int a_f32
 )
 {
     (void) A_had;  // unused in the sq path
@@ -9702,7 +9758,7 @@ void exl3_gemv_int8_sq_kernel
         if (slice != prev_slice)
         {
             gemv_int8_stage_slice<M, residual>(A, size_m, size_k, suh, qsums + 4 * slice * M,
-                                               sh_ah, sh_as, slice_stride, sh_red, kb0, nrows);
+                                               sh_ah, sh_as, slice_stride, sh_red, kb0, nrows, a_f32);
             prev_slice = slice;
         }
         int* pacc = partials + (size_t) slice * M * pstride;
@@ -9866,18 +9922,20 @@ static const SqPlan & plan_sq(int bits, int size_k, int size_n, int M)
 }
 
 static void launch_sq(const SqPlan & plan, int bits, int M,
-                      const half * A, const uint16_t * B, float * C,
+                      const float * A, const uint16_t * B, float * C,
                       int size_k, int size_n,
                       const half * suh, const half * svh,
                       int * locks, cudaStream_t stream)
 {
     int g_size_m = M;                      // fused batch rows (was hardcoded 1)
     static half * const g_null_a_had = nullptr;  // residual-only operand
+    const int a_f32 = 1;                   // A is f32: cast folds into the input prologue
     void * args[] =
     {
         (void *) &A, (void *) &B, (void *) &C,
         (void *) &g_size_m, (void *) &size_k, (void *) &size_n,
-        (void *) &locks, (void *) &suh, (void *) &g_null_a_had, (void *) &svh
+        (void *) &locks, (void *) &suh, (void *) &g_null_a_had, (void *) &svh,
+        (void *) &a_f32
     };
     CUDA_CHECK(cudaLaunchKernel(plan.fn, dim3(plan.grid), dim3(NUM_THREADS), args, plan.smem, stream));
 }
@@ -10403,7 +10461,8 @@ __device__ inline void x3g_ldsm4(X3G_FragA & frag_a, const void * smem_ptr)
     int * __restrict__ locks, \
     const half * __restrict__ suh, \
     half * __restrict__ A_had, \
-    const half * __restrict__ svh
+    const half * __restrict__ svh, \
+    const int a_f32
 
 typedef void (*fp_x3g_kernel) (X3G_ARGS);
 
@@ -11050,9 +11109,15 @@ void x3v_gemv_kernel(X3G_ARGS)
         int total_warps = size_m * size_k / 128;
         int warps_grid = gridDim.x * blockDim.x / 32;
         int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
-        for (; this_warp < total_warps; this_warp += warps_grid)
-            had_hf_r_128_inner<true, false>(A + this_warp * 128, A_had + this_warp * 128,
-                                            suh + (this_warp * 128) % size_k, 0.088388347648f);
+        for (; this_warp < total_warps; this_warp += warps_grid) {
+            if (a_f32) {
+                had_hf_r_128_inner_f32<true, false>((const float *) A + this_warp * 128, A_had + this_warp * 128,
+                                                suh + (this_warp * 128) % size_k, 0.088388347648f);
+            } else {
+                had_hf_r_128_inner<true, false>(A + this_warp * 128, A_had + this_warp * 128,
+                                                suh + (this_warp * 128) % size_k, 0.088388347648f);
+            }
+        }
         grid.sync();
         A = A_had;
     }
@@ -11437,7 +11502,7 @@ static int x3v_cfg(int size_m, int size_k, int size_n, int bits, int mode, int n
 }
 
 // Returns true if the GEMV path was launched.
-static bool x3v_try_launch(const half * A, const uint16_t * B, float * C,
+static bool x3v_try_launch(const float * A, const uint16_t * B, float * C,
                            int size_m, int size_k, int size_n,
                            const half * suh, half * A_had, const half * svh,
                            int bits, cudaStream_t stream)
@@ -11482,11 +11547,13 @@ static bool x3v_try_launch(const half * A, const uint16_t * B, float * C,
     if (grid < 1) return false;
 
     int * locks = nullptr;   // unused by the GEMV path, but kept in the arg list
+    const int a_f32 = 1;       // A is f32: cast folds into the input prologue
     void * Cv = (void *) C;
     void * args[] = {
         (void *) &A, (void *) &B, (void *) &Cv,
         (void *) &size_m, (void *) &size_k, (void *) &size_n,
-        (void *) &locks, (void *) &suh, (void *) &A_had, (void *) &svh
+        (void *) &locks, (void *) &suh, (void *) &A_had, (void *) &svh,
+        (void *) &a_f32
     };
     CUDA_CHECK(cudaLaunchCooperativeKernel((const void *) fn, dim3(grid), dim3(block_dim),
                                            args, 0, stream));
@@ -11497,13 +11564,15 @@ static void launch_x3g(const X3gPlan & plan,
                        const half * A, const uint16_t * B, float * C,
                        int size_m, int size_k, int size_n,
                        const half * suh, half * A_had, const half * svh,
-                       int * locks, cudaStream_t stream)
+                        int * locks, cudaStream_t stream)
 {
+    const int a_f32 = 0;   // x3g path keeps fp16 input (cast kernel output)
     void * args[] =
     {
         (void *) &A, (void *) &B, (void *) &C,
         (void *) &size_m, (void *) &size_k, (void *) &size_n,
-        (void *) &locks, (void *) &suh, (void *) &A_had, (void *) &svh
+        (void *) &locks, (void *) &suh, (void *) &A_had, (void *) &svh,
+        (void *) &a_f32
     };
     CUDA_CHECK(cudaLaunchCooperativeKernel((const void *) plan.fn,
                                            dim3(plan.grid), dim3(plan.block_dim),
@@ -11546,10 +11615,13 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     cudaStream_t stream = ctx.stream();
 
-    // fp16 activation rows (the reference runtime feeds fp16 activations)
-    ggml_cuda_pool_alloc<half> xh(ctx.pool(), (size_t) n * nt);
-    x3_cast_f32_f16_kernel<<<((size_t) n * nt + 255) / 256, 256, 0, stream>>>(
-        (half *) xh.get(), (const float *) x->data, (int) ((size_t) n * nt));
+    // fp16 activation rows for the paths that still need them (x3g GEMM, x3 hgemm,
+    // debug dump). The x3v and x3_sq paths take f32 x directly: the f32->f16 cast
+    // folds into their input prologues (bit-identical, see had_hf_r_128_inner_f32).
+    // NOTE: the cuda pool frees in exact reverse order of allocation, so xh is
+    // allocated eagerly below (before any branch workspace) whenever any later path
+    // may need it; allocating it lazily inside a branch breaks the pool LIFO invariant.
+    ggml_cuda_pool_alloc<half> xh;
 
     // EXL3-style prefill switch: at nt >= GGML_PAW_X3_PREFILL_NT (default 16)
     // reconstruct W once and run one batched hgemm instead of looping the
@@ -11582,23 +11654,36 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const X3gPlan * gplan = (x3_gemm_nt > 0 && nt >= x3_gemm_nt && nt <= x3_gemm_nt_max)
                           ? plan_x3g(bits, n, m) : nullptr;
 
-    // Small-m GEMV path, ported from exllamav3 exl3_gemv and tried before the GEMM exactly
-    // as exl3_gemm does.  Uses no dynamic shared memory, so it gets 4-6 blocks/SM against the
-    // GEMM's 1.  Gated OFF by default: GGML_PAW_X3_GEMV=1 enables their Ampere heuristic.
+    // Small-m GEMV path first: its prologue consumes f32 x directly, so a
+    // successful launch needs no xh and no cast kernel at all. Tried before any
+    // pool allocation (besides its own branch workspace, freed on exit).
+    bool x3v_done = false;
     if (x3v_mode() != 0 && nt <= X3V_MAX_M) {
         char shpv[64];
         snprintf(shpv, sizeof(shpv), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
-        bool launched = false;
         paw_timed(stream, std::string("x3_gemv") + shpv, [&]() {
             ggml_cuda_pool_alloc<half> a_had(ctx.pool(), (size_t) n * nt);
-            launched = x3v_try_launch((const half *) xh.get(),
+            x3v_done = x3v_try_launch((const float *) x->data,
                                       (const uint16_t *) trellis->data,
                                       (float *) dst->data,
                                       nt, n, m,
                                       (const half *) suh->data, a_had.get(),
                                       (const half *) svh->data, bits, stream);
         });
-        if (launched) return;
+    }
+
+    // eager xh only for paths that actually consume fp16 rows (x3g GEMM, x3
+    // hgemm, debug dump). Pool LIFO: allocated here, before any branch workspace
+    // below; skipped entirely when x3v (or the folded sq path) handles the call.
+    const bool need_xh = !x3v_done && (getenv("GGML_PAW_X3_DUMP") || gplan || nt >= x3_prefill_nt);
+    if (need_xh) {
+        xh.alloc(ctx.pool(), (size_t) n * nt);
+        x3_cast_f32_f16_kernel<<<((size_t) n * nt + 255) / 256, 256, 0, stream>>>(
+            (half *) xh.get(), (const float *) x->data, (int) ((size_t) n * nt));
+    }
+
+    if (x3v_done) {
+        goto paw_x3_done;
     }
 
     if (gplan) {
@@ -11609,7 +11694,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             ggml_cuda_pool_alloc<int>  locks(ctx.pool(), (size_t) gplan->lock_ints);
             CUDA_CHECK(cudaMemsetAsync(locks.get(), 0, (size_t) gplan->lock_ints * sizeof(int), stream));
             launch_x3g(*gplan,
-                       (const half *) xh.get(),
+                       xh.get(),
                        (const uint16_t *) trellis->data,
                        (float *) dst->data,
                        nt, n, m,
@@ -11658,7 +11743,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         paw_timed(stream, std::string("x3_sq") + shp, [&]() {
             CUDA_CHECK(cudaMemsetAsync(ws.get(), 0, SQ_COUNTERS_CAP * sizeof(int), stream));
             launch_sq(plan, bits, nt,
-                      (const half *) xh.get(),
+                      (const float *) x->data,
                       (const uint16_t *) trellis->data,
                       (float *) dst->data,
                       n, m,
@@ -11670,6 +11755,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     // debug: dump the I/O of the first calls for offline verification against
     // the Phase-1 oracle (GGML_PAW_X3_DUMP=<dir>)
+paw_x3_done:
     if (const char * dump_dir = getenv("GGML_PAW_X3_DUMP")) {
         static int dump_count = 0;
         static const int dump_skip = []() {
@@ -11699,7 +11785,9 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                 fclose(f);
             };
             dump_dev("_A.f32", x->data, (size_t) n * nt * sizeof(float));
-            dump_dev("_Ah.u16", xh.get(), (size_t) n * nt * 2);
+            if (xh.get()) {
+                dump_dev("_Ah.u16", xh.get(), (size_t) n * nt * 2);
+            }
             dump_dev("_B.u16", trellis->data, tbytes);
             dump_dev("_suh.u16", suh->data, (size_t) n * 2);
             dump_dev("_svh.u16", svh->data, (size_t) m * 2);

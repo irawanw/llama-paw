@@ -81,6 +81,12 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    // model-graph argmax id for output row i (GGML_PAW_GREEDY_IDS=1 only, else LLAMA_TOKEN_NULL)
+    int32_t get_greedy_id_ith(int32_t i);
+
+    // one-shot per-decode skip of the raw logits host copy (see llama_skip_raw_logits_next)
+    void set_skip_raw_logits_next(bool skip) { skip_raw_logits_next = skip; }
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -290,6 +296,15 @@ private:
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
+
+    // model-graph argmax ids (1-dimensional array: [n_outputs])
+    // populated only when GGML_PAW_GREEDY_IDS=1 and the graph emits t_greedy_ids
+    buffer_view<int32_t> greedy_ids = {nullptr, 0};
+
+    // one-shot per-decode intent: skip the raw logits host copy when the caller
+    // guarantees every output row is consumed through the greedy ids path.
+    // set via llama_skip_raw_logits_next(), auto-cleared at each decode.
+    bool skip_raw_logits_next = false;
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE

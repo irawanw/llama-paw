@@ -671,6 +671,119 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
+bool common_sampler_is_plain_greedy(const struct common_sampler * gsmpl) {
+    const auto & p = gsmpl->params;
+
+    // the temperature sampler must be present and greedy: every upstream filter
+    // (top_k/top_p/min_p/typical/xtc/top_n_sigma) keeps the argmax row element,
+    // so temp <= 0 selects exactly argmax(logits)
+    bool has_temp = false;
+    for (const auto t : p.samplers) {
+        if (t == COMMON_SAMPLER_TYPE_TEMPERATURE) {
+            has_temp = true;
+            break;
+        }
+    }
+    if (!has_temp || p.temp > 0.0f) {
+        return false;
+    }
+    if (p.dynatemp_range != 0.0f) {
+        return false;
+    }
+    if (p.mirostat != 0) {
+        return false;
+    }
+    if (p.typ_p != 1.0f) {
+        return false;
+    }
+    if (p.top_n_sigma >= 0.0f) {
+        return false;
+    }
+    if (p.xtc_probability != 0.0f) {
+        return false;
+    }
+    if (p.adaptive_target >= 0.0f) {
+        return false;
+    }
+    if (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f) {
+        return false;
+    }
+    if (p.dry_multiplier != 0.0f) {
+        return false;
+    }
+    // note: logit_bias_eog is always pre-populated but inert unless ignore_eos
+    // merges it into the active logit_bias set (covered by has_logit_bias)
+    if (p.has_logit_bias() || p.ignore_eos) {
+        return false;
+    }
+    if (!p.grammar.empty()) {
+        return false;
+    }
+    if (p.n_probs != 0) {
+        return false;
+    }
+    if (p.reasoning_budget_tokens >= 0) {
+        return false;
+    }
+
+    return true;
+}
+
+bool common_sampler_use_device_greedy(const struct common_sampler * gsmpl) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_PAW_GREEDY_IDS");
+        return e && e[0] == '1';
+    }();
+    return on && common_sampler_is_plain_greedy(gsmpl);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_device(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, common_greedy_parity * parity) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        const llama_token id = llama_get_greedy_id_ith(ctx, idxs[i]);
+
+        if (parity) {
+            const float * logits = llama_get_logits_ith(ctx, idxs[i]);
+            if (logits) {
+                const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+                int32_t amax = 0;
+                for (int32_t t = 1; t < n_vocab; t++) {
+                    if (logits[t] > logits[amax]) {
+                        amax = t;
+                    }
+                }
+                parity->rows++;
+                if (amax != id) {
+                    parity->mism++;
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+
+        if (draft[i] != id) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = llama_get_greedy_id_ith(ctx, idxs[i]);
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+    }
+
+    return result;
+}
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }

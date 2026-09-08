@@ -85,6 +85,17 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
 }
 
+// GGML_PAW_GREEDY_PARITY=1: compare every device-greedy verify row against the
+// CPU argmax of the copied logits (needs the raw-logits copy, so it disables
+// the per-decode skip below)
+static bool paw_greedy_parity_on() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_PAW_GREEDY_PARITY");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -3629,6 +3640,36 @@ private:
         }
 
         const double t_dec0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
+        // Skip the raw-logits host copy only when EVERY output row of this decode
+        // is a verify row of a device-greedy slot (and parity is off, which needs
+        // the logits). Prefill rows, single-sample rows, embeddings/rerank, logprob
+        // or non-greedy slots fall back to the copy. One-shot per decode.
+        {
+            bool all_verify_greedy = !paw_greedy_parity_on();
+            for (int32_t j = 0; all_verify_greedy && j < batch_view.n_tokens; ++j) {
+                if (!batch_view.logits[j]) {
+                    continue;
+                }
+                const int32_t abs_idx = off + j;
+                bool covered = false;
+                for (auto & slot : slots) {
+                    if (!slot.smpl || !common_sampler_use_device_greedy(slot.smpl.get())) {
+                        continue;
+                    }
+                    for (const auto & r : slot.spec_i_batch) {
+                        if (r == abs_idx) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                    if (covered) {
+                        break;
+                    }
+                }
+                all_verify_greedy = covered;
+            }
+            llama_skip_raw_logits_next(ctx_tgt, all_verify_greedy);
+        }
         const int ret = llama_decode(ctx_tgt, batch_view);
         if (paw_spec_time::on()) paw_spec_time::g.decode_tgt += paw_spec_time::us() - t_dec0;
 
@@ -3837,6 +3878,24 @@ private:
         });
 
         // speculative decoding - main model sample and accept
+        // narrow model-graph greedy verify (GGML_PAW_GREEDY_IDS=1): one int32 id per
+        // row instead of full-logits CPU sampling. CPU fallback for everything else.
+        // GGML_PAW_GREEDY_PARITY=1 additionally compares every row against the CPU
+        // argmax of the copied logits and logs the match rate.
+        auto paw_spec_verify_accept = [&](server_slot & slot) {
+            if (common_sampler_use_device_greedy(slot.smpl.get())) {
+                static uint64_t n_rounds = 0;
+                static common_greedy_parity par;
+                const bool parity = paw_greedy_parity_on();
+                auto accepted = common_sampler_sample_and_accept_n_device(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, parity ? &par : nullptr);
+                if (parity && (++n_rounds % 50 == 0)) {
+                    SLT_INF(slot, "greedy-ids parity: %llu/%llu rows match\n",
+                            (unsigned long long) (par.rows - par.mism), (unsigned long long) par.rows);
+                }
+                return accepted;
+            }
+            return common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+        };
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
                 return;
@@ -3854,7 +3913,7 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const double t_s0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                auto accepted = paw_spec_verify_accept(slot);
                 if (paw_spec_time::on()) {
                     paw_spec_time::g.sample += paw_spec_time::us() - t_s0;
                     const double t_now_r = paw_spec_time::us();
@@ -3863,7 +3922,7 @@ private:
                     }
                     paw_spec_time::g.t_round_prev = t_now_r;
                     paw_spec_time::g.n++;
-                    if (paw_spec_time::g.n >= 100) paw_spec_time::g.report();
+                    if (paw_spec_time::g.n >= 10) paw_spec_time::g.report();
                 }
                 slot.spec_i_batch.clear();
 

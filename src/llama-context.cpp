@@ -897,6 +897,26 @@ llama_token * llama_context::get_sampled_tokens()  const{
     return sampling.sampled.data;
 }
 
+int32_t llama_context::get_greedy_id_ith(int32_t i) {
+    output_reorder();
+
+    try {
+        if (greedy_ids.data == nullptr) {
+            throw std::runtime_error("no greedy ids (GGML_PAW_GREEDY_IDS=1 not set at graph build)");
+        }
+
+        const int64_t j = output_resolve_row(i);
+        return greedy_ids.data[j];
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid greedy id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return LLAMA_TOKEN_NULL;
+#endif
+    }
+}
+
 float * llama_context::get_embeddings_ith(int32_t i) {
     output_reorder();
 
@@ -1506,6 +1526,15 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
     }
 
+    // extract model-graph greedy argmax ids
+    auto * t_greedy_ids = res->get_greedy_ids();
+    if (greedy_ids.data && t_greedy_ids) {
+        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_greedy_ids);
+        GGML_ASSERT(backend_res != nullptr);
+
+        ggml_backend_tensor_get_async(backend_res, t_greedy_ids, greedy_ids.data, 0, n_outputs*sizeof(int32_t));
+    }
+
     // extract embeddings
     if (embd.data && t_embd) {
         ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
@@ -1864,6 +1893,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // one-shot per-decode intent (see llama_skip_raw_logits_next): when set, every
+    // output row is consumed through the model-graph greedy ids and the raw logits
+    // host copy is skipped. Auto-clears so a later mixed batch copies as usual.
+    const bool skip_raw_logits = skip_raw_logits_next;
+    skip_raw_logits_next = false;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1932,7 +1967,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && !skip_raw_logits && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -1944,6 +1979,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
+        }
+
+        // extract model-graph greedy argmax ids (one int32 per output row)
+        auto * t_greedy_ids = res->get_greedy_ids();
+        if (greedy_ids.data && t_greedy_ids && n_outputs > 0) {
+            ggml_backend_t backend_gid = ggml_backend_sched_get_tensor_backend(sched.get(), t_greedy_ids);
+            GGML_ASSERT(backend_gid != nullptr);
+
+            int32_t * greedy_out = greedy_ids.data + n_outputs_prev;
+
+            GGML_ASSERT(n_outputs_prev + n_outputs <= (int64_t) greedy_ids.size);
+            ggml_backend_tensor_get_async(backend_gid, t_greedy_ids, greedy_out, 0, n_outputs*sizeof(int32_t));
         }
 
         // extract embeddings
@@ -2132,6 +2179,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
+    greedy_ids.size = paw_greedy_ids_on() ? n_outputs_max : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
@@ -2160,7 +2208,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
         (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
-        (                                                                         backend_token_count) * sizeof(llama_token);
+        (                                                                         backend_token_count) * sizeof(llama_token) +
+        greedy_ids.size * sizeof(int32_t);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2177,6 +2226,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             embd.data = nullptr;
             embd_nextn.data = nullptr;
+            greedy_ids.data = nullptr;
             for (auto & layer_inp : embd_layer_inp) {
                 layer_inp = {nullptr, 0};
             }
@@ -2210,6 +2260,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
     offset += embd_nextn.size * sizeof(float);
+
+    greedy_ids = paw_greedy_ids_on() ? buffer_view<int32_t>{(int32_t *) (base + offset), greedy_ids.size} : buffer_view<int32_t>{nullptr, 0};
+    offset += greedy_ids.size * sizeof(int32_t);
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
@@ -2318,6 +2371,10 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
             }
+        }
+
+        if (greedy_ids.size > 0) {
+            std::swap(greedy_ids.data[i0], greedy_ids.data[i1]);
         }
 
         if (embd_layer_inp.size() > 0) {
@@ -3726,6 +3783,16 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     }
 
     return res;
+}
+
+int32_t llama_get_greedy_id_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_greedy_id_ith(i);
+}
+
+void llama_skip_raw_logits_next(llama_context * ctx, bool skip) {
+    ctx->set_skip_raw_logits_next(skip);
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

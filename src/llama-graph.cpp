@@ -1191,6 +1191,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_greedy_ids  = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -1230,6 +1231,9 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
+    }
+    if (t_greedy_ids != nullptr) {
+        ggml_set_output(t_greedy_ids);
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
@@ -3405,6 +3409,26 @@ void llm_graph_context::build_pooling(
 
     cb(cur, "result_embd_pooled", -1);
     res->t_embd_pooled = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+bool paw_greedy_ids_on() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_PAW_GREEDY_IDS");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+void llm_graph_context::build_greedy_ids() const {
+    if (!paw_greedy_ids_on() || !res->t_logits) {
+        return;
+    }
+
+    ggml_tensor * cur = ggml_argmax(ctx0, res->t_logits);
+    ggml_format_name(cur, "result_greedy_ids");
+    res->t_greedy_ids = cur;
 
     ggml_build_forward_expand(gf, cur);
 }

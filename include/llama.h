@@ -1024,6 +1024,16 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Model-graph argmax id for the ith output row (GGML_PAW_GREEDY_IDS=1 only).
+    // Returns LLAMA_TOKEN_NULL when the graph was built without greedy ids.
+    LLAMA_API int32_t llama_get_greedy_id_ith(struct llama_context * ctx, int32_t i);
+
+    // Skip the raw-logits host copy on the next decode. The caller guarantees every
+    // output row of that decode is consumed through the model-graph greedy ids path
+    // (plain-greedy verify); all other consumers must leave this unset. One-shot:
+    // auto-cleared at each decode so a later mixed batch copies as usual.
+    LLAMA_API void llama_skip_raw_logits_next(struct llama_context * ctx, bool skip);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

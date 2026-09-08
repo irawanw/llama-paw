@@ -1225,7 +1225,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (spec_time_on()) {
             tm.noise_us += now_us() - t_noise0;
             tm.n_draft++;
-            if (tm.n_draft >= 100) { report_time(); }
+            if (tm.n_draft >= 10) { report_time(); }
         }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
