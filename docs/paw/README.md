@@ -72,7 +72,14 @@ New files (never conflict with upstream renames):
 | path | what |
 |------|------|
 | `src/models/paw.cpp`, `src/models/paw-dense.cpp` | PAW and PAW-dense model arch (graph build, codec tensor wiring, greedy-ids sidecar) |
-| `ggml/src/ggml-cuda/paw.cu`, `paw.cuh` | all PAW CUDA kernels (trellis decode, WS-mma apply, GEMV, head) |
+| `ggml/src/ggml-cuda/paw-common.cuh` | shared prologue (fwht, launch, timed, env) + the cross-op shared kernels/helpers, each defined once and reused |
+| `ggml/src/ggml-cuda/paw-embed.cu` | `embed_gather` op + its kernels |
+| `ggml/src/ggml-cuda/paw-head.cu` | `embed_rows` + head bank cache + `head_mm` op + head kernels |
+| `ggml/src/ggml-cuda/paw-rt.cu` | `ne_mm` + rt walk/apply/bank/quant kernels + `rt_mm` + `rt_mm_batch` ops |
+| `ggml/src/ggml-cuda/paw-exp.cu` | `exp_basis` + exp walk/apply/slot kernels + `exp_mm_batch2` + `exp_mm` ops |
+| `ggml/src/ggml-cuda/paw-misc.cu` | `v_reorder` + `dual_mm` + `ggml_cuda_paw_supported` |
+| `ggml/src/ggml-cuda/paw-x3.cu` | `moe_reduce` + the `paw_x3` namespace (EXL3 GEMV/GEMM) + `x3_mm` op |
+| `ggml/src/ggml-cuda/paw.cuh` | op entry-point declarations (unchanged) |
 | `ggml/src/ggml-cuda/fattn-dq4.cu/.cuh` | direct-q4 verify attention kernel (env-gated `GGML_PAW_DQ4`) |
 | `ggml/src/ggml-vulkan/vulkan-shaders/paw_*.comp` | Vulkan codec shaders |
 | `tools/paw-parity/paw-parity.cpp` | AR parity driver (JSON protocol) |
@@ -102,17 +109,23 @@ versions unmodified.
    quality gate). A kernel that cannot be measured is not merged.
 4. Before merging: `scripts/paw/paw-verify.sh` must pass, and `paw-parity`
    output must match the reference bit-for-bit (or the diff is explained).
-5. Keep the kernel self-contained in `paw.cu` where possible; every touch of
-   a shared upstream file (dispatch tables, asserts) is a future merge cost.
+5. Keep the kernel in its op file (`paw-<op>.cu`) where possible; a kernel
+   needed by more than one op goes in `paw-common.cuh` (defined once, reused).
+   Every touch of a shared upstream file (dispatch tables, asserts) is a
+   future merge cost.
+6. The split is a pure line-move of the former `paw.cu`; `scripts/paw/
+   split_paw.py` regenerates it from a single `paw.cu` and verifies line
+   coverage. If you re-merge the files, keep that script in sync.
 
 ## Env flags
 
-The full set lives in `ggml/src/ggml-cuda/paw.cu`, `fattn-dq4.cu`,
-`src/` and `common/`; list them with:
+The full set lives in `ggml/src/ggml-cuda/paw-*.cu`, `paw-common.cuh`,
+`fattn-dq4.cu`, `src/` and `common/`; list them with:
 
 ```sh
 grep -rhoE 'GGML_PAW_[A-Z0-9_]+|GGML_DFLASH2_[A-Z0-9_]+|PAW_DBG_RS' \
-  ggml/src/ggml-cuda/paw.cu ggml/src/ggml-cuda/fattn-dq4.cu src/ common/ | sort -u
+  ggml/src/ggml-cuda/paw-*.cu ggml/src/ggml-cuda/paw-common.cuh \
+  ggml/src/ggml-cuda/fattn-dq4.cu src/ common/ | sort -u
 ```
 
 Other docs in this directory:

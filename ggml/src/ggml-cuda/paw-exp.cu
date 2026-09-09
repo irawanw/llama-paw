@@ -1,55 +1,6 @@
 // Split from paw.cu; see docs/paw/README.md for the file map.
 #include "paw-common.cuh"
 
-void ggml_cuda_op_paw_exp_basis(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * a     = dst->src[0];
-    const ggml_tensor * b     = dst->src[1];
-    const ggml_tensor * c     = dst->src[2];
-    const ggml_tensor * remap = dst->src[3];
-    const ggml_tensor * ids   = dst->src[4];
-    const ggml_tensor * x     = dst->src[5];
-    const ggml_tensor * accs  = dst->src[6];
-
-    GGML_ASSERT(a->type     == GGML_TYPE_F16);
-    GGML_ASSERT(b->type     == GGML_TYPE_F16);
-    GGML_ASSERT(c->type     == GGML_TYPE_F16);
-    GGML_ASSERT(remap->type == GGML_TYPE_I32);
-    GGML_ASSERT(ids->type   == GGML_TYPE_I32);
-    GGML_ASSERT(x->type     == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(a));
-    GGML_ASSERT(ggml_is_contiguous(b));
-    GGML_ASSERT(ggml_is_contiguous(c));
-    GGML_ASSERT(ggml_is_contiguous(remap));
-    GGML_ASSERT(ggml_is_contiguous(x));
-    GGML_ASSERT(ggml_is_contiguous(dst));
-    if (accs != nullptr) {
-        GGML_ASSERT(accs->type == GGML_TYPE_F32);
-        GGML_ASSERT(ggml_is_contiguous(accs));
-    }
-
-    const int n      = (int) a->ne[0];
-    const int r      = (int) a->ne[1];
-    const int m      = (int) b->ne[1];
-    const int n_used = (int) ids->ne[0];
-    const int n_tok  = (int) ids->ne[1];
-    const int xne1   = (int) x->ne[1];
-    const int ids_s0 = (int)(ids->nb[0]/sizeof(int32_t));
-    const int ids_s1 = (int)(ids->nb[1]/sizeof(int32_t));
-    GGML_ASSERT(r <= 256);   // tv shared bound
-
-    paw_launch(paw_exp_basis_kernel,
-        ggml_cuda_kernel_launch_params(dim3(n_used, n_tok, 1), dim3(256, 1, 1), 0, ctx.stream()),
-        (const half    *) a->data,
-        (const half    *) b->data,
-        (const half    *) c->data,
-        (const int32_t *) remap->data,
-        (const int32_t *) ids->data,
-        (const float   *) x->data,
-        accs != nullptr ? (const float *) accs->data : nullptr,
-        (float         *) dst->data,
-        n, r, m, n_used, xne1, ids_s0, ids_s1, accs != nullptr ? 1 : 0);
-}
 
 //
 // EXP_MM — 4 kernels: group pairs by storage expert -> u = H(su_e ⊙ x) per
@@ -2407,6 +2358,70 @@ static __global__ void paw_exp_out2_kernel(
     }
 }
 
+
+
+//
+// supports_op — mirrors the Vulkan predicate (ggml-vulkan.cpp)
+//
+
+// --- PAW_V_REORDER --------------------------------------------------------
+//
+// Row permutation for the v3 mach1 codec. Within the segment starting at
+// seg_off (seg_rows = hd*K*r rows): out[(v*K + k)*hd + d] =
+// in[(k*r + v)*hd + d]. All other rows copy through. Replaces the
+// cont/permute/cont + concat chains the graph used per SSM layer.
+
+
+void ggml_cuda_op_paw_exp_basis(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * a     = dst->src[0];
+    const ggml_tensor * b     = dst->src[1];
+    const ggml_tensor * c     = dst->src[2];
+    const ggml_tensor * remap = dst->src[3];
+    const ggml_tensor * ids   = dst->src[4];
+    const ggml_tensor * x     = dst->src[5];
+    const ggml_tensor * accs  = dst->src[6];
+
+    GGML_ASSERT(a->type     == GGML_TYPE_F16);
+    GGML_ASSERT(b->type     == GGML_TYPE_F16);
+    GGML_ASSERT(c->type     == GGML_TYPE_F16);
+    GGML_ASSERT(remap->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids->type   == GGML_TYPE_I32);
+    GGML_ASSERT(x->type     == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(b));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(ggml_is_contiguous(remap));
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    if (accs != nullptr) {
+        GGML_ASSERT(accs->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(accs));
+    }
+
+    const int n      = (int) a->ne[0];
+    const int r      = (int) a->ne[1];
+    const int m      = (int) b->ne[1];
+    const int n_used = (int) ids->ne[0];
+    const int n_tok  = (int) ids->ne[1];
+    const int xne1   = (int) x->ne[1];
+    const int ids_s0 = (int)(ids->nb[0]/sizeof(int32_t));
+    const int ids_s1 = (int)(ids->nb[1]/sizeof(int32_t));
+    GGML_ASSERT(r <= 256);   // tv shared bound
+
+    paw_launch(paw_exp_basis_kernel,
+        ggml_cuda_kernel_launch_params(dim3(n_used, n_tok, 1), dim3(256, 1, 1), 0, ctx.stream()),
+        (const half    *) a->data,
+        (const half    *) b->data,
+        (const half    *) c->data,
+        (const int32_t *) remap->data,
+        (const int32_t *) ids->data,
+        (const float   *) x->data,
+        accs != nullptr ? (const float *) accs->data : nullptr,
+        (float         *) dst->data,
+        n, r, m, n_used, xne1, ids_s0, ids_s1, accs != nullptr ? 1 : 0);
+}
+
 void ggml_cuda_op_paw_exp_mm_batch2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * kept0  = dst->src[0];
     const ggml_tensor * su0    = dst->src[1];
@@ -3084,39 +3099,5 @@ void ggml_cuda_op_paw_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             m, n_used, ids_s0, ids_s1);
     }
     });
-}
-
-//
-// supports_op — mirrors the Vulkan predicate (ggml-vulkan.cpp)
-//
-
-// --- PAW_V_REORDER --------------------------------------------------------
-//
-// Row permutation for the v3 mach1 codec. Within the segment starting at
-// seg_off (seg_rows = hd*K*r rows): out[(v*K + k)*hd + d] =
-// in[(k*r + v)*hd + d]. All other rows copy through. Replaces the
-// cont/permute/cont + concat chains the graph used per SSM layer.
-static __global__ void paw_v_reorder_kernel(
-        const float * GGML_CUDA_RESTRICT y,   // [M, T], rows y_stride floats apart
-        float       * GGML_CUDA_RESTRICT dst, // [M, T] packed
-        const int M, const int T, const int y_stride,
-        const int seg_off, const int hd, const int K, const int r) {
-    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    const int64_t total = (int64_t) M*T;
-    if (idx >= total) {
-        return;
-    }
-    const int row = (int)(idx % M);
-    const int t   = (int)(idx / M);
-    int src_row = row;
-    const int j = row - seg_off;
-    if (j >= 0 && j < hd*K*r) {
-        const int v   = j / (K*hd);
-        const int rem = j % (K*hd);
-        const int k   = rem / hd;
-        const int d   = rem % hd;
-        src_row = seg_off + (k*r + v)*hd + d;
-    }
-    dst[idx] = y[(int64_t) t*y_stride + src_row];
 }
 

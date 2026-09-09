@@ -1,24 +1,6 @@
 // Split from paw.cu; see docs/paw/README.md for the file map.
 #include "paw-common.cuh"
 
-void ggml_cuda_op_paw_v_reorder(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * y = dst->src[0];
-    GGML_ASSERT(y->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-
-    const int seg_off = dst->op_params[0];
-    const int hd      = dst->op_params[1];
-    const int K       = dst->op_params[2];
-    const int r       = dst->op_params[3];
-
-    const int M     = (int) y->ne[0];
-    const int T     = (int) y->ne[1];
-    const int y_str = (int)(y->nb[1] / sizeof(float));
-    const int64_t total = (int64_t) M*T;
-    const int blocks = (int)((total + 255)/256);
-    paw_launch(paw_v_reorder_kernel,
-        ggml_cuda_kernel_launch_params(dim3(blocks, 1, 1), dim3(256, 1, 1), 0, ctx.stream()),
-        (const float *) y->data, (float *) dst->data, M, T, y_str, seg_off, hd, K, r);
-}
 
 // --- PAW_DUAL_MM ----------------------------------------------------------
 //
@@ -58,6 +40,41 @@ static __global__ void paw_dual_mm_kernel(
             dst[(int64_t) t*(2*R) + row] = acc;
         }
     }
+}
+
+
+
+// --- PAW_MOE_REDUCE -------------------------------------------------------
+//
+// dst[:,t] = sum_s experts[:,s,t] * weights[0,s,t]
+//
+// Replaces the MoE aggregation's ggml_mul + (n_used-1) ggml_add chain: at
+// decode that was 8 elementwise launches per layer (320/token over 40 layers)
+// moving a few KB each -- essentially pure launch overhead.
+//
+// Bit-exactness: the old chain rounded each product to fp32 (ggml_mul wrote it
+// to memory) and then summed slot-by-slot in increasing s. __fmul_rn/__fadd_rn
+// reproduce exactly that -- plain `acc += e*w` would let nvcc contract into an
+// FMA, skipping the intermediate rounding and changing the result.
+
+
+void ggml_cuda_op_paw_v_reorder(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * y = dst->src[0];
+    GGML_ASSERT(y->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int seg_off = dst->op_params[0];
+    const int hd      = dst->op_params[1];
+    const int K       = dst->op_params[2];
+    const int r       = dst->op_params[3];
+
+    const int M     = (int) y->ne[0];
+    const int T     = (int) y->ne[1];
+    const int y_str = (int)(y->nb[1] / sizeof(float));
+    const int64_t total = (int64_t) M*T;
+    const int blocks = (int)((total + 255)/256);
+    paw_launch(paw_v_reorder_kernel,
+        ggml_cuda_kernel_launch_params(dim3(blocks, 1, 1), dim3(256, 1, 1), 0, ctx.stream()),
+        (const float *) y->data, (float *) dst->data, M, T, y_str, seg_off, hd, K, r);
 }
 
 void ggml_cuda_op_paw_dual_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -131,39 +148,5 @@ bool ggml_cuda_paw_supported(const ggml_tensor * op) {
         default:
             return false;
     }
-}
-
-// --- PAW_MOE_REDUCE -------------------------------------------------------
-//
-// dst[:,t] = sum_s experts[:,s,t] * weights[0,s,t]
-//
-// Replaces the MoE aggregation's ggml_mul + (n_used-1) ggml_add chain: at
-// decode that was 8 elementwise launches per layer (320/token over 40 layers)
-// moving a few KB each -- essentially pure launch overhead.
-//
-// Bit-exactness: the old chain rounded each product to fp32 (ggml_mul wrote it
-// to memory) and then summed slot-by-slot in increasing s. __fmul_rn/__fadd_rn
-// reproduce exactly that -- plain `acc += e*w` would let nvcc contract into an
-// FMA, skipping the intermediate rounding and changing the result.
-static __global__ void paw_moe_reduce_kernel(
-        const float * GGML_CUDA_RESTRICT experts,   // [n_embd, n_used, n_tok]
-        const float * GGML_CUDA_RESTRICT weights,   // [1,      n_used, n_tok]
-        float       * GGML_CUDA_RESTRICT dst,       // [n_embd, n_tok]
-        const int n_embd, const int n_used) {
-    const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
-    if (i >= n_embd) {
-        return;
-    }
-    ggml_cuda_pdl_sync();
-
-    const float * ebase = experts + (int64_t) t*n_used*n_embd + i;
-    const float * wbase = weights + (int64_t) t*n_used;
-
-    float acc = 0.0f;
-    for (int s = 0; s < n_used; ++s) {
-        acc = __fadd_rn(acc, __fmul_rn(ebase[(int64_t) s*n_embd], wbase[s]));
-    }
-    dst[(int64_t) t*n_embd + i] = acc;
 }
 

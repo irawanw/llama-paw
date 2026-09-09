@@ -1,44 +1,6 @@
 // Split from paw.cu; see docs/paw/README.md for the file map.
 #include "paw-common.cuh"
 
-void ggml_cuda_op_paw_ne_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * packed = dst->src[0];
-    const ggml_tensor * gscale = dst->src[1];
-    const ggml_tensor * lut    = dst->src[2];
-    const ggml_tensor * x      = dst->src[3];
-
-    GGML_ASSERT(packed->type == GGML_TYPE_I8);
-    GGML_ASSERT(gscale->type == GGML_TYPE_F16);
-    GGML_ASSERT(lut->type    == GGML_TYPE_F16);
-    GGML_ASSERT(x->type      == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(packed));
-    GGML_ASSERT(ggml_is_contiguous(gscale));
-    GGML_ASSERT(ggml_is_contiguous(lut));
-    GGML_ASSERT(ggml_is_contiguous(x));
-    GGML_ASSERT(ggml_is_contiguous(dst));
-
-    const int T   = (int) x->ne[0];
-    const int B   = (int) packed->ne[1];
-    const int k   = (int)(packed->ne[0]*8 / T);
-    const int ng  = (int) gscale->ne[0];
-    const int rpc = (int)(B / lut->ne[1]);
-    const int nt  = (int)(x->ne[1]*x->ne[2]*x->ne[3]);
-
-    const dim3 grid((unsigned)((B + 127)/128), (unsigned)((nt + 7)/8), 1);
-    char shp[64];
-    snprintf(shp, sizeof(shp), " B=%d T=%d k=%d nt=%d", B, T, k, nt);
-    paw_timed(ctx.stream(), std::string("ne_mm") + shp, [&]() {
-    paw_launch(paw_ne_mm_kernel,
-        ggml_cuda_kernel_launch_params(grid, dim3(128, 1, 1), 0, ctx.stream()),
-        (const uint8_t *) packed->data,
-        (const half    *) gscale->data,
-        (const half    *) lut->data,
-        (const float   *) x->data,
-        (float         *) dst->data,
-        B, T, k, ng, rpc, nt);
-    });
-}
 
 //
 // RT_MM — 3 kernels: u = H(su ⊙ x) per token -> K4 V2 trellis walk ->
@@ -2577,37 +2539,6 @@ static const half * paw_rt_idx_fp16_bank(const void * bank, const int m, const i
 // finishes the row. Grid (m/8, 1, nt). This is the walk path's replacement at
 // small nt: the decode work is amortized to one time per matrix instead of
 // every step.
-static __global__ void paw_rt_bank_gemv(
-        const half  * GGML_CUDA_RESTRICT bank,   // [m, n] row-major
-        const float * GGML_CUDA_RESTRICT scr_u,  // [nt, n] row-major
-        float       * GGML_CUDA_RESTRICT scr_v,  // [nt, m] row-major
-        const int m, const int n, const int nt) {
-    const int row  = blockIdx.x*8 + (threadIdx.x >> 5);
-    const int t    = blockIdx.z;
-    const int lane = threadIdx.x & 31;
-
-    if (row >= m) {
-        return;
-    }
-    ggml_cuda_pdl_sync();
-
-    const float  * u = scr_u + (int64_t) t*n;
-    const half   * W = bank   + (int64_t) row*n;
-    const half2  * W2 = (const half2 *) W;
-    const float2 * u2 = (const float2 *) u;
-    const int n2 = n/2;
-
-    float acc = 0.0f;
-    for (int i = lane; i < n2; i += 32) {
-        const float2 w = __half22float2(W2[i]);
-        const float2 x = u2[i];
-        acc += w.x*x.x + w.y*x.y;
-    }
-    acc = warp_reduce_sum<32>(acc);
-    if (lane == 0) {
-        scr_v[(int64_t) t*m + row] = acc;
-    }
-}
 
 // float4 variant of paw_rt_bank_gemv: wider loads (16 B/lane/iter instead of
 // 4) to cut load-issue pressure, and u is staged in shared once per block so
@@ -3007,6 +2938,345 @@ static __global__ void paw_rt_out_epilogue_dot_kernel(
         }
         __syncthreads();
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// batched RT_MM (GGML_OP_PAW_RT_MM_BATCH, GGML_PAW_RT_BATCH=1)
+//
+// K matrices sharing one input x run through three phase kernels (u, gemv,
+// out) launched ONCE for the whole group instead of once per matrix. At
+// nt=1 each per-matrix launch is latency/serialization-bound (~10-20 us for
+// a few us of work); packing K independent matrices into one launch lets the
+// blocks fill the GPU concurrently (measured 2.3x on a 3-matrix m=512 probe:
+// 15.2 us serialized -> 6.6 us batched). The graph builder emits this op for
+// adjacent same-x groups like (wq,wk,wv) and (wqkv,wqkv_gate); the op's
+// output is the K outputs concatenated row-wise and sliced with views, so
+// the batch is self-contained (flush-safe: consumers read the group's output
+// only after this one op completes).
+struct paw_rt_batch_desc {
+    const void  * bank;   // cached bank [m, n]: fp16, or e5m2 fp8 (GGML_PAW_BANK_FP8=1)
+    const half  * dense_bank;
+    const half  * tlut;
+    const float * su;     // [n]
+    const float * sv;     // [m]
+    float       * dst;    // output region (dst + row_off)
+    int m, n;
+    int u_off;            // offset into the batched scr_u
+    int v_off;            // offset into the batched scr_v
+    int row_off;          // output row offset
+    int map_off;          // first row of an optional grouped-to-tiled segment
+    int map_hd, map_k, map_r;
+};
+
+// u-phase: one block per (matrix, token); computes u = FWHT(su .* x) / sqrt(n)
+// WG is a template knob (matches paw_rt_u_kernel's convention): n is the
+// same for every matrix in a batch group (constructor-asserted), so unlike
+// the out-kernel there's no per-matrix mismatch to guard against here --
+// the call site can pick WG == n/16 for the whole launch whenever v2 applies.
+template <int WG>
+static __global__ void paw_rt_batch_u_kernel(
+        paw_rt_batch_desc * GGML_CUDA_RESTRICT ddesc,
+        const paw_rt_batch_desc d0, const paw_rt_batch_desc d1,
+        const paw_rt_batch_desc d2, const paw_rt_batch_desc d3,
+        const float * GGML_CUDA_RESTRICT x,
+        float * GGML_CUDA_RESTRICT scr_u,
+        const int nt) {
+    const int mat = blockIdx.x;
+    const int t   = blockIdx.z;
+    const int tid = threadIdx.x;
+    const paw_rt_batch_desc desc = mat == 0 ? d0 : mat == 1 ? d1 : mat == 2 ? d2 : d3;
+    const int n = desc.n;
+    __shared__ float sh[4096];
+
+    if (t == 0 && tid == 0) {
+        ddesc[mat] = desc;
+    }
+    ggml_cuda_pdl_sync();
+    const float * su = desc.su;
+    for (int i = tid; i < n; i += WG) {
+        sh[i] = su[i] * x[(int64_t) t*n + i];
+    }
+    __syncthreads();
+    if (WG == n/16 && paw_fwht_v2_ok(n)) {
+        paw_fwht_block_v2(sh, n, tid, WG);
+    } else {
+        paw_fwht_block(sh, n, tid, WG);
+    }
+    const float sc     = __fsqrt_rn((float) n);
+    const float inv_sc = __frcp_rn(sc);
+    float * u = scr_u + desc.u_off + (int64_t) t*n;
+    for (int i = tid; i < n; i += WG) {
+        u[i] = sh[i] * inv_sc;
+    }
+}
+
+// gemv phase: one block per 8 rows across the whole group; each block finds
+// its matrix by scanning the (small) descriptor array.
+static __global__ void paw_rt_batch_gemv_kernel(
+        const paw_rt_batch_desc * GGML_CUDA_RESTRICT desc,
+        const float * GGML_CUDA_RESTRICT scr_u,
+        float * GGML_CUDA_RESTRICT scr_v,
+        const int nt, const int n_matrices) {
+    const int b    = blockIdx.x;
+    const int t    = blockIdx.z;
+    const int lane = threadIdx.x & 31;
+
+    int mat = 0, base = 0;
+    while (mat + 1 < n_matrices && b >= base + desc[mat].m/32) {
+        base += desc[mat].m/32;
+        mat++;
+    }
+    const int m = desc[mat].m;
+    const int n = desc[mat].n;
+    const int row = (b - base)*8 + (threadIdx.x >> 5);
+    if (row >= m) {
+        return;
+    }
+
+    const float  * u  = scr_u + desc[mat].u_off + (int64_t) t*n;
+    const half2  * W2 = (const half2 *) (desc[mat].dense_bank + (int64_t) row*n);
+    const float2 * u2 = (const float2 *) u;
+    const int n2 = n/2;
+
+    float acc = 0.0f;
+    for (int i = lane; i < n2; i += 32) {
+        const float2 w = __half22float2(W2[i]);
+        const float2 uu = u2[i];
+        acc += w.x*uu.x + w.y*uu.y;
+    }
+    acc = warp_reduce_sum<32>(acc);
+    if (lane == 0) {
+        scr_v[desc[mat].v_off + (int64_t) t*m + row] = acc;
+    }
+}
+
+static __global__ void paw_rt_batch_gemv_kernel_idx80(
+        const paw_rt_batch_desc * GGML_CUDA_RESTRICT desc,
+        const float * GGML_CUDA_RESTRICT scr_u,
+        float * GGML_CUDA_RESTRICT scr_v,
+        const int nt, const int n_matrices) {
+    const int b    = blockIdx.x;
+    const int t    = blockIdx.z;
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+
+    int mat = 0, base = 0;
+    while (mat + 1 < n_matrices && b >= base + desc[mat].m/16) {
+        base += desc[mat].m/16;
+        mat++;
+    }
+
+    __shared__ half2 slut[512];
+    for (int i = tid; i < 512; i += blockDim.x) {
+        slut[i] = ((const half2 *) desc[mat].tlut)[i];
+    }
+    __syncthreads();
+
+    const int m = desc[mat].m;
+    const int n = desc[mat].n;
+    const int row = (b - base)*16 + (tid >> 5);
+    if (row >= m) {
+        return;
+    }
+
+    const float    * u = scr_u + desc[mat].u_off + (int64_t) t*n;
+    const uint32_t * W = (const uint32_t *) desc[mat].bank + (int64_t) row*(n/32)*5;
+    const float2   * u2 = (const float2 *) u;
+    const int n2 = n/2;
+
+    float acc = 0.0f;
+    for (int i = lane; i < n2; i += 32) {
+        const uint16_t code = paw_idx80_get(W, i);
+        const int lr = code & 511;
+        float2 w = __half22float2(slut[lr]);
+        if (code & 512) {
+            w.x = -w.x;
+        }
+        const float2 x = u2[i];
+        acc += w.x*x.x + w.y*x.y;
+    }
+    acc = warp_reduce_sum<32>(acc);
+    if (lane == 0) {
+        scr_v[desc[mat].v_off + (int64_t) t*m + row] = acc;
+    }
+}
+
+// fp8 twin of paw_rt_batch_gemv_kernel: bank is e5m2 (1 byte/weight), same
+// per-block software LUT + uint32/float4 wide loads as paw_rt_bank_gemv_fp8.
+static __global__ void paw_rt_batch_gemv_kernel_fp8(
+        const paw_rt_batch_desc * GGML_CUDA_RESTRICT desc,
+        const float * GGML_CUDA_RESTRICT scr_u,
+        float * GGML_CUDA_RESTRICT scr_v,
+        const int nt, const int n_matrices) {
+    __shared__ float lut[256];
+    const int tid0 = threadIdx.x;
+    if (tid0 < 256) {
+        lut[tid0] = paw_e5m2_to_f32((uint8_t) tid0);
+    }
+    __syncthreads();
+
+    const int b    = blockIdx.x;
+    const int t    = blockIdx.z;
+    const int lane = threadIdx.x & 31;
+
+    int mat = 0, base = 0;
+    while (mat + 1 < n_matrices && b >= base + desc[mat].m/8) {
+        base += desc[mat].m/8;
+        mat++;
+    }
+    const int m = desc[mat].m;
+    const int n = desc[mat].n;
+    const int row = (b - base)*8 + (threadIdx.x >> 5);
+    if (row >= m) {
+        return;
+    }
+
+    const float   * u = scr_u + desc[mat].u_off + (int64_t) t*n;
+    const uint8_t * W = (const uint8_t *) desc[mat].bank + (int64_t) row*n;
+
+    float acc = 0.0f;
+    if (n % 4 == 0) {
+        const uint32_t * W4 = (const uint32_t *) W;
+        const float4   * u4 = (const float4 *) u;
+        const int n4 = n/4;
+        for (int i = lane; i < n4; i += 128) {
+            const uint32_t w = __ldcs(W4 + i);
+            const uint8_t * wb = (const uint8_t *) &w;
+            const float4 x = u4[i];
+            acc += lut[wb[0]]*x.x + lut[wb[1]]*x.y + lut[wb[2]]*x.z + lut[wb[3]]*x.w;
+            const int j = i + 32;
+            if (j < n4) {
+                const uint32_t wj = __ldcs(W4 + j);
+                const uint8_t * wjb = (const uint8_t *) &wj;
+                const float4 xj = u4[j];
+                acc += lut[wjb[0]]*xj.x + lut[wjb[1]]*xj.y + lut[wjb[2]]*xj.z + lut[wjb[3]]*xj.w;
+            }
+            const int k = i + 64;
+            if (k < n4) {
+                const uint32_t wk = __ldcs(W4 + k);
+                const uint8_t * wkb = (const uint8_t *) &wk;
+                const float4 xk = u4[k];
+                acc += lut[wkb[0]]*xk.x + lut[wkb[1]]*xk.y + lut[wkb[2]]*xk.z + lut[wkb[3]]*xk.w;
+            }
+            const int l = i + 96;
+            if (l < n4) {
+                const uint32_t wl = __ldcs(W4 + l);
+                const uint8_t * wlb = (const uint8_t *) &wl;
+                const float4 xl = u4[l];
+                acc += lut[wlb[0]]*xl.x + lut[wlb[1]]*xl.y + lut[wlb[2]]*xl.z + lut[wlb[3]]*xl.w;
+            }
+        }
+    } else {
+        for (int i = lane; i < n; i += 32) {
+            acc += lut[W[i]] * u[i];
+        }
+    }
+    acc = warp_reduce_sum<32>(acc);
+    if (lane == 0) {
+        scr_v[desc[mat].v_off + (int64_t) t*m + row] = acc;
+    }
+}
+
+// out phase: one block per (matrix, token); FWHT over m, scale by sv
+static __global__ void paw_rt_batch_out_kernel(
+        const paw_rt_batch_desc * GGML_CUDA_RESTRICT desc,
+        const float * GGML_CUDA_RESTRICT scr_v,
+        float * GGML_CUDA_RESTRICT dst,
+        const int nt, const int m_sum) {
+    const int mat = blockIdx.x;
+    const int t   = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int m   = desc[mat].m;
+    const int wg  = blockDim.x;   // == m/16, so fwht_block sees nslots <= 16
+    __shared__ float sh[8192];
+
+    ggml_cuda_pdl_sync();
+    const float * v = scr_v + desc[mat].v_off + (int64_t) t*m;
+    for (int i = tid; i < m; i += wg) {
+        __pipeline_memcpy_async(&sh[i], &v[i], sizeof(float));
+    }
+    __pipeline_commit();
+    __pipeline_wait_prior(0);
+    __syncthreads();
+    // wg is sized for the group's largest matrix (blockDim.x == max_m/16), so
+    // v2's wg==m/16 precondition only holds when this matrix's own m equals
+    // that max -- must check per-matrix, not assume it like a single-matrix
+    // launch could (paw_fwht_block itself is wg-agnostic either way, so v1
+    // here is always safe, just not maximally fast).
+    if (wg == m/16 && paw_fwht_v2_ok(m)) {
+        paw_fwht_block_v2(sh, m, tid, wg);
+    } else {
+        paw_fwht_block(sh, m, tid, wg);
+    }
+    const float sc     = __fsqrt_rn((float) m);
+    const float inv_sc = __frcp_rn(sc);
+    const float * sv = desc[mat].sv;
+    // dst is the single [m_sum, T] concatenated output tensor (ggml.c
+    // allocates it contiguous with ne[0]=m_sum), so its per-token stride is
+    // m_sum, NOT this matrix's own m -- using m here aliased every token
+    // after the first for any group with >1 matrix (invisible at nt==1,
+    // corrupting every prompt-eval pass since nt there is the prompt length).
+    float * y = dst + desc[mat].row_off + (int64_t) t*m_sum;
+    for (int i = tid; i < m; i += wg) {
+        int oi = i;
+        if (i >= desc[mat].map_off && desc[mat].map_hd != 0) {
+            const int j = i - desc[mat].map_off;
+            const int d = j % desc[mat].map_hd;
+            const int kr = j / desc[mat].map_hd;
+            const int k = kr / desc[mat].map_r;
+            const int vhead = kr % desc[mat].map_r;
+            oi = desc[mat].map_off + (vhead*desc[mat].map_k + k)*desc[mat].map_hd + d;
+        }
+        y[oi] = sh[i] * inv_sc * sv[i];
+    }
+}
+
+
+
+//
+// EXP_BASIS — one block per (slot, token) pair (paw_exp_basis.comp)
+//
+
+
+
+void ggml_cuda_op_paw_ne_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * packed = dst->src[0];
+    const ggml_tensor * gscale = dst->src[1];
+    const ggml_tensor * lut    = dst->src[2];
+    const ggml_tensor * x      = dst->src[3];
+
+    GGML_ASSERT(packed->type == GGML_TYPE_I8);
+    GGML_ASSERT(gscale->type == GGML_TYPE_F16);
+    GGML_ASSERT(lut->type    == GGML_TYPE_F16);
+    GGML_ASSERT(x->type      == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(packed));
+    GGML_ASSERT(ggml_is_contiguous(gscale));
+    GGML_ASSERT(ggml_is_contiguous(lut));
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int T   = (int) x->ne[0];
+    const int B   = (int) packed->ne[1];
+    const int k   = (int)(packed->ne[0]*8 / T);
+    const int ng  = (int) gscale->ne[0];
+    const int rpc = (int)(B / lut->ne[1]);
+    const int nt  = (int)(x->ne[1]*x->ne[2]*x->ne[3]);
+
+    const dim3 grid((unsigned)((B + 127)/128), (unsigned)((nt + 7)/8), 1);
+    char shp[64];
+    snprintf(shp, sizeof(shp), " B=%d T=%d k=%d nt=%d", B, T, k, nt);
+    paw_timed(ctx.stream(), std::string("ne_mm") + shp, [&]() {
+    paw_launch(paw_ne_mm_kernel,
+        ggml_cuda_kernel_launch_params(grid, dim3(128, 1, 1), 0, ctx.stream()),
+        (const uint8_t *) packed->data,
+        (const half    *) gscale->data,
+        (const half    *) lut->data,
+        (const float   *) x->data,
+        (float         *) dst->data,
+        B, T, k, ng, rpc, nt);
+    });
 }
 
 void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -3736,297 +4006,6 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     });
 }
 
-// ---------------------------------------------------------------------------
-// batched RT_MM (GGML_OP_PAW_RT_MM_BATCH, GGML_PAW_RT_BATCH=1)
-//
-// K matrices sharing one input x run through three phase kernels (u, gemv,
-// out) launched ONCE for the whole group instead of once per matrix. At
-// nt=1 each per-matrix launch is latency/serialization-bound (~10-20 us for
-// a few us of work); packing K independent matrices into one launch lets the
-// blocks fill the GPU concurrently (measured 2.3x on a 3-matrix m=512 probe:
-// 15.2 us serialized -> 6.6 us batched). The graph builder emits this op for
-// adjacent same-x groups like (wq,wk,wv) and (wqkv,wqkv_gate); the op's
-// output is the K outputs concatenated row-wise and sliced with views, so
-// the batch is self-contained (flush-safe: consumers read the group's output
-// only after this one op completes).
-struct paw_rt_batch_desc {
-    const void  * bank;   // cached bank [m, n]: fp16, or e5m2 fp8 (GGML_PAW_BANK_FP8=1)
-    const half  * dense_bank;
-    const half  * tlut;
-    const float * su;     // [n]
-    const float * sv;     // [m]
-    float       * dst;    // output region (dst + row_off)
-    int m, n;
-    int u_off;            // offset into the batched scr_u
-    int v_off;            // offset into the batched scr_v
-    int row_off;          // output row offset
-    int map_off;          // first row of an optional grouped-to-tiled segment
-    int map_hd, map_k, map_r;
-};
-
-// u-phase: one block per (matrix, token); computes u = FWHT(su .* x) / sqrt(n)
-// WG is a template knob (matches paw_rt_u_kernel's convention): n is the
-// same for every matrix in a batch group (constructor-asserted), so unlike
-// the out-kernel there's no per-matrix mismatch to guard against here --
-// the call site can pick WG == n/16 for the whole launch whenever v2 applies.
-template <int WG>
-static __global__ void paw_rt_batch_u_kernel(
-        paw_rt_batch_desc * GGML_CUDA_RESTRICT ddesc,
-        const paw_rt_batch_desc d0, const paw_rt_batch_desc d1,
-        const paw_rt_batch_desc d2, const paw_rt_batch_desc d3,
-        const float * GGML_CUDA_RESTRICT x,
-        float * GGML_CUDA_RESTRICT scr_u,
-        const int nt) {
-    const int mat = blockIdx.x;
-    const int t   = blockIdx.z;
-    const int tid = threadIdx.x;
-    const paw_rt_batch_desc desc = mat == 0 ? d0 : mat == 1 ? d1 : mat == 2 ? d2 : d3;
-    const int n = desc.n;
-    __shared__ float sh[4096];
-
-    if (t == 0 && tid == 0) {
-        ddesc[mat] = desc;
-    }
-    ggml_cuda_pdl_sync();
-    const float * su = desc.su;
-    for (int i = tid; i < n; i += WG) {
-        sh[i] = su[i] * x[(int64_t) t*n + i];
-    }
-    __syncthreads();
-    if (WG == n/16 && paw_fwht_v2_ok(n)) {
-        paw_fwht_block_v2(sh, n, tid, WG);
-    } else {
-        paw_fwht_block(sh, n, tid, WG);
-    }
-    const float sc     = __fsqrt_rn((float) n);
-    const float inv_sc = __frcp_rn(sc);
-    float * u = scr_u + desc.u_off + (int64_t) t*n;
-    for (int i = tid; i < n; i += WG) {
-        u[i] = sh[i] * inv_sc;
-    }
-}
-
-// gemv phase: one block per 8 rows across the whole group; each block finds
-// its matrix by scanning the (small) descriptor array.
-static __global__ void paw_rt_batch_gemv_kernel(
-        const paw_rt_batch_desc * GGML_CUDA_RESTRICT desc,
-        const float * GGML_CUDA_RESTRICT scr_u,
-        float * GGML_CUDA_RESTRICT scr_v,
-        const int nt, const int n_matrices) {
-    const int b    = blockIdx.x;
-    const int t    = blockIdx.z;
-    const int lane = threadIdx.x & 31;
-
-    int mat = 0, base = 0;
-    while (mat + 1 < n_matrices && b >= base + desc[mat].m/32) {
-        base += desc[mat].m/32;
-        mat++;
-    }
-    const int m = desc[mat].m;
-    const int n = desc[mat].n;
-    const int row = (b - base)*8 + (threadIdx.x >> 5);
-    if (row >= m) {
-        return;
-    }
-
-    const float  * u  = scr_u + desc[mat].u_off + (int64_t) t*n;
-    const half2  * W2 = (const half2 *) (desc[mat].dense_bank + (int64_t) row*n);
-    const float2 * u2 = (const float2 *) u;
-    const int n2 = n/2;
-
-    float acc = 0.0f;
-    for (int i = lane; i < n2; i += 32) {
-        const float2 w = __half22float2(W2[i]);
-        const float2 uu = u2[i];
-        acc += w.x*uu.x + w.y*uu.y;
-    }
-    acc = warp_reduce_sum<32>(acc);
-    if (lane == 0) {
-        scr_v[desc[mat].v_off + (int64_t) t*m + row] = acc;
-    }
-}
-
-static __global__ void paw_rt_batch_gemv_kernel_idx80(
-        const paw_rt_batch_desc * GGML_CUDA_RESTRICT desc,
-        const float * GGML_CUDA_RESTRICT scr_u,
-        float * GGML_CUDA_RESTRICT scr_v,
-        const int nt, const int n_matrices) {
-    const int b    = blockIdx.x;
-    const int t    = blockIdx.z;
-    const int tid  = threadIdx.x;
-    const int lane = tid & 31;
-
-    int mat = 0, base = 0;
-    while (mat + 1 < n_matrices && b >= base + desc[mat].m/16) {
-        base += desc[mat].m/16;
-        mat++;
-    }
-
-    __shared__ half2 slut[512];
-    for (int i = tid; i < 512; i += blockDim.x) {
-        slut[i] = ((const half2 *) desc[mat].tlut)[i];
-    }
-    __syncthreads();
-
-    const int m = desc[mat].m;
-    const int n = desc[mat].n;
-    const int row = (b - base)*16 + (tid >> 5);
-    if (row >= m) {
-        return;
-    }
-
-    const float    * u = scr_u + desc[mat].u_off + (int64_t) t*n;
-    const uint32_t * W = (const uint32_t *) desc[mat].bank + (int64_t) row*(n/32)*5;
-    const float2   * u2 = (const float2 *) u;
-    const int n2 = n/2;
-
-    float acc = 0.0f;
-    for (int i = lane; i < n2; i += 32) {
-        const uint16_t code = paw_idx80_get(W, i);
-        const int lr = code & 511;
-        float2 w = __half22float2(slut[lr]);
-        if (code & 512) {
-            w.x = -w.x;
-        }
-        const float2 x = u2[i];
-        acc += w.x*x.x + w.y*x.y;
-    }
-    acc = warp_reduce_sum<32>(acc);
-    if (lane == 0) {
-        scr_v[desc[mat].v_off + (int64_t) t*m + row] = acc;
-    }
-}
-
-// fp8 twin of paw_rt_batch_gemv_kernel: bank is e5m2 (1 byte/weight), same
-// per-block software LUT + uint32/float4 wide loads as paw_rt_bank_gemv_fp8.
-static __global__ void paw_rt_batch_gemv_kernel_fp8(
-        const paw_rt_batch_desc * GGML_CUDA_RESTRICT desc,
-        const float * GGML_CUDA_RESTRICT scr_u,
-        float * GGML_CUDA_RESTRICT scr_v,
-        const int nt, const int n_matrices) {
-    __shared__ float lut[256];
-    const int tid0 = threadIdx.x;
-    if (tid0 < 256) {
-        lut[tid0] = paw_e5m2_to_f32((uint8_t) tid0);
-    }
-    __syncthreads();
-
-    const int b    = blockIdx.x;
-    const int t    = blockIdx.z;
-    const int lane = threadIdx.x & 31;
-
-    int mat = 0, base = 0;
-    while (mat + 1 < n_matrices && b >= base + desc[mat].m/8) {
-        base += desc[mat].m/8;
-        mat++;
-    }
-    const int m = desc[mat].m;
-    const int n = desc[mat].n;
-    const int row = (b - base)*8 + (threadIdx.x >> 5);
-    if (row >= m) {
-        return;
-    }
-
-    const float   * u = scr_u + desc[mat].u_off + (int64_t) t*n;
-    const uint8_t * W = (const uint8_t *) desc[mat].bank + (int64_t) row*n;
-
-    float acc = 0.0f;
-    if (n % 4 == 0) {
-        const uint32_t * W4 = (const uint32_t *) W;
-        const float4   * u4 = (const float4 *) u;
-        const int n4 = n/4;
-        for (int i = lane; i < n4; i += 128) {
-            const uint32_t w = __ldcs(W4 + i);
-            const uint8_t * wb = (const uint8_t *) &w;
-            const float4 x = u4[i];
-            acc += lut[wb[0]]*x.x + lut[wb[1]]*x.y + lut[wb[2]]*x.z + lut[wb[3]]*x.w;
-            const int j = i + 32;
-            if (j < n4) {
-                const uint32_t wj = __ldcs(W4 + j);
-                const uint8_t * wjb = (const uint8_t *) &wj;
-                const float4 xj = u4[j];
-                acc += lut[wjb[0]]*xj.x + lut[wjb[1]]*xj.y + lut[wjb[2]]*xj.z + lut[wjb[3]]*xj.w;
-            }
-            const int k = i + 64;
-            if (k < n4) {
-                const uint32_t wk = __ldcs(W4 + k);
-                const uint8_t * wkb = (const uint8_t *) &wk;
-                const float4 xk = u4[k];
-                acc += lut[wkb[0]]*xk.x + lut[wkb[1]]*xk.y + lut[wkb[2]]*xk.z + lut[wkb[3]]*xk.w;
-            }
-            const int l = i + 96;
-            if (l < n4) {
-                const uint32_t wl = __ldcs(W4 + l);
-                const uint8_t * wlb = (const uint8_t *) &wl;
-                const float4 xl = u4[l];
-                acc += lut[wlb[0]]*xl.x + lut[wlb[1]]*xl.y + lut[wlb[2]]*xl.z + lut[wlb[3]]*xl.w;
-            }
-        }
-    } else {
-        for (int i = lane; i < n; i += 32) {
-            acc += lut[W[i]] * u[i];
-        }
-    }
-    acc = warp_reduce_sum<32>(acc);
-    if (lane == 0) {
-        scr_v[desc[mat].v_off + (int64_t) t*m + row] = acc;
-    }
-}
-
-// out phase: one block per (matrix, token); FWHT over m, scale by sv
-static __global__ void paw_rt_batch_out_kernel(
-        const paw_rt_batch_desc * GGML_CUDA_RESTRICT desc,
-        const float * GGML_CUDA_RESTRICT scr_v,
-        float * GGML_CUDA_RESTRICT dst,
-        const int nt, const int m_sum) {
-    const int mat = blockIdx.x;
-    const int t   = blockIdx.z;
-    const int tid = threadIdx.x;
-    const int m   = desc[mat].m;
-    const int wg  = blockDim.x;   // == m/16, so fwht_block sees nslots <= 16
-    __shared__ float sh[8192];
-
-    ggml_cuda_pdl_sync();
-    const float * v = scr_v + desc[mat].v_off + (int64_t) t*m;
-    for (int i = tid; i < m; i += wg) {
-        __pipeline_memcpy_async(&sh[i], &v[i], sizeof(float));
-    }
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
-    __syncthreads();
-    // wg is sized for the group's largest matrix (blockDim.x == max_m/16), so
-    // v2's wg==m/16 precondition only holds when this matrix's own m equals
-    // that max -- must check per-matrix, not assume it like a single-matrix
-    // launch could (paw_fwht_block itself is wg-agnostic either way, so v1
-    // here is always safe, just not maximally fast).
-    if (wg == m/16 && paw_fwht_v2_ok(m)) {
-        paw_fwht_block_v2(sh, m, tid, wg);
-    } else {
-        paw_fwht_block(sh, m, tid, wg);
-    }
-    const float sc     = __fsqrt_rn((float) m);
-    const float inv_sc = __frcp_rn(sc);
-    const float * sv = desc[mat].sv;
-    // dst is the single [m_sum, T] concatenated output tensor (ggml.c
-    // allocates it contiguous with ne[0]=m_sum), so its per-token stride is
-    // m_sum, NOT this matrix's own m -- using m here aliased every token
-    // after the first for any group with >1 matrix (invisible at nt==1,
-    // corrupting every prompt-eval pass since nt there is the prompt length).
-    float * y = dst + desc[mat].row_off + (int64_t) t*m_sum;
-    for (int i = tid; i < m; i += wg) {
-        int oi = i;
-        if (i >= desc[mat].map_off && desc[mat].map_hd != 0) {
-            const int j = i - desc[mat].map_off;
-            const int d = j % desc[mat].map_hd;
-            const int kr = j / desc[mat].map_hd;
-            const int k = kr / desc[mat].map_r;
-            const int vhead = kr % desc[mat].map_r;
-            oi = desc[mat].map_off + (vhead*desc[mat].map_k + k)*desc[mat].map_hd + d;
-        }
-        y[oi] = sh[i] * inv_sc * sv[i];
-    }
-}
-
 void ggml_cuda_op_paw_rt_mm_batch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (!paw_bank_cache_on()) {
         GGML_ASSERT(false);   // batch op requires the bank cache (default on)
@@ -4206,63 +4185,5 @@ void ggml_cuda_op_paw_rt_mm_batch(ggml_backend_cuda_context & ctx, ggml_tensor *
         ggml_cuda_kernel_launch_params(dim3(n_matrices, 1, nt), dim3(out_wg, 1, 1), 0, stream),
         ddesc, scr_v, (float *) dst->data, nt, m_sum);
     });
-}
-
-
-//
-// EXP_BASIS — one block per (slot, token) pair (paw_exp_basis.comp)
-//
-
-static __global__ void paw_exp_basis_kernel(
-        const half    * GGML_CUDA_RESTRICT a,
-        const half    * GGML_CUDA_RESTRICT b,
-        const half    * GGML_CUDA_RESTRICT c,
-        const int32_t * GGML_CUDA_RESTRICT remap,
-        const int32_t * GGML_CUDA_RESTRICT ids,
-        const float   * GGML_CUDA_RESTRICT x,
-        const float   * GGML_CUDA_RESTRICT acc_in,   // nullptr when has_acc == 0
-        float         * GGML_CUDA_RESTRICT dst,
-        const int n, const int r, const int m, const int n_used, const int xne1,
-        const int ids_s0, const int ids_s1, const int has_acc) {
-    constexpr int WG = 256;
-    __shared__ float tv[256];
-
-    const int s   = blockIdx.x;
-    const int t   = blockIdx.y;
-    const int tid = threadIdx.x;
-
-    ggml_cuda_pdl_sync();
-    const uint32_t id = (uint32_t) ids[s*ids_s0 + t*ids_s1];
-    const uint32_t rm = (uint32_t) remap[id];
-
-    const int64_t obase = (int64_t) t*n_used*m + (int64_t) s*m;
-    if ((rm & GGML_CUDA_PAW_DEM_FLAG) == 0u) {   // kept slot: block-uniform
-        for (int i = tid; i < m; i += WG) {
-            dst[obase + i] = has_acc ? acc_in[obase + i] : 0.0f;
-        }
-        return;
-    }
-    const int di = (int)(rm & ~GGML_CUDA_PAW_DEM_FLAG);
-    const int64_t xbase = (int64_t)(xne1 == 1 ? 0 : s*n) + (int64_t) t*xne1*n;
-
-    // t_j = c_j * (A_j . x)
-    for (int j = tid; j < r; j += WG) {
-        float acc = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            acc += __half2float(a[(int64_t) j*n + i]) * x[xbase + i];
-        }
-        // one rounding: t_j = fl(c_j * v_j)
-        tv[j] = __half2float(c[(int64_t) di*r + j]) * acc;
-    }
-    __syncthreads();
-    for (int i = tid; i < m; i += WG) {
-        float acc = 0.0f;
-        for (int j = 0; j < r; ++j) {
-            // reference rounds B_ij*t_j before the add — pinned, no fma
-            const float pr = __fmul_rn(__half2float(b[(int64_t) i*r + j]), tv[j]);
-            acc = __fadd_rn(acc, pr);
-        }
-        dst[obase + i] = has_acc ? acc_in[obase + i] + acc : acc;
-    }
 }
 

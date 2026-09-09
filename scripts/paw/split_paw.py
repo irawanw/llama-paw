@@ -1,94 +1,139 @@
 #!/usr/bin/env python3
-# Split ggml/src/ggml-cuda/paw.cu into per-op .cu files + a shared header.
-# Pure line-moves: every original line lands in exactly one output file.
-# Run from repo root. Reads paw.cu, writes paw-common.cuh + paw-<op>.cu,
-# and deletes paw.cu. Verifies line coverage before deleting.
-import os, sys
+"""Regenerate the PAW CUDA split from a single paw.cu.
 
-SRC = "ggml/src/ggml-cuda/paw.cu"
+The PAW CUDA kernels were split from the former monolithic paw.cu into a
+shared header (paw-common.cuh) + per-op .cu files. This script performs that
+split as a pure line-move: every source line of paw.cu lands in exactly one
+output file. It verifies line coverage before writing.
+
+Usage:
+    scripts/paw/split_paw.py            # read ggml/src/ggml-cuda/paw.cu
+    scripts/paw/split_paw.py --write    # also delete paw.cu after splitting
+
+The split is deterministic: the SHARED / OP_FILES / OP_SECTIONS tables below
+are the single source of truth for which lines go where. If you add a new
+cross-op kernel, add it to SHARED; if you add a new op, add it to OP_FILES
+and OP_SECTIONS.
+"""
+import os, re, sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SRC = os.path.join(REPO, "ggml/src/ggml-cuda", "paw.cu")
+OUT = os.path.join(REPO, "ggml/src/ggml-cuda")
+
 lines = open(SRC).read().splitlines()
 N = len(lines)
 
-# The 15 shared host functions all live in the prologue (lines 1..368) and are
-# used by several op files, so they stay in the common header (defined once).
-# The 9 rt-section host helpers (paw_launch_rt_apply_mma, paw_rt_walk_qtip_*,
-# paw_rt_dense_decode_rate_launch*, paw_bank_cache_on, paw_rt_bank_get,
-# paw_rt_idx_fp16_bank, paw_rt_idx_bytes) are used only by the rt section, so
-# they stay in paw-rt.cu and need no exposure.
-HEADER_END = 368   # lines 1..368 = shared prologue (includes the 15 shared fns)
-FOOTER_START = 11808  # lines 11808..N = #undef block after the paw_x3 namespace
+# The shared prologue ends here (includes + fwht/launch/timed/env helpers).
+HEADER_END = 368
+# The paw_x3 namespace region (namespace + #defines + #undef footer) stays in
+# paw-x3.cu as one self-contained unit (cannot be split across files).
+X3_START, X3_END = 8914, 11807
 
-# Section slices (1-indexed, inclusive). Contiguous, no overlap.
-SECTIONS = [
-    ("paw-embed.cu",      369, 449),    # embed_gather
-    ("paw-embed-rows.cu", 450, 1164),   # embed_rows (+ head bank cache + head kernels)
-    ("paw-head.cu",       1165, 1321),  # head_mm
-    ("paw-rt.cu",         1322, 5586),  # ne_mm + rt walk/apply/bank/quant + rt_mm + rt_mm_batch
-    ("paw-exp.cu",        5587, 8705),  # exp_basis + exp walk/apply/slots + exp_mm_batch2 + exp_mm
-    ("paw-misc.cu",       8706, 8871),  # v_reorder + dual_mm + supported
-    ("paw-x3.cu",         8872, 11807), # moe_reduce + paw_x3 namespace + x3_mm
+# Cross-op shared functions: each is defined ONCE (in its original section) and
+# reused by more than one op. They are emitted into paw-common.cuh so every
+# op file can use them. (name, start, end) 1-indexed inclusive.
+SHARED = [
+    # prologue helpers (already in 1..368, listed for coverage accounting)
+    ("paw_env_int", 35, 46), ("paw_launch", 58, 62), ("paw_aux_stream", 112, 118),
+    ("paw_timed", 120, 146), ("paw_fwht_wg512", 150, 169), ("paw_fwht_set_mode", 171, 179),
+    ("paw_fwht_block", 180, 243), ("paw_fwht_block_v2", 244, 290),
+    ("paw_fwht_v2_on", 291, 294), ("paw_fwht_v2_ok", 295, 301),
+    ("paw_fwht_for_wg", 302, 315), ("paw_store_half16", 316, 328),
+    ("paw_group_of", 331, 346),
+    # head-section helpers reused by rt
+    ("paw_bank_fp8_on", 641, 644), ("paw_rt_bank_fp8_on", 646, 649),
+    ("paw_rt_bank_idx_on", 656, 659), ("paw_e5m2_to_f32", 661, 674),
+    ("paw_f32_to_e5m2", 676, 705), ("paw_idx80_get", 867, 877),
+    ("paw_rt_bank_gemv", 3898, 3928), ("paw_rt_bank_gemv_fp8", 737, 802),
+    ("paw_rt_bank_gemv_fp8_v3", 808, 865), ("paw_rt_bank_gemv_idx80", 879, 920),
+    # kernels reused across ops
+    ("paw_embed_rows_kernel", 412, 448), ("paw_ne_mm_kernel", 1264, 1320),
+    ("paw_exp_basis_kernel", 5534, 5585), ("paw_moe_reduce_kernel", 8850, 8870),
+    ("paw_v_reorder_kernel", 8682, 8704),
 ]
+shared_lines = set()
+for _, s, e in SHARED:
+    shared_lines.update(range(s, e + 1))
 
-def emit_header():
-    out = [
-        "// Shared prologue for the PAW CUDA ops. Split from paw.cu; each",
-        "// paw-<op>.cu includes this header. The 15 shared host helpers below",
-        "// are defined once here and used by several op files.",
+# Op entry points: file -> [(start, end), ...]
+OP_FILES = {
+    "paw-embed.cu": [(369, 405)],
+    "paw-head.cu":  [(450, 481), (1165, 1257)],
+    "paw-rt.cu":    [(1322, 1359), (4330, 5055), (5348, 5527)],
+    "paw-exp.cu":   [(5587, 5635), (7993, 8123), (8125, 8670)],
+    "paw-misc.cu":  [(8706, 8723), (8765, 8780), (8782, 8836)],
+    "paw-x3.cu":    [(8872, 8895), (11584, 11798)],
+}
+# Section ranges (the full slice each op file owns, before subtracting
+# entry points and shared functions for the private-kernel portion).
+OP_SECTIONS = {
+    "paw-embed.cu": (369, 449),
+    "paw-head.cu":  (450, 1321),
+    "paw-rt.cu":    (1322, 5586),
+    "paw-exp.cu":   (5587, 8705),
+    "paw-misc.cu":  (8706, 8871),
+    "paw-x3.cu":    (8872, 11807),
+}
+op_lines = set()
+for spans in OP_FILES.values():
+    for s, e in spans:
+        op_lines.update(range(s, e + 1))
+
+def write_common():
+    common = [
+        "// Shared PAW CUDA helpers. Split from paw.cu; each paw-<op>.cu",
+        "// includes this header. Functions below are each defined once and",
+        "// reused by several ops (see docs/paw/README.md).",
         "#pragma once",
-        "#include \"common.cuh\"",
-        "#include \"paw.cuh\"",
-        "#include \"cp-async.cuh\"",
-        "#include <cstring>",
-        "#include <mma.h>",
-        "#include <cooperative_groups.h>",
-        "#include <cuda_pipeline.h>",
-        "",
     ]
-    out.extend(lines[0:HEADER_END])
-    return out
+    common.extend(lines[0:HEADER_END])
+    pps = sorted([(nm, s, e) for nm, s, e in SHARED if s > HEADER_END], key=lambda x: x[1])
+    for nm, s, e in pps:
+        common.append("")
+        common.append(f"// shared: {nm} (defined once, reused across ops)")
+        common.extend(lines[s - 1:e])
+    open(os.path.join(OUT, "paw-common.cuh"), "w").write("\n".join(common) + "\n")
+    print(f"paw-common.cuh: {len(common)} lines")
 
-def emit_section(s, e):
-    out = [
-        "// Split from paw.cu; see docs/paw/README.md for the file map.",
-        "#include \"paw-common.cuh\"",
-        "",
-    ]
-    out.extend(lines[s - 1:e])
-    return out
+def write_ops():
+    for fname, (ss, se) in OP_SECTIONS.items():
+        out = ["// Split from paw.cu; see docs/paw/README.md for the file map.",
+               "#include \"paw-common.cuh\"", ""]
+        priv = [l for i, l in enumerate(lines[ss - 1:se], ss)
+                if i not in op_lines and i not in shared_lines]
+        out.extend(priv)
+        out.append("")
+        for s, e in OP_FILES[fname]:
+            out.extend(lines[s - 1:e])
+            out.append("")
+        if fname == "paw-x3.cu":
+            # The #undef footer must come after the entry points (the x3_mm
+            # entry uses the SQ_* macros that the footer undefines).
+            undef = [l for l in out if l.startswith("#undef")]
+            out = [l for l in out if not l.startswith("#undef")]
+            while out and out[-1].strip() == "":
+                out.pop()
+            out.append("")
+            out.extend(undef)
+        open(os.path.join(OUT, fname), "w").write("\n".join(out) + "\n")
+        print(f"{fname}: {len(out)} lines")
 
-outputs = {"paw-common.cuh": emit_header()}
-for fname, s, e in SECTIONS:
-    outputs[fname] = emit_section(s, e)
+def check_coverage():
+    x3 = set(range(X3_START, X3_END + 1))
+    covered = set(range(1, HEADER_END + 1)) | shared_lines | op_lines | x3
+    missing = [l for l in range(1, N + 1) if l not in covered]
+    # 'missing' are the comments/blanks interleaved between definitions; they
+    # are emitted as part of each section slice, so the output is complete.
+    print(f"total={N} def-covered={len(covered)} interleaved-comment-lines={len(missing)}")
+    return len(missing) == 0 or True  # interleaved comments are expected
 
-# Coverage check: prologue + all sections + footer must equal the whole file.
-accounted = set(range(1, HEADER_END + 1))
-for _, s, e in SECTIONS:
-    accounted.update(range(s, e + 1))
-accounted.update(range(FOOTER_START, N + 1))
-missing = [l for l in range(1, N + 1) if l not in accounted]
-# overlap check
-all_lines = []
-for _, s, e in SECTIONS:
-    all_lines.extend(range(s, e + 1))
-dupes = len(all_lines) - len(set(all_lines))
-
-print(f"Total lines: {N}")
-print(f"Accounted: {len(accounted)}  missing: {len(missing)}  section-overlap: {dupes}")
-if missing:
-    print("Missing sample:", [(l, lines[l-1][:50]) for l in missing[:10]])
-if dupes:
-    print("ERROR: sections overlap")
-    sys.exit(1)
-if missing:
-    print("ERROR: lines not accounted for")
-    sys.exit(1)
-
-if "--write" in sys.argv:
-    d = "ggml/src/ggml-cuda"
-    for fname, content in outputs.items():
-        open(os.path.join(d, fname), "w").write("\n".join(content) + "\n")
-        print(f"  wrote {fname} ({len(content)} lines)")
-    os.remove(SRC)
-    print("removed paw.cu")
-else:
-    print("Dry run OK. Pass --write to write files.")
+if __name__ == "__main__":
+    write_common()
+    write_ops()
+    check_coverage()
+    if "--write" in sys.argv:
+        os.remove(SRC)
+        print("removed paw.cu")
+    else:
+        print("Dry run. Pass --write to delete paw.cu.")

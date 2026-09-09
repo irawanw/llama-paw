@@ -1,30 +1,6 @@
 // Split from paw.cu; see docs/paw/README.md for the file map.
 #include "paw-common.cuh"
 
-void ggml_cuda_op_paw_moe_reduce(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * experts = dst->src[0];
-    const ggml_tensor * weights = dst->src[1];
-
-    GGML_ASSERT(experts->type == GGML_TYPE_F32);
-    GGML_ASSERT(weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type     == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(experts));
-    GGML_ASSERT(ggml_is_contiguous(weights));
-    GGML_ASSERT(ggml_is_contiguous(dst));
-
-    const int n_embd = (int) experts->ne[0];
-    const int n_used = (int) experts->ne[1];
-    const int n_tok  = (int) experts->ne[2];
-
-    constexpr int WG = 256;
-    const dim3 grid((unsigned)((n_embd + WG - 1)/WG), (unsigned) n_tok, 1);
-    paw_launch(paw_moe_reduce_kernel,
-        ggml_cuda_kernel_launch_params(grid, dim3(WG, 1, 1), 0, ctx.stream()),
-        (const float *) experts->data,
-        (const float *) weights->data,
-        (float *) dst->data,
-        n_embd, n_used);
-}
 
 
 // ---------------------------------------------------------------------------
@@ -2713,6 +2689,34 @@ static void launch_x3g(const X3gPlan & plan,
 
 } // namespace paw_x3
 
+
+// scoped macros from the ported section; do not leak into the rest of paw.cu
+
+void ggml_cuda_op_paw_moe_reduce(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * experts = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+
+    GGML_ASSERT(experts->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type     == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(experts));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int n_embd = (int) experts->ne[0];
+    const int n_used = (int) experts->ne[1];
+    const int n_tok  = (int) experts->ne[2];
+
+    constexpr int WG = 256;
+    const dim3 grid((unsigned)((n_embd + WG - 1)/WG), (unsigned) n_tok, 1);
+    paw_launch(paw_moe_reduce_kernel,
+        ggml_cuda_kernel_launch_params(grid, dim3(WG, 1, 1), 0, ctx.stream()),
+        (const float *) experts->data,
+        (const float *) weights->data,
+        (float *) dst->data,
+        n_embd, n_used);
+}
+
 void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     using namespace paw_x3;
 
@@ -2929,7 +2933,6 @@ paw_x3_done:
     }
 }
 
-// scoped macros from the ported section; do not leak into the rest of paw.cu
 #undef NUM_THREADS
 #undef GEMV_STAGE_D
 #undef SQ_KSPLIT_CAP
