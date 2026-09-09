@@ -115,6 +115,11 @@ grep -rhoE 'GGML_PAW_[A-Z0-9_]+|GGML_DFLASH2_[A-Z0-9_]+|PAW_DBG_RS' \
   ggml/src/ggml-cuda/paw.cu ggml/src/ggml-cuda/fattn-dq4.cu src/ common/ | sort -u
 ```
 
+Other docs in this directory:
+
+- `sglang-port-report.md` — session report from the PAW-35B SGLang port
+  (weight conventions, GDN kernel semantics, open divergence at T>15).
+
 Serving-relevant flags (see the measured recipe in `README.md`,
 "Serving at 256k context"):
 
