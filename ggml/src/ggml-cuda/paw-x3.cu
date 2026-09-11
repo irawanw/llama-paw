@@ -1573,6 +1573,13 @@ static void x3_had_in_f32_kernel(const float * __restrict__ x, half * __restrict
 }
 
 // f32 GEMM result -> f32 in place, with svh post-scale.
+// f16 GEMM output -> f32: ggml's dst is f32, but the fp16-accumulate GEMM writes
+// half. Mirrors x3_cast_f32_f16_kernel on the input side.
+__global__ static void x3_cast_f16_f32_kernel(float * __restrict__ dst, const half * __restrict__ src, int n) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half2float(src[i]);
+}
+
 __global__ __launch_bounds__(32)
 static void x3_had_out_f32_kernel(float * __restrict__ y, const half * __restrict__ svh,
                                   const float r_scale)
@@ -2924,6 +2931,17 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const X3gPlan * gplan = (x3_gemm_nt > 0 && nt >= x3_gemm_nt && nt <= x3_gemm_nt_max)
                           ? plan_x3g(bits, n, m) : nullptr;
 
+    // fp16-accumulate for the reconstructed-weight GEMM. GA102 runs fp16 tensor
+    // cores at 2x when the accumulator is fp16 (142 vs 71 TFLOP/s); measured 1.91x
+    // on the real B3.5 shapes. It costs accuracy -- the accumulator rounds to fp16
+    // per K=16 fragment, measured 2.1e-3..3.7e-3 relative RMS against 5e-6..2.8e-5
+    // for fp32 accumulate -- so it stays OFF until a quality battery clears it.
+    // Prefill-only by construction: decode (nt == 1) never reaches this branch.
+    static const bool x3_gemm_f16acc = []() {
+        const char * e = getenv("GGML_PAW_X3_GEMM_F16ACC");
+        return e && atoi(e) != 0;
+    }();
+
     // Plain-reconstruction middle path (exllamav3's 145..1023 reconstructed-GEMM
     // split, see x3_reconstruct_plain_kernel). Above this row count the fused
     // reconstruction's n*m cost is amortized and the standalone rows*(n+m)
@@ -3048,12 +3066,27 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             CUBLAS_CHECK(cublasSetStream(h, stream));
             cublasGemmAlgo_t algo = (m % 8 == 0 && n % 8 == 0 && nt % 8 == 0)
                 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
+            if (x3_gemm_f16acc) {
+                // pool is LIFO: yh is declared after wmat, so it releases first
+                ggml_cuda_pool_alloc<half> yh(ctx.pool(), (size_t) m * nt);
+                const half alpha16 = __float2half(1.0f), beta16 = __float2half(0.0f);
+                CUBLAS_CHECK(cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                                          m, nt, n, &alpha16,
+                                          wmat.get(), CUDA_R_16F, m,
+                                          xh.get(), CUDA_R_16F, n,
+                                          &beta16, yh.get(), CUDA_R_16F, m,
+                                          CUBLAS_COMPUTE_16F, algo));
+                const size_t nel = (size_t) m * nt;
+                x3_cast_f16_f32_kernel<<<(nel + 255) / 256, 256, 0, stream>>>(
+                    (float *) dst->data, yh.get(), (int) nel);
+            } else {
             CUBLAS_CHECK(cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N,
                                       m, nt, n, &alpha,
                                       wmat.get(), CUDA_R_16F, m,
                                       xh.get(), CUDA_R_16F, n,
                                       &beta, (float *) dst->data, CUDA_R_32F, m,
                                       CUBLAS_COMPUTE_32F, algo));
+            }
             if (plain_recon) {
                 x3_had_out_f32_kernel<<<dim3(nt, m / 128), 32, 0, stream>>>(
                     (float *) dst->data, (const half *) svh->data, 0.088388347648f);
