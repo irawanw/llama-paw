@@ -1454,6 +1454,135 @@ static void x3r_reconstruct_ws(half * W, const uint16_t * T,
 
 
 // ---------------------------------------------------------------------------------------------------------
+// Plain trellis reconstruction (port of exllamav3 quant/reconstruct.cu reconstruct_kernel).
+//
+// Emits W in the TRANSFORMED basis: trellis decode + tensor-core-layout shuffle only.
+// No H128, no suh, no svh. The two Hadamards move out to standalone activation
+// passes, which cost rows*(n+m) instead of the fused kernel's n*m -- profitable
+// for the middle row band. exllamav3 uses this split for 145..1023 rows
+// (exl3.py: use_fused = rows >= 1024); PAW keeps its own measured 128 lower
+// cutoff for the direct x3 GEMM and copies only the reconstructed-GEMM split.
+#define RP_THREADS 256
+
+template <int K, int cb>
+__global__ __launch_bounds__(RP_THREADS)
+void x3_reconstruct_plain_kernel
+(
+    half* __restrict__ g_unpacked,
+    const uint16_t* __restrict__ g_packed,
+    int packed_blocks_n,
+    int packed_n_offset
+)
+{
+    constexpr int packed_size = 256 * K / 16;  // in uint16s
+
+    int t = threadIdx.x;
+    int lane_id = t % 32;
+    int warp_id = t / 32;
+    int k = blockIdx.y;
+    int n = blockIdx.x * 8;
+    int tiles_n = gridDim.x;
+    int out_blocks_n = tiles_n * 8;
+
+    // Load packed 16x128 tile
+    __shared__ uint32_t s_packed[8][packed_size / 2];
+    g_packed += (size_t) (k * packed_blocks_n + packed_n_offset + n) * packed_size;
+    if (t < packed_size)
+        ((int4*) s_packed)[t] = ((const int4*) g_packed)[t];
+    __syncthreads();
+
+    // Dequant
+    register FragB frag[2];
+    dq_dispatch<K, cb>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
+
+    // Shuffle from tensor core layout to row major tile
+    __shared__ half2 tile[16][8][8];
+
+    half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
+    half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
+    half2 n2 = __shfl_down_sync(0xFFFFFFFF, frag[1][0], 4, 32);
+    half2 n3 = __shfl_down_sync(0xFFFFFFFF, frag[1][1], 4, 32);
+
+    if (!(lane_id & 4))
+    {
+        half2 m0 = __halves2half2(__low2half(frag[0][0]), __low2half(n0));
+        half2 m1 = __halves2half2(__high2half(frag[0][0]), __high2half(n0));
+        half2 m2 = __halves2half2(__low2half(frag[0][1]), __low2half(n1));
+        half2 m3 = __halves2half2(__high2half(frag[0][1]), __high2half(n1));
+        half2 m4 = __halves2half2(__low2half(frag[1][0]), __low2half(n2));
+        half2 m5 = __halves2half2(__high2half(frag[1][0]), __high2half(n2));
+        half2 m6 = __halves2half2(__low2half(frag[1][1]), __low2half(n3));
+        half2 m7 = __halves2half2(__high2half(frag[1][1]), __high2half(n3));
+        int r0 = (lane_id % 4) * 2;
+        int r1 = r0 + 1;
+        int r2 = r0 + 8;
+        int r3 = r0 + 9;
+        int c0 = lane_id / 8;
+        int c1 = c0 + 4;
+        tile[r0][warp_id][c0] = m0;
+        tile[r1][warp_id][c0] = m1;
+        tile[r2][warp_id][c0] = m2;
+        tile[r3][warp_id][c0] = m3;
+        tile[r0][warp_id][c1] = m4;
+        tile[r1][warp_id][c1] = m5;
+        tile[r2][warp_id][c1] = m6;
+        tile[r3][warp_id][c1] = m7;
+    }
+    __syncthreads();
+
+    // Store unpacked tile
+    int r = t / 16;
+    int c = t % 16;
+    int4* tile_int4 = (reinterpret_cast<int4*> (tile));
+    int4* out_int4 = ((int4*) g_unpacked) + (size_t) (k * 16 + r) * 2 * out_blocks_n + n * 2 + c;
+    *out_int4 = tile_int4[t];
+}
+
+// Host launcher: W is (n, m) row-major fp16 in the TRANSFORMED basis; T is the
+// (n//16, m//16, 16*bits) trellis. m must be a multiple of 128, n of 16.
+static void x3r_reconstruct_plain_ws(half * W, const uint16_t * T,
+                                     int n, int m, int bits, cudaStream_t stream)
+{
+    GGML_ASSERT(n % 16 == 0 && m % 128 == 0);
+    dim3 grid(m / 128, n / 16);
+    if (bits == 1) {
+        x3_reconstruct_plain_kernel<1, 2><<<grid, RP_THREADS, 0, stream>>>(W, T, m / 16, 0);
+    } else if (bits == 2) {
+        x3_reconstruct_plain_kernel<2, 2><<<grid, RP_THREADS, 0, stream>>>(W, T, m / 16, 0);
+    } else if (bits == 4) {
+        x3_reconstruct_plain_kernel<4, 2><<<grid, RP_THREADS, 0, stream>>>(W, T, m / 16, 0);
+    } else {
+        x3_reconstruct_plain_kernel<3, 2><<<grid, RP_THREADS, 0, stream>>>(W, T, m / 16, 0);
+    }
+}
+
+// Standalone activation Hadamards around the plain path. Launch geometry copies
+// exllamav3 quant/hadamard.cu: one 32-thread warp per (row, 128-column segment),
+// grid (rows, cols/128) -- the inner functions index their scale vector with
+// blockIdx.y * 32 + lane, so this mapping is required, not incidental.
+
+// f32 raw activation -> fp16 transformed activation, with suh pre-scale.
+// Replaces the generic f32->f16 cast for this branch (the cast folds into the
+// prologue, bit-identically: see had_hf_r_128_inner_f32).
+__global__ __launch_bounds__(32)
+static void x3_had_in_f32_kernel(const float * __restrict__ x, half * __restrict__ xh,
+                                 const half * __restrict__ suh, const float r_scale)
+{
+    const size_t off = (size_t) gridDim.y * 128 * blockIdx.x + (size_t) blockIdx.y * 128;
+    had_hf_r_128_inner_f32<true, false>(x + off, xh + off, suh, r_scale);
+}
+
+// f32 GEMM result -> f32 in place, with svh post-scale.
+__global__ __launch_bounds__(32)
+static void x3_had_out_f32_kernel(float * __restrict__ y, const half * __restrict__ svh,
+                                  const float r_scale)
+{
+    const size_t off = (size_t) gridDim.y * 128 * blockIdx.x + (size_t) blockIdx.y * 128;
+    had_ff_r_128_inner<false, true>(y + off, y + off, svh, r_scale);
+}
+
+
+// ---------------------------------------------------------------------------------------------------------
 // x3 tensor-core trellis GEMM (port of exllamav3 exl3_gemm_kernel / exl3_gemm_inner)
 //
 // Why this exists: the sq int8 GEMV above is only used by exllamav3 for m <= 2
@@ -2743,6 +2872,11 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(nt64 <= INT_MAX);
     const int nt = (int) nt64;
 
+    // shared index for the two debug dumps (GGML_PAW_X3_DUMP / _DUMP_W) so the
+    // weight file pairs 1:1 with the I/O file of the same call; without this a
+    // shape-keyed W file could come from a different tensor of identical shape.
+    static int x3_dump_count = 0;
+
     static bool sms_init = false;
     if (!sms_init) {
         g_num_sms = x3_num_sms();
@@ -2790,6 +2924,20 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const X3gPlan * gplan = (x3_gemm_nt > 0 && nt >= x3_gemm_nt && nt <= x3_gemm_nt_max)
                           ? plan_x3g(bits, n, m) : nullptr;
 
+    // Plain-reconstruction middle path (exllamav3's 145..1023 reconstructed-GEMM
+    // split, see x3_reconstruct_plain_kernel). Above this row count the fused
+    // reconstruction's n*m cost is amortized and the standalone rows*(n+m)
+    // Hadamards lose; below 129 the direct x3 GEMM already wins.
+    // 0 disables the path and restores the fused-only behavior.
+    static const int x3_plain_max_nt = []() {
+        const char * e = getenv("GGML_PAW_X3_PLAIN_RECON_MAX_NT");
+        return e ? atoi(e) : 1023;  // default on: +6.2% geomean whole-model at ub 512 (2G)
+    }();
+    const bool plain_recon = !gplan
+                          && nt > x3_gemm_nt_max
+                          && nt <= x3_plain_max_nt
+                          && n % 128 == 0 && m % 128 == 0;
+
     // Small-m GEMV path first: its prologue consumes f32 x directly, so a
     // successful launch needs no xh and no cast kernel at all. Tried before any
     // pool allocation (besides its own branch workspace, freed on exit).
@@ -2814,8 +2962,21 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const bool need_xh = !x3v_done && (getenv("GGML_PAW_X3_DUMP") || gplan || nt >= x3_prefill_nt);
     if (need_xh) {
         xh.alloc(ctx.pool(), (size_t) n * nt);
-        x3_cast_f32_f16_kernel<<<((size_t) n * nt + 255) / 256, 256, 0, stream>>>(
-            (half *) xh.get(), (const float *) x->data, (int) ((size_t) n * nt));
+        // timed separately so the 2F "complete x3 operation" comparison includes
+        // the input prologue: the plain path pays a Hadamard here where the
+        // fused path pays only a cast
+        char shpi[64];
+        snprintf(shpi, sizeof(shpi), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
+        paw_timed(stream, std::string(plain_recon ? "x3_in_had" : "x3_in_cast") + shpi, [&]() {
+        if (plain_recon) {
+            // fold the cast into the suh/H128 input prologue: one pass, not two
+            x3_had_in_f32_kernel<<<dim3(nt, n / 128), 32, 0, stream>>>(
+                (const float *) x->data, xh.get(), (const half *) suh->data, 0.088388347648f);
+        } else {
+            x3_cast_f32_f16_kernel<<<((size_t) n * nt + 255) / 256, 256, 0, stream>>>(
+                (half *) xh.get(), (const float *) x->data, (int) ((size_t) n * nt));
+        }
+        });
     }
 
     if (x3v_done) {
@@ -2840,11 +3001,46 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     } else if (nt >= x3_prefill_nt) {
         char shp[64];
         snprintf(shp, sizeof(shp), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
-        paw_timed(stream, std::string("x3_hgemm") + shp, [&]() {
+        paw_timed(stream, std::string(plain_recon ? "x3_hgemm_plain" : "x3_hgemm") + shp, [&]() {
             ggml_cuda_pool_alloc<half> wmat(ctx.pool(), (size_t) n * m);
-            x3r_reconstruct_ws(wmat.get(), (const uint16_t *) trellis->data,
-                               (const half *) suh->data, (const half *) svh->data,
-                               n, m, bits, stream);
+            if (plain_recon) {
+                // W in transformed basis; the Hadamards live on the activations
+                x3r_reconstruct_plain_ws(wmat.get(), (const uint16_t *) trellis->data,
+                                         n, m, bits, stream);
+            } else {
+                x3r_reconstruct_ws(wmat.get(), (const uint16_t *) trellis->data,
+                                   (const half *) suh->data, (const half *) svh->data,
+                                   n, m, bits, stream);
+            }
+            // 2E numerical gate helper: dump the reconstructed W for offline
+            // byte-comparison against the reference reconstruct. Debug only;
+            // the sync makes it unusable in throughput runs.
+            static const int wdump_skip = []() {
+                const char * e = getenv("GGML_PAW_X3_DUMP_SKIP");
+                return e ? atoi(e) : 0;
+            }();
+            static const int wdump_cap = []() {
+                const char * e = getenv("GGML_PAW_X3_DUMP_CAP");
+                return e ? atoi(e) : 16;
+            }();
+            const char * dw = getenv("GGML_PAW_X3_DUMP_W");
+            // same window as the I/O dump: uncapped this writes n*m*2 bytes on
+            // every call (hundreds of GB over a full prefill)
+            if (dw && !(x3_dump_count >= wdump_skip && x3_dump_count < wdump_skip + wdump_cap)) {
+                dw = nullptr;
+            }
+            if (dw) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                std::vector<uint16_t> hw((size_t) n * m);
+                CUDA_CHECK(cudaMemcpy(hw.data(), wmat.get(), (size_t) n * m * 2, cudaMemcpyDeviceToHost));
+                char wp[512];
+                snprintf(wp, sizeof(wp), "%s/w%02d_n%d_m%d_K%d_%s.u16", dw,
+                         x3_dump_count, n, m, bits, plain_recon ? "plain" : "fused");
+                FILE * f = fopen(wp, "wb");
+                if (f) { fwrite(hw.data(), 2, (size_t) n * m, f); fclose(f); }
+                if (!getenv("GGML_PAW_X3_DUMP")) ++x3_dump_count;
+            }
+
             // Y(nt,m) = X(nt,n) @ W(n,m), all row-major: column-major view is
             // Y_col(m,nt) = W_col(m,n) @ X_col(n,nt) with identical bytes.
             const float alpha = 1.0f, beta = 0.0f;
@@ -2858,6 +3054,10 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                                       xh.get(), CUDA_R_16F, n,
                                       &beta, (float *) dst->data, CUDA_R_32F, m,
                                       CUBLAS_COMPUTE_32F, algo));
+            if (plain_recon) {
+                x3_had_out_f32_kernel<<<dim3(nt, m / 128), 32, 0, stream>>>(
+                    (float *) dst->data, (const half *) svh->data, 0.088388347648f);
+            }
         });
     } else {
     // small-nt fused path: one launch over all nt rows (trellis read once).
@@ -2893,7 +3093,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // the Phase-1 oracle (GGML_PAW_X3_DUMP=<dir>)
 paw_x3_done:
     if (const char * dump_dir = getenv("GGML_PAW_X3_DUMP")) {
-        static int dump_count = 0;
+        int & dump_count = x3_dump_count;
         static const int dump_skip = []() {
             const char * e = getenv("GGML_PAW_X3_DUMP_SKIP");
             return e ? atoi(e) : 0;
