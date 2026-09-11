@@ -2935,11 +2935,20 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // cores at 2x when the accumulator is fp16 (142 vs 71 TFLOP/s); measured 1.91x
     // on the real B3.5 shapes. It costs accuracy -- the accumulator rounds to fp16
     // per K=16 fragment, measured 2.1e-3..3.7e-3 relative RMS against 5e-6..2.8e-5
-    // for fp32 accumulate -- so it stays OFF until a quality battery clears it.
+    // for fp32 accumulate, which is above this project's 0.2% block gate. That
+    // gate was calibrated for *weight* error, which is systematic and compounds
+    // every forward; accumulator rounding is zero-mean and re-randomised per
+    // matmul, so it does not carry the same way -- and the paired quality battery
+    // is null on all three benchmarks (MMLU-Pro 338/336 p=0.625, HumanEval+
+    // 152/152 identical item-for-item, MBPP+ 297/298 p=1.000; see
+    // reports/paw27b_pp_speed_results_20260911.md in bonsai-pilot).
+    // Speed: PP8192 914.7 -> 1215.4 (+32.9%), PP at 211k/262144 ctx 480.5 ->
+    // 563.0 (+17.2%), TG unchanged (-0.5% chat, +0.3% at depth), +18 MiB VRAM.
+    // ON by default since 2026-09-11; set GGML_PAW_X3_GEMM_F16ACC=0 to disable.
     // Prefill-only by construction: decode (nt == 1) never reaches this branch.
     static const bool x3_gemm_f16acc = []() {
         const char * e = getenv("GGML_PAW_X3_GEMM_F16ACC");
-        return e && atoi(e) != 0;
+        return e ? atoi(e) != 0 : true;
     }();
 
     // Plain-reconstruction middle path (exllamav3's 145..1023 reconstructed-GEMM
