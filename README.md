@@ -7,6 +7,10 @@ decoded on the fly inside the compute kernels.
 Get the weights from
 [PAW-27B-X3](https://huggingface.co/lackonendes/PAW-27B-X3-GGUF) (1.5-3.5
 bit) and [PAW-35B-A3B](https://huggingface.co/lackonendes/PAW-35B-A3B-GGUF).
+Direct downloads for the recommended 27B x3 artifact:
+
+- [PAW-27B-X3-3.5bit.gguf](https://huggingface.co/lackonendes/PAW-27B-X3-GGUF/resolve/main/PAW-27B-X3-3.5bit.gguf) (11.50 GiB)
+- [Qwen3.8-27B-DFlash2-Q2_K.gguf](https://huggingface.co/lackonendes/PAW-27B-X3-GGUF/resolve/main/Qwen3.8-27B-DFlash2-Q2_K.gguf) (0.67 GiB, speculative drafter)
 
 The PAW codec ops are implemented for **CPU, CUDA, and Vulkan**. There are no
 Metal kernels: on Apple Silicon this fork runs the codec on CPU.
@@ -92,6 +96,25 @@ column is comparable across every row. IFB-L/IFB-S are raw pass counts out of
   (uniform K1) is total structural incoherence (0 on every benchmark); B1.5
   is a real, partial recovery (MMLU-Pro 118, HumanEval 101).
 
+### Inference speed (current build, B3.5, one RTX 3090)
+
+Since `9f3ba0717` the fp16-accumulate x3 GEMM is on by default
+(`GGML_PAW_X3_GEMM_F16ACC=0` restores fp32). Measured on B3.5:
+
+| measurement | tok/s |
+|---|---:|
+| PP512 (short prompt) | 1076.5 |
+| PP8192 (chat length) | **1215.4** |
+| PP, 211k-token prompt at 262144 ctx (`-ub 2048`) | 563.0 |
+| TG128 (generation, chat scale) | 33.5 |
+| TG at 211k depth | 19.9 |
+| speculative decode, 8k code context | 100.45 (median, output hash-identical) |
+
+The PP512/TG128 column in the table above was measured on the older
+fp32-accumulate build and is retained for cross-artifact comparability. The
+fp16-accumulate change passed a paired quality A/B with no detectable
+difference on MMLU-Pro / HumanEval+ / MBPP+.
+
 ## Quick start
 
 ```sh
@@ -141,6 +164,10 @@ export GGML_PAW_X3_GEMV=2 GGML_PAW_MMQ_HEAD=1 GGML_PAW_GREEDY_IDS=1 GGML_PAW_DQ4
   262144 with speculative decoding; `-ubd 256` caps the draft ubatch.
 - `-ub 2048 -b 8192`: measured 425.8 tok/s prefill at a 229k-token prompt in
   spec mode; AR decode ~16.8 tok/s at 242k after the FA GQA batching fix.
+- At context depths up to ~160k, `-ub 4096` is faster than `-ub 2048` (930 vs
+  903 tok/s PP8192 before the fp16-accumulate change) and passes the VRAM
+  gate there; at 262144 it does not fit, so keep `-ub 2048` for the full
+  context profile.
 - The drafter's KV is ~50 MiB at 262144 (5 sliding-window-2048 layers).
 - If you are tight on VRAM, lower `-ub` first - it is the footprint lever.
 - At short context the same stack is verified at 100.45 tok/s median on an
