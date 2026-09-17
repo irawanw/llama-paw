@@ -16,6 +16,7 @@
 #   scripts/paw/paw-overlay.sh list            # the overlay file set, classified
 #   scripts/paw/paw-overlay.sh export <dir>    # new files + a patch for modified ones
 #   scripts/paw/paw-overlay.sh check           # warn about overlay code in upstream files
+#   scripts/paw/paw-overlay.sh constants [ref] # overlay edits that carry no PAW identifier
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -81,8 +82,63 @@ check)
     done | sort -rn
     ;;
 
+constants)
+    # The blind spot in every grep-based detector above: an overlay edit that mentions no PAW
+    # identifier at all. PAW raises upstream's own GGML_MAX_SRC from 10 to 16 because the x3 MoE
+    # op takes 15 sources. That line matches no pattern here, so a catchup takes upstream's value
+    # without a conflict and without a warning - and the damage is silent. src[10..14] becomes
+    # out of bounds, which is UB, so the compiler deleted the whole body of
+    # ggml_cuda_op_paw_x3_moe (190 bytes for 228 lines) and ggml.c wrote past the end of
+    # ggml_tensor. -Wno-array-bounds is in upstream's CUDA flags, so nothing was reported. See
+    # docs/paw/CATCHUP.md TRAP 6.
+    #
+    # So: compare the VALUE of every plain #define in the shared files, and make each difference
+    # an explicit decision.
+    #   constants            - values PAW overrides upstream on; eyeball that each is intended
+    #   constants <prev-ref> - after a catchup, report overrides that <prev-ref> had and we lost
+    defines() {  # <ref> <file> -> "NAME VALUE" for simple numeric/plain object macros
+        git show "${1}:${2}" 2>/dev/null \
+            | grep -E '^[[:space:]]*#define[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+[^([:space:]]' \
+            | sed -E 's|//.*||; s|/\*.*||; s/^[[:space:]]*#define[[:space:]]+//; s/[[:space:]]+/ /g; s/ $//'
+    }
+    # rows where ref defines the same macro as upstream but with a different value
+    diffs() {
+        local ref="$1" f
+        git grep -l -E "$PAT" "$ref" -- "${EXCL[@]}" | sed "s|^${ref}:||" | sort -u \
+          | while read -r f; do
+            git cat-file -e "${UPSTREAM}:${f}" 2>/dev/null || continue   # MOD files only
+            comm -23 <(defines "$ref" "$f" | sort -u) <(defines "$UPSTREAM" "$f" | sort -u) \
+              | while read -r name val; do
+                    u=$(defines "$UPSTREAM" "$f" | awk -v n="$name" '$1==n{sub(/^[^ ]+ /,""); print; exit}')
+                    [ -z "$u" ] && continue          # PAW-only macro, not an override
+                    echo "$f|$name|$val|$u"
+                done
+        done
+    }
+    prev="${2:-}"
+    if [ -z "$prev" ]; then
+        echo "upstream constants PAW deliberately overrides (confirm each survives a catchup):"
+        diffs "$REF" | awk -F'|' '{printf "  %-34s %-28s paw=%-8s upstream=%s\n", $1, $2, $3, $4}'
+    else
+        echo "overrides in $prev that $REF does not have. Each needs a decision, not a revert:"
+        echo "  - a value PAW raised for its own reasons (GGML_MAX_SRC) must be restored"
+        echo "  - a version upstream bumped (LLAMA_SESSION_VERSION) is correctly taken from upstream"
+        lost=0
+        diffs "$prev" > /tmp/paw_ov_prev.$$ || true
+        diffs "$REF"  > /tmp/paw_ov_cur.$$  || true
+        while IFS='|' read -r f name val u; do
+            if ! grep -q "^${f}|${name}|" /tmp/paw_ov_cur.$$; then
+                printf "  LOST %-30s %-26s was %s, now upstream's %s\n" "$f" "$name" "$val" "$u"
+                lost=1
+            fi
+        done < /tmp/paw_ov_prev.$$
+        rm -f /tmp/paw_ov_prev.$$ /tmp/paw_ov_cur.$$
+        [ "$lost" = 0 ] && echo "  none - every override in $prev is still present"
+    fi
+    ;;
+
 *)
-    echo "usage: $0 {list|export <dir>|check}" >&2
+    echo "usage: $0 {list|export <dir>|check|constants [prev-ref]}" >&2
     exit 2
     ;;
 esac

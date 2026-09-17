@@ -3845,7 +3845,7 @@ void ggml_cuda_op_paw_x3_moe(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                 if (f) { fwrite(host.data(), 1, bytes, f); fclose(f); }
             };
             int64_t e0 = 0;
-            while (expert_count[e0] == 0) ++e0;
+            while (e0 < n_expert && expert_count[e0] == 0) ++e0;
             const int64_t rows = expert_count[e0];
             FILE * fm = fopen((std::string(moe_dump) + "/meta.txt").c_str(), "w");
             if (fm) {

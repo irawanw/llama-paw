@@ -141,6 +141,56 @@ happened twice: `llama_model_paw` ended up declared *inside* `llama_model_qwen35
 PAW constructor signature was left orphaned with no body. Check brace balance and
 `grep -n '^struct '` after merging headers.
 
+### TRAP 6: the overlay edit that contains no PAW identifier
+
+Every detector in this document finds PAW code by grepping for PAW names. One line defeats all
+of them:
+
+    ggml/include/ggml.h:  #define GGML_MAX_SRC   16      // upstream says 10
+
+PAW raises it because `ggml_cuda_op_paw_x3_moe` takes 15 sources (`dst->src[3 + 4*p + i]`, so
+up to `src[14]`) and `ggml_paw_exp_mm_batch2` uses `src[10]` and `src[11]`. The line mentions
+no PAW symbol, so `paw-overlay.sh list` never reports the file for this reason, the 3-way apply
+takes upstream's value with **no conflict**, and nothing warns.
+
+The damage is silent and does not look like a missing constant:
+
+- `src[10..14]` is now out of bounds. That is UB, so GCC declared everything downstream of the
+  first use unreachable and **deleted the body of `ggml_cuda_op_paw_x3_moe`** - 228 lines of
+  source compiled to 190 bytes of code. Execution fell through into the inlined
+  `ctx.stream()` stream-create block and called `ggml_cuda_set_device` with a leftover tensor
+  pointer in the argument register, which is why the reported device id was huge, negative, and
+  different every run: it was the low 32 bits of a heap address.
+- `ggml.c`'s `result->src[10] = ids; result->src[11] = x;` wrote **past the end of
+  `ggml_tensor`** into whatever the graph allocator put next.
+- `-Wno-array-bounds` is in upstream's CUDA flags, so the out-of-bounds write was never
+  reported.
+
+The single surviving clue was this, and it is worth recognising on sight:
+
+    warning: function might be candidate for attribute 'noreturn' [-Wsuggest-attribute=noreturn]
+
+`-Wmissing-noreturn` is an upstream flag. On a function that plainly returns, that warning does
+not mean "add an attribute" - it means **the compiler has proved no path reaches the end and
+has thrown the body away**. Treat it as an error in PAW code. Confirm with:
+
+    objdump -d build/bin/libggml-cuda.so.0 | grep -A40 '<_Z23ggml_cuda_op_paw_x3_moe'
+
+A function whose source is hundreds of lines and whose disassembly is a few dozen instructions
+has been pruned.
+
+Guard for the whole class - overlay edits that change an upstream value rather than add a name:
+
+    scripts/paw/paw-overlay.sh constants                    # values PAW overrides today
+    scripts/paw/paw-overlay.sh constants <previous-paw-ref> # overrides this catchup dropped
+
+Run the second form after every catchup. Its output is a list of decisions, not of reverts: a
+value PAW raised for its own reasons must be restored, while a version upstream bumped
+(`LLAMA_SESSION_VERSION`, `LLAMA_STATE_SEQ_VERSION`) is correctly taken from upstream.
+
+Changing `GGML_MAX_SRC` changes `sizeof(ggml_tensor)`, so it forces a full rebuild, and any
+build directory that predates the fix is ABI-incompatible with one that follows it.
+
 ### Smaller gotchas
 
 - `git apply -3 <whole patch>` fails **atomically** with `does not exist in index` for every
@@ -173,17 +223,29 @@ Upstream 101 + 13 PAW ops = 114.
 
 ## 6. Gate before trusting a catchup
 
-Build, then:
+Before building, check for overlay edits that carry no PAW identifier (TRAP 6) - these produce
+no conflict and no warning, so nothing else in this procedure will find them:
+
+    scripts/paw/paw-overlay.sh constants <previous-paw-ref>
+
+Then build, and read the warnings rather than only the exit code. In PAW code,
+`-Wsuggest-attribute=noreturn` on a function that returns means the compiler deleted its body:
+
+    grep -n 'noreturn' build.log            # must be empty
+
+Then:
 
     ./build/bin/test-paw-x3-moe                       # per-expert mixed-K MoE
     GGML_PAW_X3_MOE_FUSED_ROWS=0 ./build/bin/test-paw-x3-moe   # fallback path
     ./build/bin/test-paw-x3-mm-id                     # mm_id, K=1..4
     ./build/bin/test-paw-codec <fixtures.gguf>
 
-Note what the first three do *not* prove: they run on random trellis and compare llama-paw
-against llama-paw. Only `bonsai-pilot/scripts/flashnext_x3_phase0b_run.sh` compares llama-paw
-against the EXL3 encoder on real archive bytes, which is what catches a Hadamard-convention or
-suh/svh ordering mismatch.
+Note what those do *not* prove: they run on random trellis and compare llama-paw against
+llama-paw. Only `bonsai-pilot/scripts/flashnext_x3_phase0b_run.sh` compares llama-paw against
+the EXL3 encoder on real archive bytes, which is what catches a Hadamard-convention or suh/svh
+ordering mismatch. Point it at the tree under test, which after a port is a worktree:
+
+    PAW_REPO=/path/to/port bonsai-pilot/scripts/flashnext_x3_phase0b_run.sh 47 <gpu> 2
 
 ---
 
@@ -195,8 +257,67 @@ Upstream `972d2313b`. All 63 hunks resolved, plus the three TRAP 1 omissions.
 `llama-arch`/`llama-model` registration, the Vulkan PAW backend, `tools/paw-parity`, all paw
 tests.
 
-**NOT carried across - open TODO:** `common/speculative.cpp` and `src/models/dflash.cpp` are
-currently **upstream's versions**. Their PAW customizations (DFlash2 selector plumbing, the
+The open TODO from this catchup is in section 9.
+
+---
+
+## 8. RESOLVED: test-paw-x3-moe aborted on the ported tree
+
+Fixed 2026-09-18. Cause: the lost `GGML_MAX_SRC` override, TRAP 6 above. Recorded here because
+the symptom pointed hard at the wrong subsystem and cost most of a session.
+
+The abort looked like a CUDA context bug:
+
+    ggml-cuda.cu:115: GGML_ASSERT(device >= 0 && device < info.device_count) failed
+    ggml_cuda_set_device <- ggml_cuda_op_paw_x3_moe+0x7d
+
+Everything measured about it said the context was fine. `ctx.device` was 0, `curr_stream_no` 0,
+`device_count` 1 at entry; `sizeof(ggml_backend_cuda_context)` was 4400 in both translation
+units with `device` at offset 0 and `curr_stream_no` at 3248; it failed identically under every
+`CUDA_VISIBLE_DEVICES` masking. The device id arriving at `set_device` was garbage and differed
+every run. That combination is impossible to explain by reading the CUDA code, because the CUDA
+code was never wrong.
+
+`ggml_cuda_op_paw_x3_moe` indexes `dst->src[3 + 4*p + i]`, up to `src[14]`. With upstream's
+`GGML_MAX_SRC` of 10 that is out of bounds, so GCC treated the code after the first such access
+as unreachable and deleted the function body: **228 lines of source became 190 bytes of
+machine code**, ending after the first `x3_expert_meta` call with no return. Execution fell
+through into the inlined stream-create block and called `ggml_cuda_set_device` with a stale
+tensor pointer still in `%rdi` - the low 32 bits of a heap address, hence a different "device
+id" on every run. Restoring `GGML_MAX_SRC` to 16 brought the function back to 15,141 bytes.
+
+Two lessons worth more than the fix:
+
+- **An impossible symptom means the wrong subsystem is under the microscope.** Valid inputs,
+  matching layouts, and a garbage value at the callee is not a runtime bug; it is generated
+  code that does not match the source. Check the disassembly against the source size before
+  instrumenting anything.
+- **`-Wsuggest-attribute=noreturn` on a function that returns is an error.** It was in the build
+  output the whole time and reads as a style nit.
+
+The same lost line also silently corrupted `ggml_paw_exp_mm_batch2`, where `ggml.c` writes
+`result->src[10]` and `src[11]` - past the end of `ggml_tensor`, into the graph allocator's
+memory - with no crash and no warning.
+
+Gate after the fix, all on real hardware:
+
+| check | result |
+|-------|--------|
+| `test-paw-x3-moe` fused | PASS, 6/6 token counts, worst rel_rms 0.00718 |
+| `test-paw-x3-moe` `FUSED_ROWS=0` fallback | PASS, bit-exact (rel_rms 0, cos 1.0) |
+| `test-paw-x3-mm-id` | PASS, 14/14, K=1..4 |
+| Phase 0b vs the EXL3 encoder, real archive bytes | **24/24 PASS** |
+
+Phase 0b reproduces the pre-port numbers exactly: gate and up bit-exact, `down` at 0.001122,
+which is the known plain-reconstruction middle path for 129..1023 rows with fp16 intermediates,
+not a convention mismatch. The fused MoE path is verified on the ported tree.
+
+---
+
+## 9. Open TODO
+
+**NOT carried across:** `common/speculative.cpp` and `src/models/dflash.cpp` are currently
+**upstream's versions**. Their PAW customizations (DFlash2 selector plumbing, the
 `GGML_PAW_SPEC_TIME` phase instrumentation, `GGML_DFLASH2_BLOCK_SIZE_OVERRIDE`) were damaged by
 the TRAP 4 dedupe and were reverted rather than shipped silently corrupted. The exact delta is
 saved at `flashnext/rebase_backup/TODO_paw_dflash_spec.patch` and must be re-applied by hand,
@@ -206,41 +327,4 @@ Upstream has meanwhile absorbed part of the DFlash work itself (the `LLM_KV_DFLA
 `dflash_*` hparams are upstream's now), so some of that patch is already redundant - which is
 why it needs a person, not a script.
 
----
-
-## 8. KNOWN REGRESSION: test-paw-x3-moe aborts on the ported tree
-
-`./build/bin/test-paw-x3-moe` aborts before running any case:
-
-    ggml-cuda.cu:115: GGML_ASSERT(device >= 0 && device < info.device_count) failed
-    ggml_cuda_set_device -> ggml_cuda_op_paw_x3_moe+0x7d
-
-What is established, so the next person does not repeat it:
-
-- `test-paw-x3-mm-id` **passes all 14 cases** (K=1..4, both projection shapes), so the trellis
-  kernels, per-expert K dispatch and the mm_id path are fine. The fault is specific to the
-  fused `ggml_cuda_op_paw_x3_moe`.
-- Instrumenting the op shows `ctx.device=0`, `curr_stream_no=0`, `device_count=1` at entry -
-  all valid - and the abort happens on the very next statement, `ctx.stream()`.
-- The device value reaching `ggml_cuda_get_physical_device` is garbage and **differs every
-  run** (892764160, -762277888, -1123610624), i.e. uninitialized memory, not a stale constant.
-- It is **not** an ODR/layout mismatch: `sizeof(ggml_backend_cuda_context)` is 4400 in both the
-  paw-x3.cu and ggml-cuda.cu translation units, with `device` at offset 0 and
-  `curr_stream_no` at 3248 in both.
-- Not caused by device masking: fails identically under `CUDA_VISIBLE_DEVICES=0`, `0,2`, and
-  unmasked.
-- The dispatch site and `paw.cuh` signature match the pre-port versions.
-
-That combination - valid `device`, valid `curr_stream_no`, matching layout, yet a garbage
-argument arriving at `set_device` - is not explicable by reading the source, and print
-bisection has been exhausted. Next step is gdb with a breakpoint on
-`ggml_cuda_get_physical_device`, checking the actual call site and whether the `ctx` reference
-is still the object the caller passed.
-
-Note the op is dispatched from code that is part of the **uncommitted** PAW work
-(`GGML_OP_PAW_X3_MOE` did not exist in any commit), so it has had far less exposure than the
-committed paths. Upstream also added concurrent-stream support (`curr_stream_no`,
-`stream_context`) in the 461-commit window, which is the most likely area of interaction.
-
-Until this is fixed, the fused MoE path must be considered unverified on the ported tree. The
-per-matrix path it falls back to (`paw_x3_mm_id`) is verified.
+`test-paw-codec` was not run: its fixtures GGUF is not on this machine.
