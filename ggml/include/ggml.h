@@ -585,6 +585,21 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_PAW_NE_MM,
+        GGML_OP_PAW_EMBED_ROWS,
+        GGML_OP_PAW_EXP_MM,
+        GGML_OP_PAW_EXP_BASIS,
+        GGML_OP_PAW_RT_MM,
+        GGML_OP_PAW_RT_MM_BATCH,
+        GGML_OP_PAW_X3_MM,
+        GGML_OP_PAW_X3_MM_ID,
+        GGML_OP_PAW_X3_MOE,
+        GGML_OP_PAW_EXP_MM_BATCH2,
+        GGML_OP_PAW_HEAD_MM,
+        GGML_OP_PAW_EMBED_GATHER,
+        GGML_OP_PAW_MOE_REDUCE,
+        GGML_OP_PAW_V_REORDER,
+        GGML_OP_PAW_DUAL_MM,
 
         GGML_OP_UNARY,
 
@@ -2658,6 +2673,283 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // PAW transform-free Lloyd bitshift-trellis GEMM (L=12, group-128).
+    // y = W x where W[r,t] = f32(lut[chunk(r)][state(r,t)]) * f32(gscale[r][t/128]);
+    // state walks an L=12-bit shift register over k = packed_bits/T fresh bits
+    // per step (k in {3,4}), MSB-first. Rates and chunking derive from shapes.
+    //   packed: I8  [T*k/8, B]     gscale: F16 [T/128, B]
+    //   lut:    F16 [4096, n_chunks] (rows_per_chunk = B / n_chunks)
+    //   x:      F32 [T, n_tokens, ...]  ->  dst F32 [B, n_tokens, ...]
+    GGML_API struct ggml_tensor * ggml_paw_ne_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * packed,
+            struct ggml_tensor  * gscale,
+            struct ggml_tensor  * lut,
+            struct ggml_tensor  * x);
+
+    // PAW int3 asymmetric grouped embedding row gather.
+    // W[r,i] = f32(mn[r][i/g]) + q3 * (f32(mx[r][i/g]) - f32(mn[r][i/g])) / 7,
+    // group g = n_embd / mn_ne0; 3-bit codes packed MSB-first.
+    //   q: I8 [n_embd*3/8, n_vocab]   mn,mx: F16 [n_embd/g, n_vocab]
+    //   ids: I32 [n_tokens]  ->  dst F32 [n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_paw_embed_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * mn,
+            struct ggml_tensor  * mx,
+            struct ggml_tensor  * ids);
+
+    // PAW QTIP-trellis routed-expert matmul (expert tier).
+    // For every (slot, token) pair the routed expert's weight matrix W is
+    // materialized in the release decoder's exact fp32 op order and then
+    // applied as y = W x:
+    //   * tail-biting L=16 bitshift trellis, V=2, 16x16 tiles (row-major grid),
+    //     K = words/16 in {1 (demoted), 2 (kept)}; bitstream = 16-bit words,
+    //     MSB-first: L bits of reg0 then K*V fresh bits per step, wrapping
+    //   * state s -> vec via hashed symmetric LUT: p = s*(s+1) (exact int),
+    //     row = (p>>6)&511, tlut[row] with component 0 negated iff bit 15 of p
+    //   * hatWr rounded fp32->fp16->fp32, then W = diag(sv).H_m.hatWr.H_n.diag(su)
+    //     (orthonormal FWHT: butterfly stride 1,2,4,... one final /sqrt(d));
+    //     for demoted experts sv already carries the folded Wscale
+    // remap[orig_expert] = kept_idx, or dem_idx | (1<<30) for demoted experts.
+    //   kept_trellis: I16 [K*16, (m/16)*(n/16), n_kept]
+    //   dem_trellis:  I16 [K1*16, (m/16)*(n/16), n_dem]  (may be NULL: no demoted tier)
+    //   su: F16 [n, n_expert]   sv: F16 [m, n_expert]   tlut: F32 [V, 2^tlut_bits]
+    //   remap: I32 [n_expert]   ids: I32 [n_used, n_tokens]
+    //   x: F32 [n, 1 | n_used, n_tokens]  ->  dst F32 [m, n_used, n_tokens]
+    // The walk generalizes over (V, tlut_bits, K): V and tlut_bits come from the
+    // tlut dims (V=2/512 rows: row=(p>>6)&511; V=8/32768 rows: row=p&0x7FFF), K
+    // from words-per-tile (K*16). Shipped rungs: V2K2/V2K1 (payload v2), V8K1.5
+    // (payload v3, 24 words/tile, 12 fresh bits/step).
+    // wave_gamma (may be NULL; payload v3): F16 [Mb+Nb, n_expert] per-tile scale
+    // applied AFTER the fp16 round, BEFORE the Hadamards; tile (a,b) of the
+    // (Mb=m/16, Nb=n/16) grid uses index a+b<=Nb-1 ? Mb+Nb-1-(a+b) : Mb+Nb-2-(a+b)
+    // (the encoder's last-writing anti-diagonal wavefront).
+    GGML_API struct ggml_tensor * ggml_paw_exp_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kept_trellis,
+            struct ggml_tensor  * dem_trellis,
+            struct ggml_tensor  * su,
+            struct ggml_tensor  * sv,
+            struct ggml_tensor  * tlut,
+            struct ggml_tensor  * remap,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * wave_gamma);
+
+    // PAW shared low-rank basis residual for demoted experts:
+    // y = B (c_e ⊙ (A x)) in fp32 (v = A x sequential dots; t = c*v one
+    // rounding; y_i accumulates fl(B_ij * t_j) sequentially — kept slots
+    // produce zeros). Same remap/ids convention as ggml_paw_exp_mm.
+    // acc is optional (may be NULL): when given it must match dst's shape and
+    // dst = acc + y (the fused form of the ggml_add that would otherwise
+    // follow; kept slots copy acc through).
+    //   basis_a: F16 [n, r]   basis_b: F16 [r, m]   basis_c: F16 [r, n_dem]
+    //   x: F32 [n, 1 | n_used, n_tokens]  ->  dst F32 [m, n_used, n_tokens]
+    GGML_API struct ggml_tensor * ggml_paw_exp_basis(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * basis_a,
+            struct ggml_tensor  * basis_b,
+            struct ggml_tensor  * basis_c,
+            struct ggml_tensor  * remap,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * acc);
+
+    // PAW rotated int-lattice trellis dense matmul (payload v3 NE spine).
+    // Same trellis/LUT/FWHT machinery as ggml_paw_exp_mm but a single dense
+    // tensor: W = diag(sv).H_m.fp16(hatWr).H_n.diag(su), y = W x. su/sv are F32
+    // (int8 signs, with the per-matrix F32 Wscale folded into sv at export —
+    // exact). K derives from words-per-tile (shipped: K=4, 64 words).
+    //   trellis: I16 [K*16, (m/16)*(n/16)]   tlut: F32 [2, 512]
+    //   su: F32 [n]   sv: F32 [m]
+    //   x: F32 [n, n_tokens, ...]  ->  dst F32 [m, n_tokens, ...]
+    //
+    // op_params slot carrying rht_blk. The last slot, deliberately: rt_mm
+    // already uses [0] for the epilogue mode and rt_mm_batch uses [0..4] for
+    // the matrix count and row offsets.
+#define GGML_PAW_RHT_BLK_SLOT (GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1)
+
+    // rht_blk selects the rotation's block size. 0 = one Hadamard over the
+    // whole dimension, which requires n and m to be powers of two -- the
+    // shipped 35B checkpoints. A positive power-of-two rht_blk instead applies
+    // diag(H_blk, ..., H_blk), which only requires blk | n and blk | m, so
+    // dense checkpoints whose dimensions are not powers of two (5120, 17408,
+    // ...) are expressible. Encoder and payload must agree on this value; it
+    // travels in the GGUF as "<arch>.rht_block".
+    GGML_API struct ggml_tensor * ggml_paw_rt_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * su,
+            struct ggml_tensor  * sv,
+            struct ggml_tensor  * tlut,
+            struct ggml_tensor  * x,
+            int                   rht_blk);
+
+    // Decode epilogue form: sigmoid(gate) * (W*x) + acc, with gate [1,T]
+    // and acc/output [m,T]. The extra work is folded into rt_mm's out phase.
+    GGML_API struct ggml_tensor * ggml_paw_rt_mm_epilogue(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * su,
+            struct ggml_tensor  * sv,
+            struct ggml_tensor  * tlut,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * acc,
+            int                   rht_blk);
+
+    // Decode-only scalar-gate variant: computes dot(gate_w, gate_x) inside
+    // the RT output block before applying the epilogue.
+    GGML_API struct ggml_tensor * ggml_paw_rt_mm_epilogue_dot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * su,
+            struct ggml_tensor  * sv,
+            struct ggml_tensor  * tlut,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate_w,
+            struct ggml_tensor  * gate_x,
+            struct ggml_tensor  * acc,
+            int                   rht_blk);
+
+    // Batched form of ggml_paw_rt_mm: K matrices (2..4) that share the same
+    // input x, run through one op so the per-phase kernels launch once for the
+    // whole group instead of once per matrix (the per-matrix launches are
+    // latency-bound at nt=1). Weights are passed as K triples
+    // (trellis, su, sv); src layout is [t0,s0,v0, t1,s1,v1, ..., tK,sK,vK,
+    // tlut, x] = 3K+2 srcs. op_params[0] = K, op_params[1..K] = cumulative
+    // output-row offsets. The output is the K outputs concatenated row-wise
+    // into one [sum(m_i), n_tokens] tensor; the graph slices it with views.
+    GGML_API struct ggml_tensor * ggml_paw_rt_mm_batch(
+            struct ggml_context * ctx,
+            int n_matrices,
+            struct ggml_tensor * const * trellis,
+            struct ggml_tensor * const * su,
+            struct ggml_tensor * const * sv,
+            struct ggml_tensor * tlut,
+            struct ggml_tensor * x,
+            int                  rht_blk);
+
+    // EXL3-compatible fused decode GEMV (mul1-v1 codec): one launch per
+    // matrix, decode-only (x->ne[1] == 1). trellis is I16 [16*K, ntiles]
+    // with ntiles == (m/16)*(n/16); K = trellis->ne[0]/16 in {2, 3}. suh/svh
+    // are F16 [n]/[m] Hadamard sign vectors; the H128 rotations and the
+    // per-slice int8 activation quantization happen inside the kernel, so
+    // unlike ggml_paw_rt_mm there is no input RHT launch, no tlut, and no
+    // global scratch round trip. Output is F32 [m, nt].
+    GGML_API struct ggml_tensor * ggml_paw_x3_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * suh,
+            struct ggml_tensor  * svh,
+            struct ggml_tensor  * x);
+
+    // Routed-expert form of ggml_paw_x3_mm (mul_mat_id semantics) with a
+    // per-expert rate. All experts' trellises are concatenated into one flat
+    // I16 tensor; meta is I32 [2, n_expert] with meta[0,e] = K_e in {1..4}
+    // and meta[1,e] = word offset of expert e (its tile words are
+    // 16*K_e*(m/16)*(n/16)). suh/svh are F16 [n, n_expert]/[m, n_expert].
+    //   ids: I32 [n_expert_used, n_tokens]
+    //   x:   F32 [n, 1 or n_expert_used, n_tokens]
+    //   ->   F32 [m, n_expert_used, n_tokens]
+    GGML_API struct ggml_tensor * ggml_paw_x3_mm_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * meta,
+            struct ggml_tensor  * suh,
+            struct ggml_tensor  * svh,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * x);
+
+    // Fused routed-expert SwiGLU FFN over ggml_paw_x3_mm_id-style expert tensors:
+    //   dst[:,t] = sum_s w[s,t] * down_e(silu(gate_e(x_t)) * up_e(x_t)),  e = ids[s,t]
+    // proj holds 12 tensors, (trellis, meta, suh, svh) for gate, up, down in that order.
+    //   x: F32 [n_embd, n_tokens]   ids: I32 [n_expert_used, n_tokens]
+    //   weights: F32 [1, n_expert_used, n_tokens]   ->   F32 [n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_paw_x3_moe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * const * proj);
+
+    // Batched form of ggml_paw_exp_mm for exactly two routed-expert
+    // projections that share one input x and one routing decision (remap,
+    // ids) -- the gate/up pair of a SwiGLU MoE FFN. Scoped to this
+    // checkpoint's actual runtime shape: V8+P4 trellis, no demotion, no
+    // low-rank basis correction, decode-only (ids->ne[1] == 1). group
+    // (routing) and active-group compaction are computed once and shared;
+    // only the per-matrix u/walk/out kernels run once for the whole pair.
+    // Output is [m, n_expert_used, 2, n_tokens] (matrix 0 then matrix 1);
+    // the caller slices it with views.
+    GGML_API struct ggml_tensor * ggml_paw_exp_mm_batch2(
+            struct ggml_context * ctx,
+            struct ggml_tensor * kept0, struct ggml_tensor * su0,
+            struct ggml_tensor * sv0,   struct ggml_tensor * gamma0,
+            struct ggml_tensor * kept1, struct ggml_tensor * su1,
+            struct ggml_tensor * sv1,   struct ggml_tensor * gamma1,
+            struct ggml_tensor * tlut,
+            struct ggml_tensor * remap,
+            struct ggml_tensor * ids,
+            struct ggml_tensor * x);
+
+    // PAW int5-g64 head matmul (payload v3 lm_head; codec int5g64_packed).
+    // W[r,j] = q[r,j] * f32(gscale[r][j/64]); q int5 in [-16,15], 8 codes per 5
+    // little-endian bytes (code i at bits [5i,5i+5) of the 40-bit block, stored
+    // value q+16). y = W x.
+    //   qp: I8 [n/8*5, n_vocab]   gscale: F16 [n/64, n_vocab]
+    //   x: F32 [n, n_tokens, ...]  ->  dst F32 [n_vocab, n_tokens, ...]
+    GGML_API struct ggml_tensor * ggml_paw_head_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * qp,
+            struct ggml_tensor  * gscale,
+            struct ggml_tensor  * x);
+
+    // PAW lossless nibble-LUT embedding gather (payload v3 embed).
+    // W[r,j] = bf16_to_f32(lut[r*(n_embd/g) + j/g][nib(codes[r], j)]), g = 64;
+    // low nibble = even column. LUT rows are the source bf16 bit patterns, so
+    // the gather reproduces the served embedding exactly.
+    //   codes: I8 [n_embd/2, n_vocab]   lut: BF16 [16, n_vocab*n_embd/g]
+    //   ids: I32 [n_tokens]  ->  dst F32 [n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_paw_embed_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * codes,
+            struct ggml_tensor  * lut,
+            struct ggml_tensor  * ids);
+
+    // Weighted sum of the routed-expert slots:
+    //   dst[:,t] = sum_s experts[:,s,t] * weights[0,s,t]
+    // Replaces the ggml_mul + (n_expert_used-1) ggml_add chain the MoE
+    // aggregation used to emit -- 8 tiny elementwise launches per layer at
+    // decode, almost all launch overhead. Accumulates in slot order so the
+    // result is bit-identical to that chain.
+    //   experts: [n_embd, n_expert_used, n_tokens]
+    //   weights: [1,      n_expert_used, n_tokens]
+    //   dst:     [n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_paw_moe_reduce(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * weights);
+
+    // row permutation for the v3 mach1 codec: within the row segment starting
+    // at seg_off (seg_rows = hd*K*r rows), out[(v*K + k)*hd + d] =
+    // in[(k*r + v)*hd + d]; all other rows copy through. y: [M, T] f32 contig.
+    GGML_API struct ggml_tensor * ggml_paw_v_reorder(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * y,
+            int seg_off, int hd, int K, int r);
+
+    // two [n_embd -> R] GEMVs sharing the input x in one launch:
+    // dst[[0..R), t]   = w0 * x[:, t]
+    // dst[[R..2R), t]  = w1 * x[:, t]
+    // w0/w1: [n_embd, R] f32; x: [n_embd, T] f32; dst: [2R, T] f32.
+    GGML_API struct ggml_tensor * ggml_paw_dual_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * w0,
+            struct ggml_tensor  * w1,
+            struct ggml_tensor  * x);
 
     // DSA lightning indexer
     //

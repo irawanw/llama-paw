@@ -2513,6 +2513,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
+        {"--token-ids-file"}, "FNAME",
+        "whitespace-separated token IDs used instead of tokenizing the prompt",
+        [](common_params & params, const std::string & value) {
+            params.token_ids_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
         {"--ppl-stride"}, "N",
         string_format("stride for perplexity calculation (default: %d)", params.ppl_stride),
         [](common_params & params, int value) {
@@ -4073,6 +4080,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.cpuparams_batch.poll = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-batch-size", "-bd", "--batch-size-draft"}, "N",
+        "logical batch size for the draft context (default: inherit the target's)",
+        [](common_params & params, int value) {
+            params.speculative.draft.n_batch = value;
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_BATCH").set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-ubatch-size", "-ubd", "--ubatch-size-draft"}, "N",
+        "physical batch size for the draft context (default: inherit the target's).\n"
+        "a drafter without its own output tensor borrows the target's head, so its\n"
+        "compute buffer costs n_ubatch * n_vocab * 4 bytes -- lower this when the\n"
+        "draft context fails to allocate at long target context",
+        [](common_params & params, int value) {
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH").set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(

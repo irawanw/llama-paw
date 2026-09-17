@@ -315,6 +315,48 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
         }
     }
+
+    // temporary diagnostic dump of GDN state I/O (PAW batched-inference
+    // investigation). Env: GGML_PAW_GDN_DUMP=<dir> [_SKIP] [_CAP].
+    if (const char * gdn_dump_dir = getenv("GGML_PAW_GDN_DUMP")) {
+        static int gdn_dump_count = 0;
+        static const int gdn_dump_skip = []() {
+            const char * e = getenv("GGML_PAW_GDN_DUMP_SKIP");
+            return e ? atoi(e) : 0;
+        }();
+        static const int gdn_dump_cap = []() {
+            const char * e = getenv("GGML_PAW_GDN_DUMP_CAP");
+            return e ? atoi(e) : 64;
+        }();
+        if (gdn_dump_count >= gdn_dump_skip && gdn_dump_count < gdn_dump_skip + gdn_dump_cap) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            char path[512];
+            snprintf(path, sizeof(path), "%s/gdn%02d", gdn_dump_dir, gdn_dump_count - gdn_dump_skip);
+            FILE * fmeta = fopen((std::string(path) + "_meta.txt").c_str(), "w");
+            fprintf(fmeta, "Sv %lld H %lld ntok %lld nseq %lld K %d\n",
+                (long long) S_v, (long long) H, (long long) n_tokens, (long long) n_seqs, K);
+            fclose(fmeta);
+            const size_t sin_bytes  = (size_t) S_v * S_v * H * n_seqs * sizeof(float);
+            const size_t out_bytes  = (size_t) S_v * H * n_tokens * n_seqs * sizeof(float);
+            const size_t sout_bytes = (size_t) S_v * S_v * H * n_seqs * sizeof(float);
+            size_t hneed = sin_bytes;
+            if (out_bytes  > hneed) hneed = out_bytes;
+            if (sout_bytes > hneed) hneed = sout_bytes;
+            std::vector<char> host(hneed);
+            auto gdn_dump_dev = [&] (const std::string & suffix, const void * dev, size_t bytes) {
+                CUDA_CHECK(cudaMemcpy(host.data(), dev, bytes, cudaMemcpyDeviceToHost));
+                FILE * f = fopen((std::string(path) + suffix).c_str(), "wb");
+                fwrite(host.data(), 1, bytes, f);
+                fclose(f);
+            };
+            gdn_dump_dev("_sin.f32",  s_d,     sin_bytes);
+            gdn_dump_dev("_out.f32",  dst_d,   out_bytes);
+            if (cache == nullptr) {
+                gdn_dump_dev("_sout.f32", state_d, sout_bytes);
+            }
+        }
+        ++gdn_dump_count;
+    }
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

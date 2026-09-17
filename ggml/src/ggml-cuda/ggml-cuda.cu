@@ -69,6 +69,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/paw.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1841,6 +1842,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // SPEC100v2 output head (GGML_PAW_MMQ_HEAD=1): route only the 5120x248320 Q5_K
+    // head matmul to the MMQ kernel. Measured 1.40 ms vs 2.71 ms MMVQ at ne11=6
+    // on RTX 3090 with bit-identical top-16 candidates. Default off.
+    static const bool paw_mmq_head = [] {
+        const char * e = getenv("GGML_PAW_MMQ_HEAD");
+        return e && e[0] == '1';
+    }();
+    if (paw_mmq_head && src0->type == GGML_TYPE_Q5_K && src0->ne[0] == 5120 && src0->ne[1] == 248320 &&
+        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -2412,6 +2426,51 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
+        case GGML_OP_PAW_NE_MM:
+            ggml_cuda_op_paw_ne_mm(ctx, dst);
+            break;
+        case GGML_OP_PAW_EMBED_ROWS:
+            ggml_cuda_op_paw_embed_rows(ctx, dst);
+            break;
+        case GGML_OP_PAW_EXP_MM:
+            ggml_cuda_op_paw_exp_mm(ctx, dst);
+            break;
+        case GGML_OP_PAW_EXP_BASIS:
+            ggml_cuda_op_paw_exp_basis(ctx, dst);
+            break;
+        case GGML_OP_PAW_RT_MM:
+            ggml_cuda_op_paw_rt_mm(ctx, dst);
+            break;
+        case GGML_OP_PAW_X3_MM:
+            ggml_cuda_op_paw_x3_mm(ctx, dst);
+            break;
+        case GGML_OP_PAW_X3_MM_ID:
+            ggml_cuda_op_paw_x3_mm_id(ctx, dst);
+            break;
+        case GGML_OP_PAW_X3_MOE:
+            ggml_cuda_op_paw_x3_moe(ctx, dst);
+            break;
+        case GGML_OP_PAW_RT_MM_BATCH:
+            ggml_cuda_op_paw_rt_mm_batch(ctx, dst);
+            break;
+        case GGML_OP_PAW_EXP_MM_BATCH2:
+            ggml_cuda_op_paw_exp_mm_batch2(ctx, dst);
+            break;
+        case GGML_OP_PAW_HEAD_MM:
+            ggml_cuda_op_paw_head_mm(ctx, dst);
+            break;
+        case GGML_OP_PAW_EMBED_GATHER:
+            ggml_cuda_op_paw_embed_gather(ctx, dst);
+            break;
+        case GGML_OP_PAW_MOE_REDUCE:
+            ggml_cuda_op_paw_moe_reduce(ctx, dst);
+            break;
+        case GGML_OP_PAW_V_REORDER:
+            ggml_cuda_op_paw_v_reorder(ctx, dst);
+            break;
+        case GGML_OP_PAW_DUAL_MM:
+            ggml_cuda_op_paw_dual_mm(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -2578,6 +2637,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
             }
+        }
+
+        // reads the routing ids on the host, like the sorted mul_mat_id path
+        if (node->op == GGML_OP_PAW_X3_MM_ID || node->op == GGML_OP_PAW_X3_MOE) {
+            use_cuda_graph = false;
         }
 
         if (!use_cuda_graph) {
@@ -4280,6 +4344,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            static const bool node_dump = getenv("LLAMA_NODE_DUMP") != nullptr;
+            if (node_dump) {
+                static int dumps_left = 1;
+                if (cgraph->n_nodes > 100 && dumps_left > 0) {
+                    dumps_left--;
+                    for (int i = 0; i < cgraph->n_nodes; i++) {
+                        const ggml_tensor * nd = cgraph->nodes[i];
+                        fprintf(stderr, "ND %4d %-14s %-40s [%lld,%lld,%lld,%lld] src0=%s src1=%s\n",
+                            i, ggml_op_name(nd->op), nd->name,
+                            (long long)nd->ne[0], (long long)nd->ne[1], (long long)nd->ne[2], (long long)nd->ne[3],
+                            nd->src[0] ? nd->src[0]->name : "-",
+                            nd->src[1] ? nd->src[1]->name : "-");
+                    }
+                    fflush(stderr);
+                }
+            }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4351,7 +4431,56 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                // per-op wall clock (GGML_CUDA_OP_TIME=1): sync-bracketed,
+                // so graphs must be off; keyed by op name + op string
+                static const bool op_time_on =
+                    getenv("GGML_CUDA_OP_TIME") != nullptr;
+                static const bool la_time_on =
+                    getenv("LLAMA_LAUNCH_TIME") != nullptr;
+                double op_us = 0.0;
+                if (la_time_on) {
+                    static int64_t la_t0 = ggml_time_us();
+                    static int64_t acc_gap = 0; static int n_la = 0;
+                    static int64_t last = ggml_time_us();
+                    int64_t now = ggml_time_us();
+                    acc_gap += now - last; last = now;
+                    if (++n_la % 4614 == 0) {
+                        fprintf(stderr, "launch-time: host gaps cum=%.1f ms over %d nodes (avg %.1f us/node)\n",
+                            acc_gap/1000.0, n_la, (double)(acc_gap)/n_la);
+                        fflush(stderr);
+                        acc_gap = 0; n_la = 0;
+                    }
+                    (void) la_t0;
+                }
+                if (op_time_on) {
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    op_us = -ggml_time_us();
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (op_time_on) {
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    op_us += ggml_time_us();
+                    static std::mutex op_mtx;
+                    static std::map<std::string,
+                        std::pair<long long, double>> op_acc;
+                    std::lock_guard<std::mutex> l(op_mtx);
+                    auto & e = op_acc[std::string(ggml_op_name(node->op)) +
+                        std::string(": ") + node->name];
+                    e.first += 1;
+                    e.second += op_us;
+                    static long long op_n = 0;
+                    if (++op_n % 20000 == 0) {
+                        fprintf(stderr, "cuda-op-time dump after %lld ops:\n",
+                            op_n);
+                        for (auto & kv : op_acc) {
+                            fprintf(stderr,
+                                "  %9.1f ms  n=%7lld  %s\n",
+                                kv.second.second/1000.0, kv.second.first,
+                                kv.first.c_str());
+                        }
+                        fflush(stderr);
+                    }
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -4380,6 +4509,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
+            static int eager_logged = 0;
+            if (use_cuda_graph) {
+                // captured this pass; replay happens below
+            } else if (!eager_logged && ++eager_logged == 1) {
+                fprintf(stderr, "CUDA-GRAPH: EAGER PATH (use_cuda_graph=false)\n");
+            }
         }
     }
 
@@ -4393,6 +4528,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        static int replay_logged = 0;
+        if (!replay_logged && ++replay_logged == 1) {
+            fprintf(stderr, "CUDA-GRAPH: REPLAY ENGAGED (%zu nodes)\n",
+                cgraph->n_nodes);
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -4420,6 +4560,16 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
+    // LLAMA_GPU_TIME=1: event-bracket the whole graph on the device and
+    // report true GPU execution time per compute call
+    static const bool gpu_time_on = getenv("LLAMA_GPU_TIME") != nullptr;
+    cudaEvent_t gt0, gt1;
+    if (gpu_time_on) {
+        cudaEventCreate(&gt0);
+        cudaEventCreate(&gt1);
+        cudaEventRecord(gt0, cuda_ctx->stream());
+    }
+
     ggml_cuda_set_device(cuda_ctx->device);
 
     bool use_cuda_graph             = false;
@@ -4427,6 +4577,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
+    // LLAMA_NO_GRAPHS=1: skip CUDA graph capture so per-op profiling
+    // (GGML_CUDA_OP_TIME / LLAMA_LAUNCH_TIME) sees individual node dispatches
+    static const bool graphs_disabled = getenv("LLAMA_NO_GRAPHS") != nullptr;
+    if (!graphs_disabled) {
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -4459,6 +4613,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+    }
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -4473,6 +4628,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
+
+    if (gpu_time_on) {
+        cudaEventRecord(gt1, cuda_ctx->stream());
+        cudaEventSynchronize(gt1);
+        float gms = 0;
+        cudaEventElapsedTime(&gms, gt0, gt1);
+        static double acc_g = 0; static int n_g = 0;
+        acc_g += gms; n_g++;
+        if (n_g % 8 == 0) {
+            fprintf(stderr, "gpu-time: cum=%.1f ms n=%d (last=%.2f ms, %d nodes)\n",
+                acc_g, n_g, (double) gms, cgraph->n_nodes);
+            fflush(stderr);
+        }
+        cudaEventDestroy(gt0);
+        cudaEventDestroy(gt1);
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -5513,6 +5684,22 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_PAW_NE_MM:
+        case GGML_OP_PAW_EMBED_ROWS:
+        case GGML_OP_PAW_EXP_MM:
+        case GGML_OP_PAW_EXP_BASIS:
+        case GGML_OP_PAW_RT_MM:
+        case GGML_OP_PAW_RT_MM_BATCH:
+        case GGML_OP_PAW_X3_MM:
+        case GGML_OP_PAW_X3_MM_ID:
+        case GGML_OP_PAW_X3_MOE:
+        case GGML_OP_PAW_EXP_MM_BATCH2:
+        case GGML_OP_PAW_HEAD_MM:
+        case GGML_OP_PAW_EMBED_GATHER:
+        case GGML_OP_PAW_MOE_REDUCE:
+        case GGML_OP_PAW_V_REORDER:
+        case GGML_OP_PAW_DUAL_MM:
+            return ggml_cuda_paw_supported(op);
 
         default:
             return false;

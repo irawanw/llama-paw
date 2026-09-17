@@ -369,6 +369,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_exp_probs_b_vl = nullptr; // deepseek4 vision (bias for image tokens)
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
+    // DFlash2 block-diffusion conv mixing
     struct ggml_tensor * dflash_attn_conv_base = nullptr;
     struct ggml_tensor * dflash_attn_conv_proj = nullptr;
     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
@@ -684,6 +685,7 @@ struct llama_model {
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
 
+    // DFlash2 top-k selector lattice
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;

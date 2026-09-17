@@ -1260,7 +1260,36 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            // paw packed sidecar tensors ("<base>.m1_*") are raw code streams
+            // consumed by fork-provided codec kernels; no stock ggml op applies
+            // to their storage types (I8/I16/I32/F16), so skip the op-support
+            // probe. Prefer the first real DEVICE buffer type (offloaded layers:
+            // the codec kernels run on that backend), else fall back to the
+            // LAST entry — the plain CPU type. Intermediate host entries can be
+            // extra (repack) bufts whose supports_op veto rejects the paw ops.
+            const bool is_m1_sidecar = tn.suffix != nullptr &&
+                (strncmp(tn.suffix, "m1_", 3) == 0 || strncmp(tn.suffix, "m3_", 3) == 0);
+            if (is_m1_sidecar) {
+                // note: a device-type check, not is_host — the CPU repack extra
+                // buft reports non-host and would repack (crash on) raw streams
+                for (const auto & entry : *buft_list) {
+                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(entry.second);
+                    if (dev == nullptr) {
+                        continue;
+                    }
+                    const enum ggml_backend_dev_type dt = ggml_backend_dev_type(dev);
+                    if ((dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                        entry.second == ggml_backend_dev_buffer_type(dev)) {
+                        buft = entry.second;
+                        break;
+                    }
+                }
+                if (!buft) {
+                    buft = buft_list->back().second;
+                }
+            } else {
+                buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            }
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }

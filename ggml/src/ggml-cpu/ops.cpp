@@ -12190,3 +12190,698 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_paw_ne_mm
+// Transform-free Lloyd bitshift trellis (PAW NE tier): decode one row into
+// a stack buffer (bit-exact with the reference numpy decode: f32(lut) * f32(gscale),
+// single fp32 product per weight), then dot with every token column.
+
+void ggml_compute_forward_paw_ne_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * packed = dst->src[0];
+    const struct ggml_tensor * gscale = dst->src[1];
+    const struct ggml_tensor * lut    = dst->src[2];
+    const struct ggml_tensor * x      = dst->src[3];
+
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t T  = x->ne[0];
+    const int64_t B  = packed->ne[1];
+    const int64_t nt = x->ne[1]*x->ne[2]*x->ne[3];
+    const int     k  = (int)(packed->ne[0]*8 / T);
+    const int64_t ng = gscale->ne[0];                    // groups per row (T/128)
+    const int64_t group = T / ng;                        // 128
+    const int64_t rows_per_chunk = B / lut->ne[1];
+
+    const uint8_t     * pk = (const uint8_t     *) packed->data;
+    const ggml_fp16_t * gs = (const ggml_fp16_t *) gscale->data;
+    const ggml_fp16_t * lt = (const ggml_fp16_t *) lut->data;
+    const float       * xd = (const float       *) x->data;
+    float             * yd = (float             *) dst->data;
+
+    const size_t row_bytes = (size_t) packed->ne[0];
+
+    float wbuf[4096];
+    GGML_ASSERT(T <= 4096);
+
+    for (int64_t r = params->ith; r < B; r += params->nth) {
+        const uint8_t     * pb   = pk + r*row_bytes;
+        const ggml_fp16_t * lrow = lt + (r / rows_per_chunk) * 4096;
+        const ggml_fp16_t * grow = gs + r*ng;
+
+        uint32_t acc = 0, state = 0;
+        int nbits = 0;
+        for (int64_t g = 0; g < ng; ++g) {
+            const float gsc = GGML_CPU_FP16_TO_FP32(grow[g]);
+            float * wg = wbuf + g*group;
+            for (int64_t t = 0; t < group; ++t) {
+                while (nbits < k) { acc = (acc << 8) | *pb++; nbits += 8; }
+                nbits -= k;
+                state = ((state << k) | ((acc >> nbits) & ((1u << k) - 1))) & 0xFFFu;
+                wg[t] = GGML_CPU_FP16_TO_FP32(lrow[state]) * gsc;
+            }
+        }
+        for (int64_t j = 0; j < nt; ++j) {
+            float sum = 0.0f;
+            ggml_vec_dot_f32((int) T, &sum, 0, wbuf, 0, (float *)(xd + j*T), 0, 1);
+            yd[j*B + r] = sum;
+        }
+    }
+}
+
+// ggml_compute_forward_paw_embed_rows
+// int3 asymmetric grouped embedding gather: W = mn + q * (mx - mn)/7, all fp32.
+
+void ggml_compute_forward_paw_embed_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * q   = dst->src[0];
+    const struct ggml_tensor * mn  = dst->src[1];
+    const struct ggml_tensor * mx  = dst->src[2];
+    const struct ggml_tensor * ids = dst->src[3];
+
+    const int64_t n_embd = dst->ne[0];
+    const int64_t nt     = ids->ne[0];
+    const int64_t ng     = mn->ne[0];
+    const int64_t group  = n_embd / ng;
+
+    const uint8_t     * qd  = (const uint8_t     *) q->data;
+    const ggml_fp16_t * mnd = (const ggml_fp16_t *) mn->data;
+    const ggml_fp16_t * mxd = (const ggml_fp16_t *) mx->data;
+    const int32_t     * id  = (const int32_t     *) ids->data;
+    float             * yd  = (float             *) dst->data;
+
+    const size_t row_bytes = (size_t) q->ne[0];
+
+    for (int64_t j = params->ith; j < nt; j += params->nth) {
+        const int64_t r = id[j];
+        GGML_ASSERT(r >= 0 && r < q->ne[1]);
+        const uint8_t * pb = qd + r*row_bytes;
+        float * out = yd + j*n_embd;
+
+        uint32_t acc = 0;
+        int nbits = 0;
+        for (int64_t g = 0; g < ng; ++g) {
+            const float mnf  = GGML_CPU_FP16_TO_FP32(mnd[r*ng + g]);
+            const float d    = GGML_CPU_FP16_TO_FP32(mxd[r*ng + g]) - mnf;
+            // reference: step = max(mx - mn, 1e-8) / 7, all fp32
+            const float step = (d > 1e-8f ? d : 1e-8f) / 7.0f;
+            for (int64_t t = 0; t < group; ++t) {
+                while (nbits < 3) { acc = (acc << 8) | *pb++; nbits += 8; }
+                nbits -= 3;
+                const uint32_t qv = (acc >> nbits) & 0x7u;
+                // two statements on purpose: the reference rounds q*step to fp32
+                // BEFORE the add — do not let the compiler contract into an fma
+                volatile float prod = (float) qv * step;
+                out[g*group + t] = mnf + prod;
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_paw_exp_mm
+// QTIP bitshift-trellis routed experts (PAW expert tier). For each expert
+// used in the batch, the full weight matrix is materialized in the reference
+// decoder's exact fp32 op order (trellis walk -> fp16 round -> row FWHT * su
+// -> col FWHT * sv), then applied to every (slot, token) pair routed to it.
+// Bit-exact vs the release decode.py given the exported (Wscale-folded) su/sv.
+
+#define GGML_PAW_DEM_FLAG (1u << 30)   // remap: demoted-tier marker (exporter contract)
+
+// tlut accessor: the table ships either F32 (payload v2) or PRE-ROUNDED F16
+// (v3). hatWr is defined at fp16 precision, so both forms yield the same
+// weight — rounding an already-rounded value is a no-op, and the sign flip
+// is exact in fp16.
+static inline float paw_tlut_at(const void * td, bool f16, int64_t i) {
+    return f16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) td)[i])
+               : GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(((const float *) td)[i]));
+}
+
+// orthonormal Walsh-Hadamard, Sylvester order: butterfly pairs at stride
+// 1,2,4,... then ONE fp32 division by sqrt(d) — the reference op order
+static void paw_fwht_f32(float * v, const int64_t d) {
+    for (int64_t span = 1; span < d; span <<= 1) {
+        for (int64_t base = 0; base < d; base += span << 1) {
+            for (int64_t i = 0; i < span; ++i) {
+                const float a = v[base + i];
+                const float b = v[base + span + i];
+                v[base + i]        = a + b;
+                v[base + span + i] = a - b;
+            }
+        }
+    }
+    const float s = sqrtf((float) d);
+    for (int64_t i = 0; i < d; ++i) {
+        v[i] = v[i] / s;
+    }
+}
+
+// Block-diagonal form: diag(H_blk, ..., H_blk) applied in place over d
+// elements. blk == d reproduces paw_fwht_f32 exactly, so a legacy (power-of-
+// two, unblocked) payload takes the identical arithmetic path.
+static void paw_fwht_blk_f32(float * v, const int64_t d, const int64_t blk) {
+    for (int64_t off = 0; off < d; off += blk) {
+        paw_fwht_f32(v + off, blk);
+    }
+}
+
+void ggml_compute_forward_paw_exp_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * kept  = dst->src[0];
+    const struct ggml_tensor * dem   = dst->src[1];
+    const struct ggml_tensor * su    = dst->src[2];
+    const struct ggml_tensor * sv    = dst->src[3];
+    const struct ggml_tensor * tlut  = dst->src[4];
+    const struct ggml_tensor * remap = dst->src[5];
+    const struct ggml_tensor * ids   = dst->src[6];
+    const struct ggml_tensor * x     = dst->src[7];
+    const struct ggml_tensor * gamma = dst->src[8];   // optional per-tile wave scale (v3)
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n        = su->ne[0];
+    const int64_t m        = sv->ne[0];
+    const int64_t n_expert = remap->ne[0];
+    const int64_t n_kept   = kept->ne[2];
+    const int64_t n_dem    = dem ? dem->ne[2] : 0;
+    const int64_t n_groups = n_kept + n_dem;
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_tok    = ids->ne[1];
+    const int64_t n_pairs  = n_used*n_tok;
+    const int64_t tiles_y  = n/16;
+    const int64_t ntiles   = (m/16)*tiles_y;
+    const int64_t xne1     = x->ne[1];
+
+    GGML_ASSERT(m <= 4096);   // column scratch bound
+
+    // V and tlut_bits derive from the tlut dims (see ggml_paw_exp_mm)
+    const int V     = (int) tlut->ne[0];
+    const int steps = 256 / V;
+
+    const ggml_fp16_t * sud = (const ggml_fp16_t *) su->data;
+    const ggml_fp16_t * svd = (const ggml_fp16_t *) sv->data;
+    const void        * td  = tlut->data;
+    const bool          tf16 = tlut->type == GGML_TYPE_F16;
+    const int32_t     * rmd = (const int32_t     *) remap->data;
+    const float       * xd  = (const float       *) x->data;
+    const ggml_fp16_t * gmd = gamma ? (const ggml_fp16_t *) gamma->data : NULL;
+    const int64_t       gml = gamma ? gamma->ne[0] : 0;
+    float             * yd  = (float             *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // workspace: W buffer + fp32 su/sv rows + per-group pair lists
+    char * w = (char *) params->wdata;
+    float   * wbuf     = (float   *) w; w += sizeof(float)*m*n;
+    float   * su32     = (float   *) w; w += sizeof(float)*n;
+    float   * sv32     = (float   *) w; w += sizeof(float)*m;
+    int32_t * grp_cnt  = (int32_t *) w; w += sizeof(int32_t)*n_groups;
+    int32_t * grp_off  = (int32_t *) w; w += sizeof(int32_t)*n_groups;
+    int32_t * grp_orig = (int32_t *) w; w += sizeof(int32_t)*n_groups;
+    int32_t * pairs    = (int32_t *) w; w += sizeof(int32_t)*2*n_pairs;
+    GGML_ASSERT((size_t)(w - (char *) params->wdata) <= params->wsize);
+
+    // phase 0: group (slot, token) pairs by storage expert
+    if (ith == 0) {
+        memset(grp_cnt, 0, sizeof(int32_t)*n_groups);
+        for (int64_t t = 0; t < n_tok; ++t) {
+            for (int64_t s = 0; s < n_used; ++s) {
+                const int32_t id = *(const int32_t *)((const char *) ids->data + s*ids->nb[0] + t*ids->nb[1]);
+                GGML_ASSERT(id >= 0 && id < n_expert);
+                const int32_t rm = rmd[id];
+                const int64_t g  = (rm & GGML_PAW_DEM_FLAG) ? n_kept + (rm & ~GGML_PAW_DEM_FLAG) : rm;
+                GGML_ASSERT(g >= 0 && g < n_groups);
+                grp_orig[g] = id;
+                grp_cnt[g]++;
+            }
+        }
+        int32_t off = 0;
+        for (int64_t g = 0; g < n_groups; ++g) {
+            grp_off[g] = off;
+            off += grp_cnt[g];
+            grp_cnt[g] = 0;
+        }
+        for (int64_t t = 0; t < n_tok; ++t) {
+            for (int64_t s = 0; s < n_used; ++s) {
+                const int32_t id = *(const int32_t *)((const char *) ids->data + s*ids->nb[0] + t*ids->nb[1]);
+                const int32_t rm = rmd[id];
+                const int64_t g  = (rm & GGML_PAW_DEM_FLAG) ? n_kept + (rm & ~GGML_PAW_DEM_FLAG) : rm;
+                const int64_t p  = grp_off[g] + grp_cnt[g]++;
+                pairs[2*p + 0] = (int32_t) s;
+                pairs[2*p + 1] = (int32_t) t;
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    for (int64_t g = 0; g < n_groups; ++g) {
+        if (grp_cnt[g] == 0) {
+            continue;   // uniform across threads: wdata is shared
+        }
+        const bool     is_dem = g >= n_kept;
+        const int64_t  ei     = is_dem ? g - n_kept : g;
+        const int64_t  words  = is_dem ? 16 : kept->ne[0];   // K*16 codes per tile
+        const int      step   = (int)(words*V/16);           // K*V fresh bits per step
+        const int64_t  e_orig = grp_orig[g];
+        const uint16_t * tr = (const uint16_t *)(is_dem ? dem->data : kept->data) + ei*ntiles*words;
+
+        // phase A: decode tiles -> hatWr (fp16-rounded) into wbuf
+        if (ith == 0) {
+            for (int64_t j = 0; j < n; ++j) {
+                su32[j] = GGML_CPU_FP16_TO_FP32(sud[e_orig*n + j]);
+            }
+            for (int64_t i = 0; i < m; ++i) {
+                sv32[i] = GGML_CPU_FP16_TO_FP32(svd[e_orig*m + i]);
+            }
+        }
+        for (int64_t tid = ith; tid < ntiles; tid += nth) {
+            const uint16_t * tw = tr + tid*words;
+            float * wt = wbuf + (tid/tiles_y)*16*n + (tid % tiles_y)*16;
+
+            // per-tile wave gamma (v3): last anti-diagonal wavefront writing
+            // tile (a, b) of the (Mb, Nb) grid — see ggml_paw_exp_mm
+            float gsc = 0.0f;
+            if (gmd) {
+                const int64_t a = tid / tiles_y, b = tid % tiles_y;
+                const int64_t Mb = m/16, Nb = tiles_y;
+                const int64_t wv = (a + b <= Nb - 1) ? Mb + Nb - 1 - (a + b)
+                                                     : Mb + Nb - 2 - (a + b);
+                gsc = GGML_CPU_FP16_TO_FP32(gmd[e_orig*gml + wv]);
+            }
+
+            // MSB-first big-endian 16-bit words, tail-biting. DIRECT-WINDOW
+            // states: the shift register after step i holds exactly the 16-bit
+            // window of the tile stream starting at bit step*i (wrapping) —
+            // verified bit-identical to the serial walk on the shipped
+            // payloads. steps*step == words*16 by construction, so the bit
+            // offset never needs a modulo; only the word pair wraps. No serial
+            // dependency between steps.
+            for (int i = 0; i < steps; ++i) {   // T/V steps
+                const int      b  = step*i;
+                const int      wi = b >> 4;
+                const int      o  = b & 15;
+                const uint32_t w2 = ((uint32_t) tw[wi] << 16) |
+                                     (uint32_t) tw[wi + 1 < words ? wi + 1 : 0];
+                const uint32_t reg = (w2 >> (16 - o)) & 0xFFFFu;
+
+                // quantlut_sym: p = s*(s+1) exact, row = (p >> (16-tlut_bits-1)) &
+                // (2^tlut_bits - 1), component 0 negated iff bit 15 of p.
+                // V=2: tlut_bits 9 -> (p>>6)&511; V=8: tlut_bits 15 -> p&0x7FFF.
+                const uint32_t p   = reg*(reg + 1);
+                const uint32_t row = V == 2 ? (p >> 6) & 511 : p & 0x7FFFu;
+                const int64_t  tv  = (int64_t) V*row;
+                const int ri = (V*i) >> 4;
+                const int ci = (V*i) & 15;
+                float * wo = wt + ri*n + ci;
+                for (int c = 0; c < V; ++c) {
+                    // hatWr is defined at fp16 precision (reference spec); the
+                    // v3 wave gamma multiplies AFTER the round, in fp32
+                    float w16 = paw_tlut_at(td, tf16, tv + c);
+                    if (c == 0 && (p & 0x8000u)) {
+                        w16 = -w16;       // exact in fp16 (sign bit)
+                    }
+                    wo[c] = gmd ? w16*gsc : w16;
+                }
+            }
+        }
+        ggml_barrier(params->threadpool);
+
+        // phase B: FWHT each row over n, scale by su
+        for (int64_t i = ith; i < m; i += nth) {
+            float * row = wbuf + i*n;
+            paw_fwht_f32(row, n);
+            for (int64_t j = 0; j < n; ++j) {
+                row[j] *= su32[j];
+            }
+        }
+        ggml_barrier(params->threadpool);
+
+        // phase C: FWHT each column over m, scale by sv
+        for (int64_t j = ith; j < n; j += nth) {
+            float col[4096];
+            for (int64_t i = 0; i < m; ++i) {
+                col[i] = wbuf[i*n + j];
+            }
+            paw_fwht_f32(col, m);
+            for (int64_t i = 0; i < m; ++i) {
+                wbuf[i*n + j] = col[i]*sv32[i];
+            }
+        }
+        ggml_barrier(params->threadpool);
+
+        // phase D: y[:, s, t] = W @ x[:, s|0, t] for every pair in the group
+        for (int64_t i = ith; i < m; i += nth) {
+            const float * wrow = wbuf + i*n;
+            for (int64_t p = grp_off[g]; p < grp_off[g] + grp_cnt[g]; ++p) {
+                const int64_t s = pairs[2*p + 0];
+                const int64_t t = pairs[2*p + 1];
+                const float * xc = xd + (xne1 == 1 ? 0 : s*n) + t*xne1*n;
+                float sum = 0.0f;
+                ggml_vec_dot_f32((int) n, &sum, 0, (float *) wrow, 0, (float *) xc, 0, 1);
+                yd[t*n_used*m + s*m + i] = sum;
+            }
+        }
+        ggml_barrier(params->threadpool);   // wbuf is reused by the next group
+    }
+}
+
+// ggml_compute_forward_paw_exp_basis
+// Shared low-rank residual for demoted experts: y = B (c_e ⊙ (A x)) in fp32.
+// Kept-expert slots produce zeros. The B accumulation keeps the reference's
+// two-rounding order: p = fl(B_ij * t_j) then acc = fl(acc + p).
+// Optional src[6] acc: dst = acc + y (same operand order as the ggml_add it
+// replaces); kept slots copy acc through.
+
+void ggml_compute_forward_paw_exp_basis(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * a     = dst->src[0];
+    const struct ggml_tensor * b     = dst->src[1];
+    const struct ggml_tensor * c     = dst->src[2];
+    const struct ggml_tensor * remap = dst->src[3];
+    const struct ggml_tensor * ids   = dst->src[4];
+    const struct ggml_tensor * x     = dst->src[5];
+    const struct ggml_tensor * accs  = dst->src[6];
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n      = a->ne[0];
+    const int64_t r      = a->ne[1];
+    const int64_t m      = b->ne[1];
+    const int64_t n_dem  = c->ne[1];
+    const int64_t n_used = ids->ne[0];
+    const int64_t n_tok  = ids->ne[1];
+    const int64_t xne1   = x->ne[1];
+
+    const ggml_fp16_t * ad  = (const ggml_fp16_t *) a->data;
+    const ggml_fp16_t * bd  = (const ggml_fp16_t *) b->data;
+    const ggml_fp16_t * cd  = (const ggml_fp16_t *) c->data;
+    const int32_t     * rmd = (const int32_t     *) remap->data;
+    const float       * xd  = (const float       *) x->data;
+    const float       * accd = accs ? (const float *) accs->data : NULL;
+    float             * yd  = (float             *) dst->data;
+
+    for (int64_t pp = params->ith; pp < n_used*n_tok; pp += params->nth) {
+        const int64_t s = pp % n_used;
+        const int64_t t = pp / n_used;
+        const int32_t id = *(const int32_t *)((const char *) ids->data + s*ids->nb[0] + t*ids->nb[1]);
+        GGML_ASSERT(id >= 0 && id < remap->ne[0]);
+        const int32_t rm = rmd[id];
+        float * y = yd + t*n_used*m + s*m;
+        const float * ac = accd ? accd + t*n_used*m + s*m : NULL;
+
+        if (!(rm & GGML_PAW_DEM_FLAG)) {
+            if (ac) {
+                memcpy(y, ac, sizeof(float)*m);
+            } else {
+                memset(y, 0, sizeof(float)*m);
+            }
+            continue;
+        }
+        const int64_t di = rm & ~GGML_PAW_DEM_FLAG;
+        GGML_ASSERT(di < n_dem);
+
+        const float * xc = xd + (xne1 == 1 ? 0 : s*n) + t*xne1*n;
+
+        float v[256];
+        float tv[256];
+        for (int64_t j = 0; j < r; ++j) {
+            const ggml_fp16_t * ar = ad + j*n;
+            float acc = 0.0f;
+            for (int64_t i = 0; i < n; ++i) {
+                acc += GGML_CPU_FP16_TO_FP32(ar[i]) * xc[i];
+            }
+            v[j] = acc;
+        }
+        for (int64_t j = 0; j < r; ++j) {
+            // one rounding: t_j = fl(c_j * v_j)
+            const float pr = GGML_CPU_FP16_TO_FP32(cd[di*r + j]) * v[j];
+            tv[j] = pr;
+        }
+        for (int64_t i = 0; i < m; ++i) {
+            const ggml_fp16_t * br = bd + i*r;
+            float acc = 0.0f;
+            for (int64_t j = 0; j < r; ++j) {
+                // two statements on purpose: reference rounds B_ij*t_j before the
+                // add — do not let the compiler contract into an fma
+                const float pr = GGML_CPU_FP16_TO_FP32(br[j]) * tv[j];
+                acc += pr;
+            }
+            y[i] = ac ? ac[i] + acc : acc;
+        }
+    }
+}
+
+// ggml_compute_forward_paw_rt_mm
+// Rotated int-lattice trellis dense matmul (payload v3 NE spine): the single
+// weight matrix W = diag(sv).H_m.fp16(hatWr).H_n.diag(su) is materialized in
+// the reference decoder's exact fp32 op order (su/sv are F32 with the F32
+// Wscale folded into sv at export), then y = W x for every token column.
+
+void ggml_compute_forward_paw_rt_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * trellis = dst->src[0];
+    const struct ggml_tensor * su      = dst->src[1];
+    const struct ggml_tensor * sv      = dst->src[2];
+    const struct ggml_tensor * tlut    = dst->src[3];
+    const struct ggml_tensor * x       = dst->src[4];
+    const int epilogue_mode              = dst->op_params[0];
+    const bool epilogue                  = epilogue_mode != 0;
+    const bool epilogue_dot              = epilogue_mode == 2;
+    const struct ggml_tensor * gate      = epilogue ? dst->src[5] : nullptr;
+    const struct ggml_tensor * gate_x    = epilogue_dot ? dst->src[6] : nullptr;
+    const struct ggml_tensor * acc       = epilogue_dot ? dst->src[7] : epilogue ? dst->src[6] : nullptr;
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n       = su->ne[0];
+    const int64_t m       = sv->ne[0];
+    // 0 = one Hadamard over the whole dimension (power-of-two payloads);
+    // otherwise diag(H_blk, ...), which is what non-power-of-two dense
+    // checkpoints carry.
+    const int64_t rht_blk = dst->op_params[GGML_PAW_RHT_BLK_SLOT];
+    const int64_t bn      = rht_blk ? rht_blk : n;
+    const int64_t bm      = rht_blk ? rht_blk : m;
+    const int64_t words   = trellis->ne[0];
+    const int     step    = (int)(words*2/16);      // K*V fresh bits per step (V = 2)
+    const int64_t tiles_y = n/16;
+    const int64_t ntiles  = (m/16)*tiles_y;
+    const int64_t nt      = x->ne[1]*x->ne[2]*x->ne[3];
+
+    GGML_ASSERT(bm <= 8192);  // column scratch bound; blocked payloads stage one block
+
+    const uint16_t    * trd = (const uint16_t    *) trellis->data;
+    const float       * sud = (const float       *) su->data;
+    const float       * svd = (const float       *) sv->data;
+    const ggml_fp16_t * td  = (const ggml_fp16_t *) tlut->data;   // pre-rounded
+    const float       * xd  = (const float       *) x->data;
+    float             * yd  = (float             *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * wbuf = (float *) params->wdata;   // m*n floats
+    GGML_ASSERT(params->wsize >= sizeof(float)*m*n);
+
+    // phase A: decode tiles -> hatWr (fp16-rounded) into wbuf.
+    // DIRECT-WINDOW states: state j is the 16-bit window of the tile's
+    // MSB-first stream starting at bit step*j (wrapping) — verified
+    // bit-identical to the reference's serial shift-register walk. K*V = 8
+    // here, so state j is exactly the big-endian u16 at BYTE offset j:
+    // word[j/2] for even j, (word[j/2] << 8 | word[j/2+1] >> 8) for odd j.
+    // No serial dependency between steps.
+    // step is K*V fresh bits per state, so K = step/2 at V = 2: 8 -> K=4,
+    // 4 -> K=2, 2 -> K=1. The window is byte-aligned only at step 8, hence the
+    // general shift below rather than the byte shortcut this used to take.
+    GGML_ASSERT(step >= 2 && step <= 8);   // K = step/V, V = 2: 1, 1.5, 2, 2.5, ... 4
+    for (int64_t tid = ith; tid < ntiles; tid += nth) {
+        const uint16_t * tw = trd + tid*words;
+        float * wt = wbuf + (tid/tiles_y)*16*n + (tid % tiles_y)*16;
+
+        for (int i = 0; i < 128; ++i) {
+            const int      b   = step*i;              // bit offset, MSB-first
+            const int      wi  = b >> 4;
+            const int      off = b & 15;
+            const uint32_t hi  = tw[wi];
+            const uint32_t reg = off == 0
+                ? hi
+                : (((hi << off) | (tw[wi + 1 < words ? wi + 1 : 0] >> (16 - off)))
+                   & 0xFFFFu);
+
+            const uint32_t p   = reg*(reg + 1);
+            const uint32_t row = (p >> 6) & 511;
+            float v0 = GGML_CPU_FP16_TO_FP32(td[2*row + 0]);
+            const float v1 = GGML_CPU_FP16_TO_FP32(td[2*row + 1]);
+            if (p & 0x8000u) {
+                v0 = -v0;                    // exact in fp16 (sign bit)
+            }
+            const int ri = (2*i) >> 4;
+            const int ci = (2*i) & 15;
+            wt[ri*n + ci    ] = v0;
+            wt[ri*n + ci + 1] = v1;
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    // phase B: FWHT each row over n, scale by su
+    for (int64_t i = ith; i < m; i += nth) {
+        float * row = wbuf + i*n;
+        paw_fwht_blk_f32(row, n, bn);
+        for (int64_t j = 0; j < n; ++j) {
+            row[j] *= sud[j];
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    // phase C: FWHT each column over m, scale by sv
+    for (int64_t j = ith; j < n; j += nth) {
+        float col[8192];
+        for (int64_t off = 0; off < m; off += bm) {
+            for (int64_t i = 0; i < bm; ++i) {
+                col[i] = wbuf[(off + i)*n + j];
+            }
+            paw_fwht_f32(col, bm);
+            for (int64_t i = 0; i < bm; ++i) {
+                wbuf[(off + i)*n + j] = col[i]*svd[off + i];
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    // phase D: y = W x per token column
+    for (int64_t i = ith; i < m; i += nth) {
+        const float * wrow = wbuf + i*n;
+        for (int64_t t = 0; t < nt; ++t) {
+            float sum = 0.0f;
+            ggml_vec_dot_f32((int) n, &sum, 0, (float *) wrow, 0, (float *)(xd + t*n), 0, 1);
+            if (epilogue) {
+                float gate_value = ((const float *) gate->data)[t];
+                if (epilogue_dot) {
+                    gate_value = 0.0f;
+                    const float * gw = (const float *) gate->data;
+                    const float * gx = (const float *) gate_x->data + t*gate->ne[0];
+                    for (int64_t j = 0; j < gate->ne[0]; ++j) {
+                        gate_value += gw[j]*gx[j];
+                    }
+                }
+                const float sigmoid = 1.0f / (1.0f + expf(-gate_value));
+                const float gated = sum * sigmoid;
+                yd[t*m + i] = ((const float *) acc->data)[t*m + i] + gated;
+            } else {
+                yd[t*m + i] = sum;
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_paw_head_mm
+// int5-g64 lm_head matmul: W[r,j] = q[r,j] * f32(gscale[r][j/64]) with q int5
+// unpacked from 5-byte little-endian blocks (8 codes each, stored value q+16).
+
+void ggml_compute_forward_paw_head_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * qp     = dst->src[0];
+    const struct ggml_tensor * gscale = dst->src[1];
+    const struct ggml_tensor * x      = dst->src[2];
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n     = x->ne[0];
+    const int64_t vocab = qp->ne[1];
+    const int64_t ng    = n/64;
+    const int64_t nt    = x->ne[1]*x->ne[2]*x->ne[3];
+    const int64_t row_bytes = n/8*5;
+
+    GGML_ASSERT(n <= 8192);   // row scratch bound
+
+    const uint8_t     * qd = (const uint8_t     *) qp->data;
+    const ggml_fp16_t * gs = (const ggml_fp16_t *) gscale->data;
+    const float       * xd = (const float       *) x->data;
+    float             * yd = (float             *) dst->data;
+
+    for (int64_t r = params->ith; r < vocab; r += params->nth) {
+        const uint8_t     * pb   = qd + r*row_bytes;
+        const ggml_fp16_t * grow = gs + r*ng;
+        float wrow[8192];
+
+        for (int64_t blk = 0; blk < n/8; ++blk) {
+            const uint8_t * b = pb + blk*5;
+            const uint64_t word = (uint64_t) b[0] | ((uint64_t) b[1] << 8) |
+                                  ((uint64_t) b[2] << 16) | ((uint64_t) b[3] << 24) |
+                                  ((uint64_t) b[4] << 32);
+            for (int i = 0; i < 8; ++i) {
+                const int64_t j = blk*8 + i;
+                const float q = (float)((int)((word >> (5*i)) & 31u) - 16);
+                // reference decode: q_f32 * gscale_f32, one fp32 rounding
+                wrow[j] = q * GGML_CPU_FP16_TO_FP32(grow[j >> 6]);
+            }
+        }
+        for (int64_t t = 0; t < nt; ++t) {
+            float sum = 0.0f;
+            ggml_vec_dot_f32((int) n, &sum, 0, wrow, 0, (float *)(xd + t*n), 0, 1);
+            yd[t*vocab + r] = sum;
+        }
+    }
+}
+
+// ggml_compute_forward_paw_moe_reduce
+
+void ggml_compute_forward_paw_moe_reduce(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * experts = dst->src[0];
+    const struct ggml_tensor * weights = dst->src[1];
+
+    GGML_ASSERT(experts->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type     == GGML_TYPE_F32);
+
+    const int64_t n_embd = experts->ne[0];
+    const int64_t n_used = experts->ne[1];
+    const int64_t n_tok  = experts->ne[2];
+
+    const int64_t total = n_embd*n_tok;
+    const int64_t per   = (total + params->nth - 1)/params->nth;
+    const int64_t i0    = per*params->ith;
+    const int64_t i1    = MIN(i0 + per, total);
+
+    const float * esrc = (const float *) experts->data;
+    const float * wsrc = (const float *) weights->data;
+    float       * d    = (float *) dst->data;
+
+    for (int64_t idx = i0; idx < i1; ++idx) {
+        const int64_t t = idx / n_embd;
+        const int64_t i = idx % n_embd;
+        float acc = 0.0f;
+        for (int64_t s = 0; s < n_used; ++s) {
+            acc += esrc[t*n_used*n_embd + s*n_embd + i] * wsrc[t*n_used + s];
+        }
+        d[t*n_embd + i] = acc;
+    }
+}
+
+// ggml_compute_forward_paw_embed_gather
+// Lossless nibble-LUT embedding gather: 4-bit codes (low nibble = even column)
+// into per-(row, group-64) bf16 LUT rows; bf16 -> f32 widening is exact.
+
+void ggml_compute_forward_paw_embed_gather(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * codes = dst->src[0];
+    const struct ggml_tensor * lut   = dst->src[1];
+    const struct ggml_tensor * ids   = dst->src[2];
+
+    const int64_t n_embd = dst->ne[0];
+    const int64_t nt     = ids->ne[0];
+    const int64_t ng     = lut->ne[1] / codes->ne[1];      // LUT groups per row
+    const int64_t group  = n_embd / ng;                    // 64 on the 35B, 256 on paw-dense
+
+    const uint8_t  * cd = (const uint8_t  *) codes->data;
+    const uint16_t * ld = (const uint16_t *) lut->data;   // bf16 bit patterns
+    const int32_t  * id = (const int32_t  *) ids->data;
+    float          * yd = (float          *) dst->data;
+
+    for (int64_t t = params->ith; t < nt; t += params->nth) {
+        const int64_t r = id[t];
+        GGML_ASSERT(r >= 0 && r < codes->ne[1]);
+        const uint8_t * crow = cd + r*(n_embd/2);
+        float * out = yd + t*n_embd;
+        for (int64_t j = 0; j < n_embd; ++j) {
+            const uint32_t q = (j & 1) ? (crow[j >> 1] >> 4) : (crow[j >> 1] & 0x0F);
+            const uint32_t bits = (uint32_t) ld[(r*ng + j/group)*16 + q] << 16;
+            float w;
+            memcpy(&w, &bits, sizeof(w));
+            out[j] = w;
+        }
+    }
+}

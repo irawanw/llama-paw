@@ -46,6 +46,9 @@ enum llm_arch {
     LLM_ARCH_QWEN35,
     LLM_ARCH_QWEN35MOE,
     LLM_ARCH_QWEN4EXP,
+    LLM_ARCH_PAW,
+    LLM_ARCH_MACH1, // legacy name for PAW
+    LLM_ARCH_PAW_DENSE, // PAW codec on the dense qwen35 topology (PAW-27B)
     LLM_ARCH_PHI2,
     LLM_ARCH_PHI3,
     LLM_ARCH_PHIMOE,
@@ -226,6 +229,10 @@ enum llm_kv {
     LLM_KV_MOE_EVERY_N_LAYERS,
     LLM_KV_MOE_LATENT_SIZE,
     LLM_KV_NEXTN_PREDICT_LAYERS,
+
+    // PAW: rotation block size of the NE spine (0/absent = one Hadamard per
+    // dimension, which is every checkpoint published before the dense lane)
+    LLM_KV_PAW_RHT_BLOCK,
     LLM_KV_NUM_DEEPSTACK_LAYERS,
     LLM_KV_DEEPSTACK_MAPPING,
     LLM_KV_HIDDEN_ACT,
@@ -407,12 +414,12 @@ enum llm_kv {
     LLM_KV_CLASSIFIER_OUTPUT_LABELS,
 
     LLM_KV_TARGET_LAYERS,
-    LLM_KV_TARGET_HIDDEN_SIZE,
     LLM_KV_DFLASH_BLOCK_SIZE,
     LLM_KV_DFLASH_CONV_KERNEL_SIZE,
     LLM_KV_DFLASH_CONV_GROUP_SIZE,
     LLM_KV_DFLASH_SELECTOR_RANK,
     LLM_KV_DFLASH_SELECTOR_TOP_K,
+    LLM_KV_TARGET_HIDDEN_SIZE,
     LLM_KV_NORM_BEFORE_RESIDUAL,
     LLM_KV_NORM_BEFORE_FC,
 
@@ -701,6 +708,8 @@ enum llm_tensor {
     LLM_TENSOR_HRM_Z_L_INIT,
     LLM_TENSOR_FC,
     LLM_TENSOR_D2T,
+    LLM_TENSOR_PAW_TLUT,          // paw shared expert trellis codebook [512,2] f32
+    LLM_TENSOR_PAW_NE_TLUT,       // paw v3 rotated-NE trellis codebook [512,2] f32
     LLM_TENSOR_DSPARK_MARKOV_W1,
     LLM_TENSOR_DSPARK_MARKOV_W2,
     LLM_TENSOR_DSPARK_CONF_PROJ,

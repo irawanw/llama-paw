@@ -1084,6 +1084,21 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "PAW_NE_MM",
+    "PAW_EMBED_ROWS",
+    "PAW_EXP_MM",
+    "PAW_EXP_BASIS",
+    "PAW_RT_MM",
+    "PAW_RT_MM_BATCH",
+    "PAW_X3_MM",
+    "PAW_X3_MM_ID",
+    "PAW_X3_MOE",
+    "PAW_EXP_MM_BATCH2",
+    "PAW_HEAD_MM",
+    "PAW_EMBED_GATHER",
+    "PAW_MOE_REDUCE",
+    "PAW_V_REORDER",
+    "PAW_DUAL_MM",
 
     "UNARY",
 
@@ -1101,7 +1116,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1199,6 +1214,19 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "paw_ne_mm(packed, gscale, lut, x)",
+    "paw_embed_rows(q, mn, mx, ids)",
+    "paw_exp_mm(kept, dem, su, sv, tlut, remap, ids, x[, gamma])",
+    "paw_exp_basis(a, b, c, remap, ids, x[, acc])",
+    "paw_rt_mm(trellis, su, sv, tlut, x)",
+    "paw_rt_mm_batch(...)",
+    "paw_x3_mm(trellis, suh, svh, x)",
+    "paw_x3_mm_id(trellis, meta, suh, svh, ids, x)",
+    "paw_x3_moe(x, ids, weights, proj...)",
+    "paw_exp_mm_batch2(...)",
+    "paw_head_mm(qp, gscale, x)",
+    "paw_embed_gather(codes, lut, ids)",
+    "paw_moe_reduce(experts, weights)",
 
     "unary(x)",
 
@@ -1216,7 +1244,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6414,6 +6442,687 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_paw_ne_mm
+
+struct ggml_tensor * ggml_paw_ne_mm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * gscale,
+        struct ggml_tensor  * lut,
+        struct ggml_tensor  * x) {
+    GGML_ASSERT(packed->type == GGML_TYPE_I8);
+    GGML_ASSERT(gscale->type == GGML_TYPE_F16);
+    GGML_ASSERT(lut->type    == GGML_TYPE_F16);
+    GGML_ASSERT(x->type      == GGML_TYPE_F32);
+    GGML_ASSERT(lut->ne[0] == 4096);   // L = 12
+    GGML_ASSERT(ggml_is_contiguous(packed));
+    GGML_ASSERT(ggml_is_contiguous(gscale));
+    GGML_ASSERT(ggml_is_contiguous(lut));
+
+    const int64_t T = x->ne[0];
+    const int64_t B = packed->ne[1];
+    GGML_ASSERT(T > 0 && T <= 4096);           // kernel row-decode buffer bound
+    GGML_ASSERT(gscale->ne[1] == B);
+    GGML_ASSERT(gscale->ne[0] > 0 && T % gscale->ne[0] == 0);
+    GGML_ASSERT(T / gscale->ne[0] == 128);     // group-128 tier
+    GGML_ASSERT((packed->ne[0]*8) % T == 0);
+    const int64_t k = packed->ne[0]*8 / T;
+    GGML_ASSERT(k == 3 || k == 4);
+    GGML_ASSERT(lut->ne[1] > 0 && B % lut->ne[1] == 0);
+
+    const int64_t ne[4] = { B, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_PAW_NE_MM;
+    result->src[0] = packed;
+    result->src[1] = gscale;
+    result->src[2] = lut;
+    result->src[3] = x;
+
+    return result;
+}
+
+// ggml_paw_embed_rows
+
+struct ggml_tensor * ggml_paw_embed_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * mn,
+        struct ggml_tensor  * mx,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(q->type   == GGML_TYPE_I8);
+    GGML_ASSERT(mn->type  == GGML_TYPE_F16);
+    GGML_ASSERT(mx->type  == GGML_TYPE_F16);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(mn));
+    GGML_ASSERT(ggml_is_contiguous(mx));
+
+    const int64_t n_embd = q->ne[0]*8/3;
+    GGML_ASSERT(q->ne[0]*8 == n_embd*3);
+    GGML_ASSERT(mn->ne[1] == q->ne[1] && mx->ne[1] == q->ne[1]);
+    GGML_ASSERT(mn->ne[0] == mx->ne[0] && mn->ne[0] > 0);
+    GGML_ASSERT(n_embd % mn->ne[0] == 0);
+
+    const int64_t ne[4] = { n_embd, ids->ne[0], 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_PAW_EMBED_ROWS;
+    result->src[0] = q;
+    result->src[1] = mn;
+    result->src[2] = mx;
+    result->src[3] = ids;
+
+    return result;
+}
+
+// ggml_paw_exp_mm
+
+struct ggml_tensor * ggml_paw_exp_mm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kept_trellis,
+        struct ggml_tensor  * dem_trellis,
+        struct ggml_tensor  * su,
+        struct ggml_tensor  * sv,
+        struct ggml_tensor  * tlut,
+        struct ggml_tensor  * remap,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * wave_gamma) {
+    GGML_ASSERT(kept_trellis->type == GGML_TYPE_I16);
+    GGML_ASSERT(su->type    == GGML_TYPE_F16);
+    GGML_ASSERT(sv->type    == GGML_TYPE_F16);
+    // tlut is F32 (payload v2) or PRE-ROUNDED F16 (v3) — bit-equivalent,
+    // since the decode spec rounds every gathered value to fp16 anyway
+    GGML_ASSERT(tlut->type  == GGML_TYPE_F32 || tlut->type == GGML_TYPE_F16);
+    GGML_ASSERT(remap->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids->type   == GGML_TYPE_I32);
+    GGML_ASSERT(x->type     == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(kept_trellis));
+    GGML_ASSERT(ggml_is_contiguous(su));
+    GGML_ASSERT(ggml_is_contiguous(sv));
+    GGML_ASSERT(ggml_is_contiguous(tlut));
+    GGML_ASSERT(ggml_is_contiguous(remap));
+    GGML_ASSERT(ggml_is_contiguous(x));
+
+    // V and tlut_bits derive from the tlut dims; V*steps must tile 256 scalars
+    const int64_t V = tlut->ne[0];
+    GGML_ASSERT((V == 2 && tlut->ne[1] == 512) ||          // quantlut_sym, tlut_bits = 9
+                (V == 8 && tlut->ne[1] == 32768));         // int-L1-ball,   tlut_bits = 15
+
+    const int64_t n = x->ne[0];
+    const int64_t m = sv->ne[0];
+    GGML_ASSERT(su->ne[0] == n);
+    GGML_ASSERT((m & (m - 1)) == 0 && (n & (n - 1)) == 0); // FWHT dims (unpadded pow2)
+    GGML_ASSERT(m % 16 == 0 && n % 16 == 0);
+
+    const int64_t ntiles = (m/16)*(n/16);
+    // words-per-tile encodes K (K*16); fresh bits per step = words*V/16 must be whole
+    GGML_ASSERT(kept_trellis->ne[1] == ntiles);
+    GGML_ASSERT(kept_trellis->ne[0]*V % 16 == 0 && kept_trellis->ne[0]*V/16 <= 16);
+    if (dem_trellis != NULL) {
+        GGML_ASSERT(dem_trellis->type == GGML_TYPE_I16);
+        GGML_ASSERT(ggml_is_contiguous(dem_trellis));
+        GGML_ASSERT(dem_trellis->ne[0] == 16 && dem_trellis->ne[1] == ntiles); // K = 1
+        GGML_ASSERT(V == 2);   // demoted tier exists only in the V2 payload
+    }
+    if (wave_gamma != NULL) {
+        GGML_ASSERT(wave_gamma->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(wave_gamma));
+        GGML_ASSERT(wave_gamma->ne[0] == m/16 + n/16);
+        GGML_ASSERT(wave_gamma->ne[1] == remap->ne[0]);
+    }
+
+    GGML_ASSERT(remap->ne[0] == su->ne[1] && remap->ne[0] == sv->ne[1]);
+    GGML_ASSERT(x->ne[1] == 1 || x->ne[1] == ids->ne[0]);
+    GGML_ASSERT(x->ne[2] == ids->ne[1] && x->ne[3] == 1);
+
+    const int64_t ne[4] = { m, ids->ne[0], ids->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_PAW_EXP_MM;
+    result->src[0] = kept_trellis;
+    result->src[1] = dem_trellis;
+    result->src[2] = su;
+    result->src[3] = sv;
+    result->src[4] = tlut;
+    result->src[5] = remap;
+    result->src[6] = ids;
+    result->src[7] = x;
+    result->src[8] = wave_gamma;
+
+    return result;
+}
+
+// ggml_paw_rt_mm
+
+struct ggml_tensor * ggml_paw_rt_mm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * trellis,
+        struct ggml_tensor  * su,
+        struct ggml_tensor  * sv,
+        struct ggml_tensor  * tlut,
+        struct ggml_tensor  * x,
+        int                   rht_blk) {
+    GGML_ASSERT(trellis->type == GGML_TYPE_I16);
+    GGML_ASSERT(su->type   == GGML_TYPE_F32);
+    GGML_ASSERT(sv->type   == GGML_TYPE_F32);
+    GGML_ASSERT(tlut->type == GGML_TYPE_F16);   // pre-rounded (see ggml_paw_exp_mm)
+    GGML_ASSERT(x->type    == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(trellis));
+    GGML_ASSERT(ggml_is_contiguous(su));
+    GGML_ASSERT(ggml_is_contiguous(sv));
+    GGML_ASSERT(ggml_is_contiguous(tlut));
+    GGML_ASSERT(ggml_is_contiguous(x));
+
+    GGML_ASSERT(tlut->ne[0] == 2 && tlut->ne[1] == 512);   // V = 2, tlut_bits = 9
+
+    const int64_t n = x->ne[0];
+    const int64_t m = sv->ne[0];
+    GGML_ASSERT(su->ne[0] == n);
+    if (rht_blk == 0) {
+        // one Hadamard across the whole dimension
+        GGML_ASSERT((m & (m - 1)) == 0 && (n & (n - 1)) == 0);
+    } else {
+        // diag(H_blk, ...): blk must be a power of two and divide both sides
+        GGML_ASSERT(rht_blk >= 16 && (rht_blk & (rht_blk - 1)) == 0);
+        GGML_ASSERT(n % rht_blk == 0 && m % rht_blk == 0);
+    }
+    GGML_ASSERT(m % 16 == 0 && n % 16 == 0);
+    GGML_ASSERT(trellis->ne[1] == (m/16)*(n/16));
+    GGML_ASSERT(trellis->ne[0]*2 % 16 == 0 && trellis->ne[0]*2/16 <= 16);
+
+    const int64_t ne[4] = { m, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_PAW_RT_MM;
+    result->src[0] = trellis;
+    result->src[1] = su;
+    result->src[2] = sv;
+    result->src[3] = tlut;
+    result->src[4] = x;
+    result->op_params[GGML_PAW_RHT_BLK_SLOT] = rht_blk;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_paw_rt_mm_epilogue(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * trellis,
+        struct ggml_tensor  * su,
+        struct ggml_tensor  * sv,
+        struct ggml_tensor  * tlut,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * acc,
+        int                   rht_blk) {
+    struct ggml_tensor * result = ggml_paw_rt_mm(ctx, trellis, su, sv, tlut, x, rht_blk);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && acc->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(gate) && ggml_is_contiguous(acc));
+    GGML_ASSERT(gate->ne[0] == 1 && ggml_nelements(gate) == x->ne[1]*x->ne[2]*x->ne[3]);
+    GGML_ASSERT(ggml_are_same_shape(result, acc));
+    result->src[5] = gate;
+    result->src[6] = acc;
+    result->op_params[0] = 1;
+    return result;
+}
+
+struct ggml_tensor * ggml_paw_rt_mm_epilogue_dot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * trellis,
+        struct ggml_tensor  * su,
+        struct ggml_tensor  * sv,
+        struct ggml_tensor  * tlut,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate_w,
+        struct ggml_tensor  * gate_x,
+        struct ggml_tensor  * acc,
+        int                   rht_blk) {
+    struct ggml_tensor * result = ggml_paw_rt_mm(ctx, trellis, su, sv, tlut, x, rht_blk);
+    GGML_ASSERT(gate_w->type == GGML_TYPE_F32 && gate_x->type == GGML_TYPE_F32 && acc->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(gate_w) && ggml_is_contiguous(gate_x) && ggml_is_contiguous(acc));
+    GGML_ASSERT(ggml_nelements(gate_w) == gate_x->ne[0]);
+    GGML_ASSERT(gate_x->ne[1] == x->ne[1] && ggml_are_same_shape(result, acc));
+    result->src[5] = gate_w;
+    result->src[6] = gate_x;
+    result->src[7] = acc;
+    result->op_params[0] = 2;
+    return result;
+}
+
+struct ggml_tensor * ggml_paw_rt_mm_batch(
+        struct ggml_context * ctx,
+        int n_matrices,
+        struct ggml_tensor * const * trellis,
+        struct ggml_tensor * const * su,
+        struct ggml_tensor * const * sv,
+        struct ggml_tensor * tlut,
+        struct ggml_tensor * x,
+        int                  rht_blk) {
+    GGML_ASSERT(n_matrices >= 2 && n_matrices <= 4);
+    GGML_ASSERT(tlut->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type    == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(tlut));
+    GGML_ASSERT(ggml_is_contiguous(x));
+
+    const int64_t n = x->ne[0];
+    int64_t m_sum = 0;
+    for (int i = 0; i < n_matrices; ++i) {
+        GGML_ASSERT(trellis[i]->type == GGML_TYPE_I16);
+        GGML_ASSERT(su[i]->type      == GGML_TYPE_F32);
+        GGML_ASSERT(sv[i]->type      == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(trellis[i]));
+        GGML_ASSERT(ggml_is_contiguous(su[i]));
+        GGML_ASSERT(ggml_is_contiguous(sv[i]));
+        GGML_ASSERT(su[i]->ne[0] == n);
+        GGML_ASSERT(sv[i]->ne[0] % 16 == 0);
+        if (rht_blk == 0) {
+            const int64_t mi = sv[i]->ne[0];
+            GGML_ASSERT((mi & (mi - 1)) == 0 && (n & (n - 1)) == 0);
+        } else {
+            GGML_ASSERT(rht_blk >= 16 && (rht_blk & (rht_blk - 1)) == 0);
+            GGML_ASSERT(n % rht_blk == 0 && sv[i]->ne[0] % rht_blk == 0);
+        }
+        m_sum += sv[i]->ne[0];
+    }
+
+    const int64_t ne[4] = { m_sum, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op = GGML_OP_PAW_RT_MM_BATCH;
+    int idx = 0;
+    int m_off = 0;
+    result->op_params[0] = n_matrices;
+    for (int i = 0; i < n_matrices; ++i) {
+        result->op_params[1 + i] = m_off;
+        result->src[idx++] = trellis[i];
+        result->src[idx++] = su[i];
+        result->src[idx++] = sv[i];
+        m_off += (int) sv[i]->ne[0];
+    }
+    result->src[idx++] = tlut;
+    result->src[idx++] = x;
+    result->op_params[GGML_PAW_RHT_BLK_SLOT] = rht_blk;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_paw_x3_mm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * trellis,
+        struct ggml_tensor  * suh,
+        struct ggml_tensor  * svh,
+        struct ggml_tensor  * x) {
+    GGML_ASSERT(trellis->type == GGML_TYPE_I16);
+    GGML_ASSERT(suh->type     == GGML_TYPE_F16);
+    GGML_ASSERT(svh->type     == GGML_TYPE_F16);
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(trellis));
+    GGML_ASSERT(ggml_is_contiguous(suh));
+    GGML_ASSERT(ggml_is_contiguous(svh));
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_n_dims(trellis) == 2);
+
+    // words-per-tile = 16*K (mul1-v1: K fresh bits per value in a 16x16 tile)
+    const int64_t words = trellis->ne[0];
+    const int64_t k     = words / 16;
+    GGML_ASSERT(words % 16 == 0);
+    GGML_ASSERT(k == 1 || k == 2 || k == 3 || k == 4);   // Plan D rates + K1/K4 sweep
+
+    const int64_t n = x->ne[0];
+    GGML_ASSERT(suh->ne[0] == n);
+    GGML_ASSERT(n % 16 == 0);
+
+    const int64_t ntiles = trellis->ne[1];
+    const int64_t m      = 16 * (ntiles / (n / 16));
+    GGML_ASSERT(ntiles % (n / 16) == 0);
+    GGML_ASSERT(svh->ne[0] == m);
+
+    const int64_t ne[4] = { m, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op = GGML_OP_PAW_X3_MM;
+    result->src[0] = trellis;
+    result->src[1] = suh;
+    result->src[2] = svh;
+    result->src[3] = x;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_paw_x3_mm_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * trellis,
+        struct ggml_tensor  * meta,
+        struct ggml_tensor  * suh,
+        struct ggml_tensor  * svh,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * x) {
+    GGML_ASSERT(trellis->type == GGML_TYPE_I16);
+    GGML_ASSERT(meta->type    == GGML_TYPE_I32);
+    GGML_ASSERT(suh->type     == GGML_TYPE_F16);
+    GGML_ASSERT(svh->type     == GGML_TYPE_F16);
+    GGML_ASSERT(ids->type     == GGML_TYPE_I32);
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(trellis) && ggml_is_contiguous(meta));
+    GGML_ASSERT(ggml_is_contiguous(suh) && ggml_is_contiguous(svh));
+    GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(x));
+
+    const int64_t n        = x->ne[0];
+    const int64_t m        = svh->ne[0];
+    const int64_t n_expert = suh->ne[1];
+    GGML_ASSERT(ggml_n_dims(trellis) == 1);
+    GGML_ASSERT(meta->ne[0] == 2 && meta->ne[1] == n_expert);
+    GGML_ASSERT(suh->ne[0] == n && svh->ne[1] == n_expert);
+    // H128 is baked into the kernels
+    GGML_ASSERT(n % 128 == 0 && m % 128 == 0);
+
+    GGML_ASSERT(x->ne[1] == 1 || x->ne[1] == ids->ne[0]);
+    GGML_ASSERT(x->ne[2] == ids->ne[1] && x->ne[3] == 1);
+
+    const int64_t ne[4] = { m, ids->ne[0], ids->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op = GGML_OP_PAW_X3_MM_ID;
+    result->src[0] = trellis;
+    result->src[1] = meta;
+    result->src[2] = suh;
+    result->src[3] = svh;
+    result->src[4] = ids;
+    result->src[5] = x;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_paw_x3_moe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * const * proj) {
+    GGML_ASSERT(x->type       == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(ids->type     == GGML_TYPE_I32 && ggml_is_contiguous(ids));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_n_dims(x) <= 2 && x->ne[1] == ids->ne[1]);
+    GGML_ASSERT(ggml_nelements(weights) == ids->ne[0] * ids->ne[1]);
+
+    const int64_t n        = x->ne[0];
+    const int64_t ni       = proj[3]->ne[0];   // gate svh
+    const int64_t n_expert = proj[2]->ne[1];   // gate suh
+    // H128 tiles in the fused kernel; lock space is sized for n <= 8192
+    GGML_ASSERT(n % 128 == 0 && ni % 128 == 0 && n <= 8192 && ni <= 8192);
+
+    for (int p = 0; p < 3; ++p) {
+        struct ggml_tensor * trellis = proj[4*p + 0];
+        struct ggml_tensor * meta    = proj[4*p + 1];
+        struct ggml_tensor * suh     = proj[4*p + 2];
+        struct ggml_tensor * svh     = proj[4*p + 3];
+        const int64_t in  = p == 2 ? ni : n;
+        const int64_t out = p == 2 ? n  : ni;
+        GGML_ASSERT(trellis->type == GGML_TYPE_I16 && ggml_n_dims(trellis) == 1 && ggml_is_contiguous(trellis));
+        GGML_ASSERT(meta->type == GGML_TYPE_I32 && meta->ne[0] == 2 && meta->ne[1] == n_expert && ggml_is_contiguous(meta));
+        GGML_ASSERT(suh->type == GGML_TYPE_F16 && suh->ne[0] == in  && suh->ne[1] == n_expert && ggml_is_contiguous(suh));
+        GGML_ASSERT(svh->type == GGML_TYPE_F16 && svh->ne[0] == out && svh->ne[1] == n_expert && ggml_is_contiguous(svh));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, x->ne[1]);
+
+    result->op     = GGML_OP_PAW_X3_MOE;
+    result->src[0] = x;
+    result->src[1] = ids;
+    result->src[2] = weights;
+    for (int i = 0; i < 12; ++i) {
+        result->src[3 + i] = proj[i];
+    }
+
+    return result;
+}
+
+struct ggml_tensor * ggml_paw_exp_mm_batch2(
+        struct ggml_context * ctx,
+        struct ggml_tensor * kept0, struct ggml_tensor * su0,
+        struct ggml_tensor * sv0,   struct ggml_tensor * gamma0,
+        struct ggml_tensor * kept1, struct ggml_tensor * su1,
+        struct ggml_tensor * sv1,   struct ggml_tensor * gamma1,
+        struct ggml_tensor * tlut,
+        struct ggml_tensor * remap,
+        struct ggml_tensor * ids,
+        struct ggml_tensor * x) {
+    GGML_ASSERT(kept0->type == GGML_TYPE_I16 && kept1->type == GGML_TYPE_I16);
+    GGML_ASSERT(su0->type   == GGML_TYPE_F16 && su1->type   == GGML_TYPE_F16);
+    GGML_ASSERT(sv0->type   == GGML_TYPE_F16 && sv1->type   == GGML_TYPE_F16);
+    GGML_ASSERT(gamma0->type == GGML_TYPE_F16 && gamma1->type == GGML_TYPE_F16);
+    GGML_ASSERT(tlut->type  == GGML_TYPE_F16);
+    GGML_ASSERT(remap->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids->type   == GGML_TYPE_I32);
+    GGML_ASSERT(x->type     == GGML_TYPE_F32);
+    GGML_ASSERT(tlut->ne[0] == 8);   // V8 only -- this batched path never sees the V2 codec
+    GGML_ASSERT(su0->ne[0]  == su1->ne[0]);
+    GGML_ASSERT(sv0->ne[0]  == sv1->ne[0]);
+    GGML_ASSERT(sv0->ne[0] % 16 == 0);
+    GGML_ASSERT(kept0->ne[2] == kept1->ne[2]);   // n_kept must match to share one routing/group pass
+    GGML_ASSERT(ids->ne[1] == 1);                // decode-only: this batched path is scoped to nt==1
+
+    const int64_t m       = sv0->ne[0];
+    const int64_t n_used  = ids->ne[0];
+    const int64_t n_tok   = ids->ne[1];
+
+    const int64_t ne[4] = { m, n_used, 2, n_tok };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op = GGML_OP_PAW_EXP_MM_BATCH2;
+    result->src[0]  = kept0;
+    result->src[1]  = su0;
+    result->src[2]  = sv0;
+    result->src[3]  = gamma0;
+    result->src[4]  = kept1;
+    result->src[5]  = su1;
+    result->src[6]  = sv1;
+    result->src[7]  = gamma1;
+    result->src[8]  = tlut;
+    result->src[9]  = remap;
+    result->src[10] = ids;
+    result->src[11] = x;
+
+    return result;
+}
+
+// ggml_paw_head_mm
+
+struct ggml_tensor * ggml_paw_head_mm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * qp,
+        struct ggml_tensor  * gscale,
+        struct ggml_tensor  * x) {
+    GGML_ASSERT(qp->type     == GGML_TYPE_I8);
+    GGML_ASSERT(gscale->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type      == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(qp));
+    GGML_ASSERT(ggml_is_contiguous(gscale));
+    GGML_ASSERT(ggml_is_contiguous(x));
+
+    const int64_t n     = x->ne[0];
+    const int64_t vocab = qp->ne[1];
+    GGML_ASSERT(n % 64 == 0);
+    GGML_ASSERT(qp->ne[0] == n/8*5);
+    GGML_ASSERT(gscale->ne[0] == n/64 && gscale->ne[1] == vocab);
+
+    const int64_t ne[4] = { vocab, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_PAW_HEAD_MM;
+    result->src[0] = qp;
+    result->src[1] = gscale;
+    result->src[2] = x;
+
+    return result;
+}
+
+// ggml_paw_moe_reduce
+
+struct ggml_tensor * ggml_paw_moe_reduce(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(experts));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(weights->ne[0] == 1);
+    GGML_ASSERT(experts->ne[1] == weights->ne[1]);   // n_expert_used
+    GGML_ASSERT(experts->ne[2] == weights->ne[2]);   // n_tokens
+    GGML_ASSERT(experts->ne[3] == 1 && weights->ne[3] == 1);
+
+    const int64_t ne[4] = { experts->ne[0], experts->ne[2], 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_PAW_MOE_REDUCE;
+    result->src[0] = experts;
+    result->src[1] = weights;
+
+    return result;
+}
+
+// ggml_paw_v_reorder
+
+struct ggml_tensor * ggml_paw_v_reorder(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * y,
+        int seg_off, int hd, int K, int r) {
+    GGML_ASSERT(y->type == GGML_TYPE_F32);
+    GGML_ASSERT(y->nb[0] == sizeof(float));   // rows must be dense
+
+    const int seg_rows = hd*K*r;
+    GGML_ASSERT(seg_off >= 0 && seg_off + seg_rows <= y->ne[0]);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, y->ne);
+
+    result->op = GGML_OP_PAW_V_REORDER;
+    result->src[0] = y;
+    result->op_params[0] = seg_off;
+    result->op_params[1] = hd;
+    result->op_params[2] = K;
+    result->op_params[3] = r;
+
+    return result;
+}
+
+// ggml_paw_dual_mm
+
+struct ggml_tensor * ggml_paw_dual_mm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w0,
+        struct ggml_tensor  * w1,
+        struct ggml_tensor  * x) {
+    GGML_ASSERT(w0->type == GGML_TYPE_F32 && w1->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(w0) && ggml_is_contiguous(w1));
+    GGML_ASSERT(w0->ne[0] == w1->ne[0] && w0->ne[1] == w1->ne[1]);
+    GGML_ASSERT(x->ne[0] == w0->ne[0]);
+
+    const int64_t ne[4] = { 2*w0->ne[1], x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op = GGML_OP_PAW_DUAL_MM;
+    result->src[0] = w0;
+    result->src[1] = w1;
+    result->src[2] = x;
+
+    return result;
+}
+
+// ggml_paw_embed_gather
+
+struct ggml_tensor * ggml_paw_embed_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * codes,
+        struct ggml_tensor  * lut,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(codes->type == GGML_TYPE_I8);
+    GGML_ASSERT(lut->type   == GGML_TYPE_BF16);
+    GGML_ASSERT(ids->type   == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(codes));
+    GGML_ASSERT(ggml_is_contiguous(lut));
+    GGML_ASSERT(ggml_is_contiguous(ids));
+
+    const int64_t n_embd = codes->ne[0]*2;
+    const int64_t vocab  = codes->ne[1];
+    GGML_ASSERT(n_embd % 64 == 0);
+    // one 16-entry LUT per group; the group size is whatever the payload
+    // chose (64 on every shipped 35B, 256 on paw-dense) and must be a
+    // power of two that divides n_embd
+    GGML_ASSERT(lut->ne[0] == 16);
+    GGML_ASSERT(lut->ne[1] % vocab == 0);
+    const int64_t n_groups = lut->ne[1] / vocab;
+    const int64_t group    = n_embd / n_groups;
+    GGML_ASSERT(group*n_groups == n_embd);
+    GGML_ASSERT(group >= 16 && (group & (group - 1)) == 0);
+
+    const int64_t ne[4] = { n_embd, ids->ne[0], 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_PAW_EMBED_GATHER;
+    result->src[0] = codes;
+    result->src[1] = lut;
+    result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_paw_exp_basis
+
+struct ggml_tensor * ggml_paw_exp_basis(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * basis_a,
+        struct ggml_tensor  * basis_b,
+        struct ggml_tensor  * basis_c,
+        struct ggml_tensor  * remap,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * acc) {
+    GGML_ASSERT(basis_a->type == GGML_TYPE_F16);
+    GGML_ASSERT(basis_b->type == GGML_TYPE_F16);
+    GGML_ASSERT(basis_c->type == GGML_TYPE_F16);
+    GGML_ASSERT(remap->type   == GGML_TYPE_I32);
+    GGML_ASSERT(ids->type     == GGML_TYPE_I32);
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(basis_a));
+    GGML_ASSERT(ggml_is_contiguous(basis_b));
+    GGML_ASSERT(ggml_is_contiguous(basis_c));
+    GGML_ASSERT(ggml_is_contiguous(remap));
+    GGML_ASSERT(ggml_is_contiguous(x));
+
+    const int64_t n = x->ne[0];
+    const int64_t r = basis_a->ne[1];
+    const int64_t m = basis_b->ne[1];
+    GGML_ASSERT(basis_a->ne[0] == n);
+    GGML_ASSERT(basis_b->ne[0] == r && basis_c->ne[0] == r);
+    GGML_ASSERT(r > 0 && r <= 256);                        // kernel stack buffer bound
+
+    GGML_ASSERT(x->ne[1] == 1 || x->ne[1] == ids->ne[0]);
+    GGML_ASSERT(x->ne[2] == ids->ne[1] && x->ne[3] == 1);
+
+    const int64_t ne[4] = { m, ids->ne[0], ids->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    if (acc != NULL) {
+        GGML_ASSERT(acc->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(acc));
+        GGML_ASSERT(ggml_are_same_shape(acc, result));
+    }
+
+    result->op     = GGML_OP_PAW_EXP_BASIS;
+    result->src[0] = basis_a;
+    result->src[1] = basis_b;
+    result->src[2] = basis_c;
+    result->src[3] = remap;
+    result->src[4] = ids;
+    result->src[5] = x;
+    result->src[6] = acc;
 
     return result;
 }

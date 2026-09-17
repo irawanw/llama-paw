@@ -949,6 +949,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     model->load_hparams(ml);
     model->load_stats  (ml);
 
+    if ((model->arch == LLM_ARCH_PAW || model->arch == LLM_ARCH_MACH1 || model->arch == LLM_ARCH_PAW_DENSE)) {
+        throw std::runtime_error(
+            "paw checkpoints are already packed trellis code streams; "
+            "requantization with llama-quantize is not supported");
+    }
+
     quantize_state_impl qs(*model, params);
 
     if (params->only_copy) {

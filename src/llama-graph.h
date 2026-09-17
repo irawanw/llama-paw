@@ -898,6 +898,7 @@ public:
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
+    ggml_tensor * get_greedy_ids()  const { return t_greedy_ids; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
@@ -933,6 +934,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_greedy_ids  = nullptr; // [n_outputs] int32 argmax per logits row, GGML_PAW_GREEDY_IDS=1 only
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -1371,6 +1373,12 @@ struct llm_graph_context {
             ggml_tensor * cls_norm) const;
 
     //
+    // greedy ids (model-graph argmax, not backend sampling)
+    //
+
+    void build_greedy_ids() const;
+
+    //
     // sampling (backend sampling)
     //
 
@@ -1388,3 +1396,6 @@ struct llm_graph_context {
 
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);
+
+// GGML_PAW_GREEDY_IDS=1: model graph also emits per-row argmax ids for the greedy verify path
+bool paw_greedy_ids_on();

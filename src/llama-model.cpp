@@ -328,6 +328,11 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen35moe(params);
         case LLM_ARCH_QWEN4EXP:
             return new llama_model_qwen4exp(params);
+        case LLM_ARCH_PAW:
+        case LLM_ARCH_MACH1:
+            return new llama_model_paw(params);
+        case LLM_ARCH_PAW_DENSE:
+            return new llama_model_paw_dense(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
         case LLM_ARCH_EAGLE3:
@@ -2765,6 +2770,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
 
+    // model-graph greedy argmax ids (GGML_PAW_GREEDY_IDS=1 only, not backend sampling)
+    llm->build_greedy_ids();
+
     // add backend sampling layers (if any)
     llm->build_sampling();
 
@@ -3067,6 +3075,9 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_QWEN3TTS:
+        case LLM_ARCH_PAW:
+        case LLM_ARCH_MACH1:
+        case LLM_ARCH_PAW_DENSE:
             return LLAMA_ROPE_TYPE_IMROPE;
 
         case LLM_ARCH_GLM4:

@@ -293,6 +293,43 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
     }
 }
 
+static std::vector<llama_token> load_token_ids_file(const std::string & path, int n_vocab) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("cannot open token-ids file " + path);
+    }
+    std::vector<llama_token> out;
+    std::string piece;
+    while (in >> piece) {
+        char * end = nullptr;
+        long v = std::strtol(piece.c_str(), &end, 10);
+        if (end == piece.c_str() || *end != '\0') {
+            throw std::runtime_error("malformed integer '" + piece + "' in " + path);
+        }
+        if (v < 0 || v >= n_vocab) {
+            throw std::runtime_error("token id out of range in " + path);
+        }
+        out.push_back((llama_token) v);
+    }
+    if (out.empty()) {
+        throw std::runtime_error("empty token-ids file " + path);
+    }
+    return out;
+}
+
+// Token IDs either from --token-ids-file or by tokenizing the prompt.
+// Throws std::runtime_error on conflict or unreadable IDs.
+static std::vector<llama_token> get_eval_tokens(llama_context * ctx, const common_params & params,
+        const llama_vocab * vocab) {
+    if (params.token_ids_file.empty()) {
+        return common_tokenize(ctx, params.prompt, true);
+    }
+    if (!params.prompt.empty() || !params.prompt_file.empty()) {
+        throw std::runtime_error("--token-ids-file cannot be combined with prompt text/file input");
+    }
+    return load_token_ids_file(params.token_ids_file, llama_vocab_n_tokens(vocab));
+}
+
 static results_perplexity perplexity_v2(llama_context * ctx, const common_params & params) {
     // Download: https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
     // Run `./perplexity -m models/7B/ggml-model-q4_0.bin -f wiki.test.raw`
@@ -307,7 +344,7 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
 
     LOG_INF("%s: tokenizing the input ..\n", __func__);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
+    std::vector<llama_token> tokens = get_eval_tokens(ctx, params, vocab);
 
     const int n_ctx = llama_n_ctx(ctx);
 
@@ -472,7 +509,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     auto tim1 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenizing the input ..\n", __func__);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
+    std::vector<llama_token> tokens = get_eval_tokens(ctx, params, vocab);
 
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
@@ -2085,7 +2122,12 @@ int llama_perplexity(int argc, char ** argv) {
     } else if (params.kl_divergence) {
         kl_divergence(ctx, params);
     } else {
-        results = perplexity(ctx, params, n_ctx);
+        try {
+            results = perplexity(ctx, params, n_ctx);
+        } catch (const std::exception & e) {
+            LOG_ERR("%s: %s\n", __func__, e.what());
+            return 1;
+        }
     }
 
     LOG("\n");

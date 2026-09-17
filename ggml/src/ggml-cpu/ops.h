@@ -118,6 +118,17 @@ void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * para
 void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+
+// PAW codec CPU forwards (fork-local ops; CUDA/Vulkan carry the fast paths)
+void ggml_compute_forward_paw_ne_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_paw_embed_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_paw_exp_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_paw_exp_basis(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_paw_rt_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_paw_head_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_paw_embed_gather(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_paw_moe_reduce(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+
 #ifdef __cplusplus
 }
 #endif

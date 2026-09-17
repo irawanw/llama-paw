@@ -441,6 +441,49 @@ def dump_markdown_metadata(reader: GGUFReader, args: argparse.Namespace) -> None
     print(markdown_content)  # noqa: NP100
 
 
+def validate_paw_x3(reader: GGUFReader) -> list[dict[str, Any]]:
+    version = reader.get_field('paw.format_version')
+    if version is None:
+        version = reader.get_field('mach1.format_version')
+    if version is None or type(version.contents()) is not int or version.contents() < 3:
+        raise ValueError('PAW X3 requires an integer format_version >= 3')
+
+    tensors = {tensor.name: tensor for tensor in reader.tensors}
+    if len(tensors) != len(reader.tensors):
+        raise ValueError('Duplicate tensor names')
+    suffixes = ('m3_trellis', 'm3_suh', 'm3_svh')
+    bases = sorted({name.rsplit('.', 1)[0] for name in tensors if name.endswith(tuple('.' + suffix for suffix in suffixes))})
+    if not bases:
+        raise ValueError('No PAW X3 sidecars found')
+
+    matrices: list[dict[str, Any]] = []
+    for base in bases:
+        names = [base + '.' + suffix for suffix in suffixes]
+        for name in names:
+            if name not in tensors:
+                raise ValueError(f'Missing PAW X3 sidecar: {name}')
+        trellis, suh, svh = (tensors[name] for name in names)
+        for tensor, expected_type, rank in zip((trellis, suh, svh), ('I16', 'F16', 'F16'), (2, 1, 1)):
+            if tensor.tensor_type.name != expected_type:
+                raise ValueError(f'{tensor.name}: expected {expected_type}, got {tensor.tensor_type.name}')
+            if len(tensor.shape) != rank or any(int(dim) <= 0 for dim in tensor.shape):
+                raise ValueError(f'{tensor.name}: expected positive rank-{rank} dense X3 shape')
+        words, tiles = (int(dim) for dim in trellis.shape)
+        n, m = int(suh.shape[0]), int(svh.shape[0])
+        if words not in (16, 32, 48, 64):
+            raise ValueError(f'{trellis.name}: unsupported K (words per tile = {words})')
+        if n % 16 or m % 16 or tiles != (n // 16) * (m // 16):
+            raise ValueError(f'{base}: inconsistent X3 tile count or scale dimensions')
+        matrices.append({
+            'name': base,
+            'input_features': n,
+            'output_features': m,
+            'k': words // 16,
+            'bytes': sum(tensors[name].n_bytes for name in names),
+        })
+    return matrices
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Dump GGUF file metadata")
     parser.add_argument("model",           type=str,            help="GGUF format model filename")

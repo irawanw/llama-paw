@@ -2085,6 +2085,51 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_PAW_NE_MM:
+            {
+                ggml_compute_forward_paw_ne_mm(params, tensor);
+            } break;
+        case GGML_OP_PAW_EMBED_ROWS:
+            {
+                ggml_compute_forward_paw_embed_rows(params, tensor);
+            } break;
+        case GGML_OP_PAW_EXP_MM:
+            {
+                ggml_compute_forward_paw_exp_mm(params, tensor);
+            } break;
+        case GGML_OP_PAW_EXP_BASIS:
+            {
+                ggml_compute_forward_paw_exp_basis(params, tensor);
+            } break;
+        case GGML_OP_PAW_RT_MM:
+            {
+                ggml_compute_forward_paw_rt_mm(params, tensor);
+            } break;
+        case GGML_OP_PAW_RT_MM_BATCH:
+        case GGML_OP_PAW_X3_MM:
+        case GGML_OP_PAW_X3_MM_ID:
+        case GGML_OP_PAW_X3_MOE:
+            {
+                // CUDA-only op; the CPU backend never executes it.
+                GGML_ASSERT(false);
+            } break;
+        case GGML_OP_PAW_EXP_MM_BATCH2:
+            {
+                // CUDA-only op; the CPU backend never executes it.
+                GGML_ASSERT(false);
+            } break;
+        case GGML_OP_PAW_HEAD_MM:
+            {
+                ggml_compute_forward_paw_head_mm(params, tensor);
+            } break;
+        case GGML_OP_PAW_EMBED_GATHER:
+            {
+                ggml_compute_forward_paw_embed_gather(params, tensor);
+            } break;
+        case GGML_OP_PAW_MOE_REDUCE:
+            {
+                ggml_compute_forward_paw_moe_reduce(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2280,6 +2325,19 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
+        case GGML_OP_PAW_NE_MM:
+        case GGML_OP_PAW_EMBED_ROWS:
+        case GGML_OP_PAW_EXP_MM:
+        case GGML_OP_PAW_EXP_BASIS:
+        case GGML_OP_PAW_RT_MM:
+        case GGML_OP_PAW_RT_MM_BATCH:
+        case GGML_OP_PAW_X3_MM:
+        case GGML_OP_PAW_X3_MM_ID:
+        case GGML_OP_PAW_X3_MOE:
+        case GGML_OP_PAW_EXP_MM_BATCH2:
+        case GGML_OP_PAW_HEAD_MM:
+        case GGML_OP_PAW_EMBED_GATHER:
+        case GGML_OP_PAW_MOE_REDUCE:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
@@ -2918,6 +2976,69 @@ struct ggml_cplan ggml_graph_plan(
                             node->src[0]->type == GGML_TYPE_F16) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
+                    } break;
+                case GGML_OP_PAW_EXP_MM:
+                    {
+                        // shared W buffer + fp32 su/sv rows + per-group pair lists
+                        const int64_t n = node->src[2]->ne[0];                         // su
+                        const int64_t m = node->src[3]->ne[0];                         // sv
+                        const int64_t n_dem    = node->src[1] ? node->src[1]->ne[2] : 0;
+                        const int64_t n_groups = node->src[0]->ne[2] + n_dem;
+                        const int64_t n_pairs  = node->src[6]->ne[0]*node->src[6]->ne[1];
+                        cur  = sizeof(float)*(m*n + m + n);
+                        cur += sizeof(int32_t)*(3*n_groups + 2*n_pairs);
+                        cur += 64;
+                    } break;
+                case GGML_OP_PAW_RT_MM:
+                    {
+                        // shared W buffer
+                        const int64_t n = node->src[1]->ne[0];                         // su
+                        const int64_t m = node->src[2]->ne[0];                         // sv
+                        cur = sizeof(float)*m*n;
+                    } break;
+                case GGML_OP_PAW_X3_MM:
+                    {
+                        // CUDA-only; size the work buffer like RT_MM so the
+                        // scheduler never sees a zero-work node
+                        const int64_t n = node->src[1]->ne[0];                         // suh
+                        const int64_t m = node->src[2]->ne[0];                         // svh
+                        cur = sizeof(float)*m*n;
+                    } break;
+                case GGML_OP_PAW_X3_MM_ID:
+                    {
+                        // CUDA-only; same sizing as PAW_X3_MM
+                        const int64_t n = node->src[2]->ne[0];                         // suh
+                        const int64_t m = node->src[3]->ne[0];                         // svh
+                        cur = sizeof(float)*m*n;
+                    } break;
+                case GGML_OP_PAW_X3_MOE:
+                    {
+                        // CUDA-only; one gate matrix
+                        const int64_t n = node->src[5]->ne[0];                         // gate suh
+                        const int64_t m = node->src[6]->ne[0];                         // gate svh
+                        cur = sizeof(float)*m*n;
+                    } break;
+                case GGML_OP_PAW_RT_MM_BATCH:
+                    {
+                        const int64_t n = node->src[1]->ne[0];   // first su
+                        int64_t m = 0;
+                        for (int i = 0; i < node->op_params[0]; ++i) {
+                            m += node->src[3*i + 2]->ne[0];
+                        }
+                        cur = sizeof(float)*m*n;
+                    } break;
+                case GGML_OP_PAW_EXP_MM_BATCH2:
+                    {
+                        // CUDA-only op; this sizing is never actually used (no
+                        // CPU implementation), kept for consistency with the
+                        // other paw ops' work-buffer entries.
+                        const int64_t n = node->src[1]->ne[0];   // su0
+                        const int64_t m = node->src[2]->ne[0];   // sv0
+                        const int64_t n_groups = node->src[0]->ne[2];   // kept0
+                        const int64_t n_pairs  = node->src[10]->ne[0]*node->src[10]->ne[1];   // ids
+                        cur  = sizeof(float)*2*(m*n + m + n);
+                        cur += sizeof(int32_t)*(3*n_groups + 2*n_pairs);
+                        cur += 64;
                     } break;
                 case GGML_OP_SET_ROWS:
                     {
