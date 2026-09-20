@@ -230,10 +230,22 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     const int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
 
+    // An MTP draft GGUF carries only the nextn block (blk.<n_layer>.*) and no
+    // base layers -- it is never executed as a normal decoder, it only runs
+    // graph_mtp against hidden states produced by the target. The base layers
+    // are therefore required by bookkeeping, not by math, so when this file
+    // has no layer-0 tensors treat them as optional instead of failing the
+    // load. Without this, any 1-layer MTP draft dies on
+    // "check_tensor_dims: tensor 'blk.0.hc_attn_norm.weight' not found".
+    const bool mtp_only = ml.load_mtp &&
+        ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_NORM, "weight", 0).str().c_str()) == nullptr &&
+        ml.get_tensor_meta(tn(LLM_TENSOR_HC_ATTN_NORM, "weight", 0).str().c_str()) == nullptr;
+    const int base_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+
     paw_x3_layers.resize(hparams.n_layer_all);
     for (int il = 0; il < (int) hparams.n_layer_all; ++il) {
         auto & layer = layers[il];
-        const int flags = il < n_layer ? 0 : mtp_flags;
+        const int flags = il < n_layer ? base_flags : mtp_flags;
 
         const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
