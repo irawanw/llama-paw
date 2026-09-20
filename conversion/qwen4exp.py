@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Iterable, cast
+import json
+import logging
+import os
+from typing import Callable, Iterable, cast
 
 import torch
 from torch import Tensor
@@ -12,6 +15,18 @@ from .base import ModelBase
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 from .qwen3vl import Qwen3VLVisionModel
 
+logger = logging.getLogger(__name__)
+
+# PAW overlay: substitute the routed experts and PLE table with packed tensors.
+PAW_X3_PACKED_ENV = "PAW_X3_PACKED"
+PAW_PLE_Q8_ENV = "PAW_PLE_Q8"
+PAW_X3_PROJ = ("gate", "up", "down")
+PAW_X3_TENSOR = {
+    "gate": gguf.MODEL_TENSOR.FFN_GATE_EXP,
+    "up": gguf.MODEL_TENSOR.FFN_UP_EXP,
+    "down": gguf.MODEL_TENSOR.FFN_DOWN_EXP,
+}
+
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
 @ModelBase.example("Qwen/Qwen3.8-Flash-Next")
@@ -21,19 +36,61 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     Shares the Qwen3.5 gated delta net and interleaved mrope, and adds three things:
     hyper-connections in place of every layer norm, QSA sparse attention on the full
     attention layers, and PLE n-gram hash embeddings on a single layer.
+
+    The checkpoint also carries a NextN/MTP draft head under `mtp.*`, exported as a
+    trailing block; pass --no-nextn to leave it out.
     """
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
-
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # only the shard names, so the table itself is never held
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
+
+        self._paw_x3_root = os.environ.get(PAW_X3_PACKED_ENV)
+        self._paw_ple_q8_root = os.environ.get(PAW_PLE_Q8_ENV)
+        for env, root in ((PAW_X3_PACKED_ENV, self._paw_x3_root),
+                          (PAW_PLE_Q8_ENV, self._paw_ple_q8_root)):
+            if root and not os.path.isdir(root):
+                raise ValueError(f"{env}={root!r} is not a directory")
+        if self._paw_x3_root:
+            logger.info("PAW X3: routed experts come from %s", self._paw_x3_root)
+        if self._paw_ple_q8_root:
+            logger.info("PAW PLE Q8: n-gram table comes from %s", self._paw_ple_q8_root)
+
+    _MTP_MIXER_PREFIX = "mtp.hyper_connection_mixer."
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, gen = item
+        if name.startswith("model." + cls._MTP_MIXER_PREFIX):
+            name = name.replace("model.", "", 1)
+        if name.startswith(cls._MTP_MIXER_PREFIX):
+            if cls.no_mtp:
+                return None
+            assert cls._original_block_count is not None
+            return f"model.layers.{cls._original_block_count}.{name[len('mtp.'):]}", gen
+        return super().filter_tensors((name, gen))
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        tensors = super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+        emb = tensors.pop("mtp.fc_embedding.weight", None)
+        hid = tensors.pop("mtp.fc_hidden.weight", None)
+        if emb is None and hid is None:
+            return tensors
+        if emb is None or hid is None:
+            raise ValueError(
+                "the qwen4exp MTP combiner needs both mtp.fc_embedding.weight and "
+                "mtp.fc_hidden.weight; pass --no-nextn to convert without the draft head"
+            )
+
+        assert self._original_block_count is not None
+        name = f"model.layers.{self._original_block_count}.eh_proj.weight"
+        tensors[name] = lambda: torch.cat([emb(), hid()], dim=1)
+        return tensors
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -63,14 +120,14 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
-        self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-        )
+        ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+        ratios += [0] * (self.block_count - n_layer)
+        self.gguf_writer.add_attention_compress_ratios(ratios)
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones
         ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
-        if not ple_layers:
+        if not ple_layers or self.mtp_only:
             return
         self.gguf_writer.add_ple_layers(ple_layers)
         self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
@@ -106,6 +163,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         return int(eos)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if self._paw_x3_root and ".mlp.experts." in name:
+            return []
+
+        if self._paw_ple_q8_root and ".ngram_embedding.shard_" in name:
+            return []
+
         # int64 hash constants must stay exact; 1-D tensors force F32, so use KV
         if name.endswith("ple_embedding.layer_multipliers"):
             self._ple_multipliers = [int(x) for x in data_torch.tolist()]
@@ -187,6 +250,81 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             raise ValueError(
                 f"got {len(self._ple_shards)} PLE embedding shards, expected {n_parts}"
             )
+        if self._paw_x3_root:
+            self._add_paw_x3_tensors()
+        if self._paw_ple_q8_root:
+            self._add_paw_ple_q8_tensors()
+
+    @staticmethod
+    def _memmap(path: str, dtype: np.dtype, shape: tuple[int, ...]) -> np.memmap:
+        expected = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        actual = os.path.getsize(path)
+        if actual != expected:
+            raise ValueError(f"{path} has {actual} bytes, expected {expected}")
+        return np.memmap(path, dtype=dtype, mode="r", shape=shape)
+
+    def _add_paw_x3_tensors(self) -> None:
+        assert self._paw_x3_root is not None
+        n_layer = self.hparams["num_hidden_layers"]
+        n_expert = self.hparams["num_experts"]
+
+        for il in range(n_layer):
+            layer_dir = os.path.join(self._paw_x3_root, f"L{il:02d}")
+            index_path = os.path.join(layer_dir, "index.json")
+            if not os.path.isfile(os.path.join(layer_dir, "DONE")):
+                raise ValueError(f"PAW X3 layer {il} is incomplete: {layer_dir}")
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            if index["n_expert"] != n_expert:
+                raise ValueError(
+                    f"PAW X3 layer {il} has {index['n_expert']} experts, expected {n_expert}")
+
+            for proj in PAW_X3_PROJ:
+                base = self.format_tensor_name(PAW_X3_TENSOR[proj], il, suffix="")
+                shapes = index["proj"][proj]["shapes"]
+                arrays = {
+                    "m3_trellis": self._memmap(
+                        os.path.join(layer_dir, f"{proj}_trellis.bin"), np.dtype("<i2"),
+                        (shapes["trellis"][0],)),
+                    "m3_meta": self._memmap(
+                        os.path.join(layer_dir, f"{proj}_meta.bin"), np.dtype("<i4"),
+                        (shapes["meta"][1], shapes["meta"][0])),
+                    "m3_suh": self._memmap(
+                        os.path.join(layer_dir, f"{proj}_suh.bin"), np.dtype("<f2"),
+                        (shapes["suh"][1], shapes["suh"][0])),
+                    "m3_svh": self._memmap(
+                        os.path.join(layer_dir, f"{proj}_svh.bin"), np.dtype("<f2"),
+                        (shapes["svh"][1], shapes["svh"][0])),
+                }
+                for suffix, array in arrays.items():
+                    self.gguf_writer.add_tensor(f"{base}.{suffix}", array)
+
+        logger.info("PAW X3: added %d packed expert layers", n_layer)
+
+    def _add_paw_ple_q8_tensors(self) -> None:
+        assert self._paw_ple_q8_root is not None
+        layout_path = os.path.join(self._paw_ple_q8_root, "layout.json")
+        with open(layout_path, "r", encoding="utf-8") as f:
+            layout = json.load(f)
+
+        n_rows = int(layout["n_rows"])
+        row_dim = int(layout["dim"])
+        if len(layout["shards"]) != self.hparams["split_ngram_parts"]:
+            raise ValueError(
+                f"PAW PLE Q8 has {len(layout['shards'])} shards, expected "
+                f"{self.hparams['split_ngram_parts']}")
+
+        q8 = self._memmap(
+            os.path.join(self._paw_ple_q8_root, "ngram_q8.bin"), np.dtype("i1"),
+            (n_rows, row_dim))
+        scale = self._memmap(
+            os.path.join(self._paw_ple_q8_root, "ngram_scale.bin"), np.dtype("<f2"),
+            (n_rows, 1))
+        base = self.format_tensor_name(gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD, suffix="")
+        self.gguf_writer.add_tensor(base + ".q8", q8)
+        self.gguf_writer.add_tensor(base + ".scale", scale)
+        self._ple_row_dim = row_dim
+        logger.info("PAW PLE Q8: added %d rows x %d", n_rows, row_dim)
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration")

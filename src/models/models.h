@@ -2384,12 +2384,32 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     class llm_graph_input_qsa;
 
+    struct paw_x3_proj {
+        ggml_tensor * trellis = nullptr;
+        ggml_tensor * meta    = nullptr;
+        ggml_tensor * suh     = nullptr;
+        ggml_tensor * svh     = nullptr;
+    };
+
+    struct paw_x3_layer {
+        paw_x3_proj gate;
+        paw_x3_proj up;
+        paw_x3_proj down;
+    };
+
+    std::vector<paw_x3_layer> paw_x3_layers;
+    ggml_tensor * per_layer_tok_embd_scale = nullptr;
+
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
-        graph(const llama_model & model, const llm_graph_params & params);
-    private:
+        graph(const llama_model_qwen4exp & model, const llm_graph_params & params);
+    protected:
+        struct no_build_t {};
+        graph(const llama_model_qwen4exp & model, const llm_graph_params & params, no_build_t) :
+            llm_build_delta_net_base(params), model(model) {}
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2478,8 +2498,15 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * input,
                             int   il);
 
-        const llama_model & model;
+        const llama_model_qwen4exp & model;
     };
+
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model_qwen4exp & model, const llm_graph_params & params);
+    };
+
+private:
+    ggml_tensor * paw_x3_create(llama_model_loader & ml, const LLM_TN_IMPL & tnv, bool required);
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

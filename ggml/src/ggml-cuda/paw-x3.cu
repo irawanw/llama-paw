@@ -3791,11 +3791,8 @@ void ggml_cuda_op_paw_x3_moe(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         const int *       tables_k       = (const int *) ((char *) tables_dev + 3 * np * sizeof(void *));
 
         static const int num_sms = x3_num_sms();
-        static std::once_flag attr_once;
-        std::call_once(attr_once, []() {
-            CUDA_CHECK(cudaFuncSetAttribute((const void *) x3m_moe_kernel,
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize, X3G_SMEM_MAX));
-        });
+        CUDA_CHECK(cudaFuncSetAttribute((const void *) x3m_moe_kernel,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, X3G_SMEM_MAX));
 
         // debug: GGML_PAW_X3_MOE_GROUP_SIZE forces the SMs per expert group
         static const int group_size_env = []() {
