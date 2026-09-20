@@ -3673,6 +3673,56 @@ void ggml_cuda_op_paw_x3_mm_id(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Device-side counting sort of the routing ids, for the fused MoE path.
+// Reproduces the host sort exactly: rows keep ascending order within an expert,
+// so x3m_moe_kernel sees byte-identical tables either way. One thread per
+// expert rescans the (short) id list instead of using atomics, which keeps the
+// result deterministic and needs no scratch buffer. n_rows is capped at the
+// fused-row limit by the caller, so the O(n_expert * n_rows) scan is a few
+// microseconds.
+static __global__ void x3m_route_sort_kernel(
+    const int32_t * __restrict__ ids,
+    int32_t * __restrict__ expert_count,
+    int32_t * __restrict__ token_sorted,
+    int32_t * __restrict__ flat_sorted,
+    const int n_rows, const int n_expert, const int n_used)
+{
+    extern __shared__ int32_t s_route[];
+    int32_t * s_cnt = s_route;
+    int32_t * s_off = s_route + n_expert;
+
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+        int c = 0;
+        for (int i = 0; i < n_rows; ++i) {
+            c += (ids[i] == e);
+        }
+        s_cnt[e] = c;
+        expert_count[e] = c;
+    }
+    __syncthreads();
+
+    // n_expert is small (512 here); a serial scan beats a block scan's overhead
+    if (threadIdx.x == 0) {
+        int acc = 0;
+        for (int e = 0; e < n_expert; ++e) {
+            s_off[e] = acc;
+            acc += s_cnt[e];
+        }
+    }
+    __syncthreads();
+
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+        int pos = s_off[e];
+        for (int i = 0; i < n_rows; ++i) {
+            if (ids[i] == e) {
+                token_sorted[pos] = i / n_used;
+                flat_sorted[pos]  = i;
+                ++pos;
+            }
+        }
+    }
+}
+
 // Fused routed-expert SwiGLU FFN with per-expert rates: sum_s w[s] * down_e(silu(gate_e(x)) * up_e(x)).
 // Experts with at most GGML_PAW_X3_MOE_FUSED_ROWS rows (default 128, exllamav3's TEMP_ROWS_FUSED)
 // run in one launch of x3m_moe_kernel; larger experts (prefill) run the per-matrix x3 paths.
@@ -3700,33 +3750,102 @@ void ggml_cuda_op_paw_x3_moe(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         kmeta[p] = x3_expert_meta(P(p, 1), P(p, 0), (P(p, 3)->ne[0] / 16) * (P(p, 2)->ne[0] / 16), stream);
     }
 
-    std::vector<int32_t> ids_host(n_rows);
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    static const int fused_rows = []() {
+        const char * e = getenv("GGML_PAW_X3_MOE_FUSED_ROWS");
+        return e ? atoi(e) : 128;
+    }();
 
-    // host tables: [expert_count | token_sorted | flat_sorted], flat = t * n_used + s
-    std::vector<int32_t> tab(n_expert + 2 * n_rows, 0);
-    int32_t * expert_count = tab.data();
-    int32_t * token_sorted = tab.data() + n_expert;
-    int32_t * flat_sorted  = tab.data() + n_expert + n_rows;
-    for (int64_t i = 0; i < n_rows; ++i) {
-        GGML_ASSERT(ids_host[i] >= 0 && ids_host[i] < n_expert);
-        expert_count[ids_host[i]]++;
-    }
-    {
-        std::vector<int32_t> cursor(n_expert);
-        for (int64_t e = 1; e < n_expert; ++e) {
-            cursor[e] = cursor[e - 1] + expert_count[e - 1];
+    // GGML_PAW_X3_HOST_IDS=1 forces the legacy host counting sort, for A/B and bisect
+    static const bool force_host_ids = getenv("GGML_PAW_X3_HOST_IDS") != nullptr;
+
+    // With n_rows <= fused_rows every per-expert count is <= fused_rows by
+    // construction, so the large-expert loop below is provably empty and the
+    // group count follows from the shapes alone. Nothing about the launch then
+    // depends on the routing ids, so the sort moves to the device and this op
+    // stops draining the stream -- which is what lets CUDA graphs stay on.
+    const bool device_route = !force_host_ids && n_rows <= fused_rows;
+
+    std::vector<int32_t> tab;
+    const int32_t * expert_count = nullptr;
+    ggml_cuda_pool_alloc<int32_t> tab_dev(ctx.pool(), n_expert + 2 * n_rows);
+
+    if (device_route) {
+        const size_t smem = 2 * n_expert * sizeof(int32_t);
+        x3m_route_sort_kernel<<<1, 256, smem, stream>>>(
+            (const int32_t *) ids->data, tab_dev.get(),
+            tab_dev.get() + n_expert, tab_dev.get() + n_expert + n_rows,
+            (int) n_rows, (int) n_expert, (int) n_used);
+        CUDA_CHECK(cudaGetLastError());
+
+        // GGML_PAW_X3_IDS_CHECK=1: rebuild the tables on the host and assert the
+        // device kernel matches element for element. Syncs, so it is a debug
+        // gate only -- but it validates the routing directly instead of through
+        // generated text, which atomicAdd ordering makes non-reproducible.
+        static const bool ids_check = getenv("GGML_PAW_X3_IDS_CHECK") != nullptr;
+        if (ids_check) {
+            std::vector<int32_t> ids_h(n_rows), dev_h(n_expert + 2 * n_rows);
+            CUDA_CHECK(cudaMemcpyAsync(ids_h.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(dev_h.data(), tab_dev.get(), dev_h.size() * sizeof(int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            std::vector<int32_t> ref(n_expert + 2 * n_rows, 0);
+            for (int64_t i = 0; i < n_rows; ++i) {
+                ref[ids_h[i]]++;
+            }
+            std::vector<int32_t> cursor(n_expert);
+            for (int64_t e = 1; e < n_expert; ++e) {
+                cursor[e] = cursor[e - 1] + ref[e - 1];
+            }
+            for (int64_t i = 0; i < n_rows; ++i) {
+                const int32_t pos = cursor[ids_h[i]]++;
+                ref[n_expert + pos]          = (int32_t) (i / n_used);
+                ref[n_expert + n_rows + pos] = (int32_t) i;
+            }
+            static long long checked = 0, mismatched = 0;
+            ++checked;
+            for (size_t j = 0; j < ref.size(); ++j) {
+                if (ref[j] != dev_h[j]) {
+                    ++mismatched;
+                    fprintf(stderr, "x3-ids-check MISMATCH at %zu: host=%d dev=%d (n_rows=%lld)\n",
+                            j, ref[j], dev_h[j], (long long) n_rows);
+                    break;
+                }
+            }
+            if (checked % 500 == 0) {
+                fprintf(stderr, "x3-ids-check: %lld calls, %lld mismatched\n", checked, mismatched);
+            }
         }
+    } else {
+        std::vector<int32_t> ids_host(n_rows);
+        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // host tables: [expert_count | token_sorted | flat_sorted], flat = t * n_used + s
+        tab.assign(n_expert + 2 * n_rows, 0);
+        int32_t * expert_count_h = tab.data();
+        int32_t * token_sorted = tab.data() + n_expert;
+        int32_t * flat_sorted  = tab.data() + n_expert + n_rows;
         for (int64_t i = 0; i < n_rows; ++i) {
-            const int32_t pos = cursor[ids_host[i]]++;
-            token_sorted[pos] = (int32_t) (i / n_used);
-            flat_sorted[pos]  = (int32_t) i;
+            GGML_ASSERT(ids_host[i] >= 0 && ids_host[i] < n_expert);
+            expert_count_h[ids_host[i]]++;
         }
+        {
+            std::vector<int32_t> cursor(n_expert);
+            for (int64_t e = 1; e < n_expert; ++e) {
+                cursor[e] = cursor[e - 1] + expert_count_h[e - 1];
+            }
+            for (int64_t i = 0; i < n_rows; ++i) {
+                const int32_t pos = cursor[ids_host[i]]++;
+                token_sorted[pos] = (int32_t) (i / n_used);
+                flat_sorted[pos]  = (int32_t) i;
+            }
+        }
+        expert_count = tab.data();
+
+        CUDA_CHECK(cudaMemcpyAsync(tab_dev.get(), tab.data(), tab.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     }
 
-    ggml_cuda_pool_alloc<int32_t> tab_dev(ctx.pool(), tab.size());
-    CUDA_CHECK(cudaMemcpyAsync(tab_dev.get(), tab.data(), tab.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     const int32_t * expert_count_dev = tab_dev.get();
     const int32_t * token_sorted_dev = tab_dev.get() + n_expert;
     const int32_t * flat_sorted_dev  = tab_dev.get() + n_expert + n_rows;
@@ -3740,14 +3859,18 @@ void ggml_cuda_op_paw_x3_moe(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
 
-    static const int fused_rows = []() {
-        const char * e = getenv("GGML_PAW_X3_MOE_FUSED_ROWS");
-        return e ? atoi(e) : 128;
-    }();
-
+    // On the device path the exact active-expert count is unknown on the host by
+    // design. n_rows is an upper bound on it (each row selects one expert), and
+    // the kernel's ticket scheduler simply retires any group whose ticket finds
+    // no matching expert, so over-provisioning groups costs idle blocks, not
+    // correctness.
     int64_t num_active = 0;
-    for (int64_t e = 0; e < n_expert; ++e) {
-        num_active += expert_count[e] > 0 && expert_count[e] <= fused_rows;
+    if (device_route) {
+        num_active = n_rows < n_expert ? n_rows : n_expert;
+    } else {
+        for (int64_t e = 0; e < n_expert; ++e) {
+            num_active += expert_count[e] > 0 && expert_count[e] <= fused_rows;
+        }
     }
 
     if (num_active > 0) {
@@ -3831,7 +3954,8 @@ void ggml_cuda_op_paw_x3_moe(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         // against the exllamav3 reference (GGML_PAW_X3_MOE_DUMP=<dir>, first call only)
         static const char * moe_dump = getenv("GGML_PAW_X3_MOE_DUMP");
         static bool moe_dumped = false;
-        if (moe_dump && !moe_dumped && num_active == 1) {
+        // the dump needs host-side expert counts; GGML_PAW_X3_HOST_IDS=1 enables it
+        if (moe_dump && !moe_dumped && !device_route && num_active == 1) {
             moe_dumped = true;
             CUDA_CHECK(cudaStreamSynchronize(stream));
             auto dump = [&](const char * name, const void * dev_ptr, size_t bytes) {
@@ -3875,9 +3999,10 @@ void ggml_cuda_op_paw_x3_moe(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         }
     }
 
-    // experts above the fused row limit
+    // experts above the fused row limit -- provably none when device_route, since
+    // every per-expert count is then bounded by n_rows <= fused_rows
     int64_t beg = 0;
-    for (int64_t e = 0; e < n_expert; ++e) {
+    for (int64_t e = 0; !device_route && e < n_expert; ++e) {
         const int64_t cnt = expert_count[e];
         if (cnt > fused_rows) {
             ggml_cuda_pool_alloc<float> xe(ctx.pool(), cnt * n);

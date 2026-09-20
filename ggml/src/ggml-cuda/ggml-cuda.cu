@@ -2640,8 +2640,26 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
 
         // reads the routing ids on the host, like the sorted mul_mat_id path
-        if (node->op == GGML_OP_PAW_X3_MM_ID || node->op == GGML_OP_PAW_X3_MOE) {
+        if (node->op == GGML_OP_PAW_X3_MM_ID) {
             use_cuda_graph = false;
+        }
+
+        // PAW_X3_MOE keeps routing on the device when the row count fits the
+        // fused path (n_rows = n_used * n_tokens <= GGML_PAW_X3_MOE_FUSED_ROWS),
+        // and is then capture-safe: no host readback, and a launch shape that
+        // depends only on tensor shapes. Above that bound it falls back to the
+        // host counting sort and per-expert launches, which are not.
+        if (node->op == GGML_OP_PAW_X3_MOE) {
+            static const int fused_rows = []() {
+                const char * e = getenv("GGML_PAW_X3_MOE_FUSED_ROWS");
+                return e ? atoi(e) : 128;
+            }();
+            static const bool force_host_ids = getenv("GGML_PAW_X3_HOST_IDS") != nullptr;
+            const ggml_tensor * ids = node->src[1];
+            const int64_t n_rows = ids->ne[0] * ids->ne[1];
+            if (force_host_ids || n_rows > fused_rows) {
+                use_cuda_graph = false;
+            }
         }
 
         if (!use_cuda_graph) {
