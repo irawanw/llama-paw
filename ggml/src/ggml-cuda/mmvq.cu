@@ -437,6 +437,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
+                // batch-1 decode: 2 warps measured faster than 4 on Ampere
+                return 2;
             case 2:
             case 3:
             case 4:
