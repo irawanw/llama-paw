@@ -340,7 +340,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // hyper-connection head. The reference export (PR 27739, and every
         // published Flash-Next MTP head) reuses the model-level
         // output_hc_{norm,down,up} instead -- see the fallback in graph_mtp.
-        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags | TENSOR_NOT_REQUIRED);
+        // Declared like output_hc_norm: build_hc_mix scales a [n_embd, hc, T]
+        // stream, so a flat [hc_dim] gamma aborts in ggml_mul on ggml_can_repeat.
+        // The file stores it flat, hence ALLOW_RESHAPE.
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, flags | TENSOR_NOT_REQUIRED | TENSOR_ALLOW_RESHAPE);
         layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags | TENSOR_NOT_REQUIRED);
         layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags | TENSOR_NOT_REQUIRED);
 

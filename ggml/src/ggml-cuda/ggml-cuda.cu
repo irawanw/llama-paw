@@ -4539,8 +4539,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         std::string(": ") + node->name];
                     e.first += 1;
                     e.second += op_us;
+                    // GGML_CUDA_OP_TIME=N dumps every N ops; a single prefill
+                    // graph is only a few thousand, so the old fixed 20000 never
+                    // fired for short runs.
+                    static const long long dump_every = []() {
+                        const char * e = getenv("GGML_CUDA_OP_TIME");
+                        long long v = e ? atoll(e) : 0;
+                        return v > 1 ? v : 20000;
+                    }();
                     static long long op_n = 0;
-                    if (++op_n % 20000 == 0) {
+                    if (++op_n % dump_every == 0) {
                         fprintf(stderr, "cuda-op-time dump after %lld ops:\n",
                             op_n);
                         for (auto & kv : op_acc) {
