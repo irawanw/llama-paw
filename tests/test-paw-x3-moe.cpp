@@ -8,6 +8,10 @@
 // The fused kernel keeps fp16 intermediates, so outputs are compared at a tolerance.
 //
 // usage: test-paw-x3-moe [n_tokens ...]    (CUDA device 0)
+//
+// Set X3MOE_BENCH_REPS=N to also time the fused op and the unfused chain
+// separately and report effective trellis bandwidth. Use X3MOE_TEST_EXPERTS=512
+// for the real per-layer shape (0.762 GiB of trellis, fits in <1 GiB of VRAM).
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -19,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <random>
 #include <vector>
 
@@ -34,7 +39,7 @@ static int run_case(ggml_backend_t backend, int64_t n_tokens, std::mt19937 & rng
     const int64_t n_used   = env_int("X3MOE_TEST_USED", 10);
 
     ggml_init_params ip = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * 64 + ggml_graph_overhead(),
+        /*.mem_size   =*/ ggml_tensor_overhead() * 64 + ggml_graph_overhead() * 3,
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
@@ -161,6 +166,47 @@ static int run_case(ggml_backend_t backend, int64_t n_tokens, std::mt19937 & rng
     printf("tokens=%-4lld used=%lld ref_rms=%-9.4g worst rel_rms=%.5f worst cos=%.8f nonfinite fused/ref=%lld/%lld  %s\n",
            (long long) n_tokens, (long long) n_used, ref_rms, worst_rel, worst_cos,
            (long long) nonfinite_a, (long long) nonfinite_b, ok ? "PASS" : "FAIL");
+
+    // Opt-in timing mode. The correctness graph above holds the fused op and the
+    // reference chain together, so neither can be timed from it; build a graph per
+    // variant over the same already-allocated tensors and time them separately.
+    const int64_t reps = env_int("X3MOE_BENCH_REPS", 0);
+    if (reps > 0) {
+        ggml_cgraph * gf_fused = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf_fused, fused);
+        ggml_cgraph * gf_ref = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf_ref, ref);
+
+        auto time_graph = [&](ggml_cgraph * g) {
+            ggml_backend_graph_compute(backend, g);   // warmup: JIT, caches, clocks
+            ggml_backend_synchronize(backend);
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int64_t i = 0; i < reps; ++i) ggml_backend_graph_compute(backend, g);
+            ggml_backend_synchronize(backend);
+            const auto t1 = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(t1 - t0).count() / reps;
+        };
+
+        // Trellis bytes the op must read: each distinct routed expert once, at that
+        // expert's own rate K (rates are mixed per expert). This is the quantity the
+        // decode path is bandwidth-bound on.
+        std::vector<char> seen(n_expert, 0);
+        int64_t uniq = 0, tbytes = 0;
+        for (int64_t i = 0; i < n_used * n_tokens; ++i) {
+            const int32_t e = ids[i];
+            if (seen[e]) continue;
+            seen[e] = 1; ++uniq;
+            for (int p = 0; p < 3; ++p) tbytes += ph[p].in * ph[p].out * ph[p].meta[2 * e] / 16 * 2;
+        }
+
+        const double ms_f = time_graph(gf_fused);
+        const double ms_r = time_graph(gf_ref);
+        printf("  bench reps=%lld experts=%lld uniq_routed=%lld trellis=%.3f GiB | "
+               "fused %.3f ms (%.1f GiB/s) | unfused %.3f ms | fused is %.2fx\n",
+               (long long) reps, (long long) n_expert, (long long) uniq,
+               tbytes / 1073741824.0, ms_f, tbytes / 1073741824.0 / (ms_f / 1e3),
+               ms_r, ms_r / ms_f);
+    }
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
