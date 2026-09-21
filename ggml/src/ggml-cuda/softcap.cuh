@@ -2,4 +2,5 @@
 
 #define CUDA_SOFTCAP_BLOCK_SIZE 256
 
-void ggml_cuda_op_softcap(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * src);
+void ggml_cuda_op_softcap(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * src, ggml_unary_op unary_op);
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * src);
