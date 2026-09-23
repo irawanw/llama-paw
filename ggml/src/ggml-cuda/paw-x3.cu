@@ -3697,6 +3697,11 @@ paw_x3_done:
     }
 }
 
+// Tables below are cached by device address. Only valid for WEIGHTS buffers: op offload copies weights into a reused compute buffer, so the address does not identify the layer.
+static bool x3_is_resident_weight(const ggml_tensor * t) {
+    return t->buffer && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
 // Per-expert rate table of a flat expert trellis (meta I32 [2, n_expert]: K, word offset). meta is
 // model data and never changes, so it is fetched and validated once per tensor.
 static const int32_t * x3_expert_meta(const ggml_tensor * meta, const ggml_tensor * trellis, int64_t ntiles,
@@ -3708,7 +3713,7 @@ static const int32_t * x3_expert_meta(const ggml_tensor * meta, const ggml_tenso
     const int64_t n_expert = meta->ne[1];
     std::lock_guard<std::mutex> lock(meta_mtx);
     meta_entry & me = meta_cache[meta->data];
-    if (me.trellis != trellis->data || me.v.size() != (size_t) (2 * n_expert)) {
+    if (!x3_is_resident_weight(meta) || me.trellis != trellis->data || me.v.size() != (size_t) (2 * n_expert)) {
         me.trellis = trellis->data;
         me.v.resize(2 * n_expert);
         CUDA_CHECK(cudaMemcpyAsync(me.v.data(), meta->data, ggml_nbytes(meta), cudaMemcpyDeviceToHost, stream));
@@ -4055,7 +4060,13 @@ void ggml_cuda_op_paw_x3_moe(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         {
             std::lock_guard<std::mutex> lock(tab_mtx);
             x3m_tables & tb = tab_cache[P(0, 0)->data];
-            if (tb.key[0] != P(0, 0)->data || tb.key[1] != P(1, 0)->data || tb.key[2] != P(2, 0)->data) {
+            bool resident = true;
+            for (int p = 0; p < 3; ++p) {
+                for (int j = 0; j < 4; ++j) {
+                    resident = resident && x3_is_resident_weight(P(p, j));
+                }
+            }
+            if (!resident || tb.key[0] != P(0, 0)->data || tb.key[1] != P(1, 0)->data || tb.key[2] != P(2, 0)->data) {
                 const size_t np = 3 * n_expert;
                 std::vector<const void *> ptrs(3 * np);
                 std::vector<int32_t> ks(np);
