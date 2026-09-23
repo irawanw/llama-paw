@@ -6767,11 +6767,12 @@ struct ggml_tensor * ggml_paw_x3_mm(
     GGML_ASSERT(ggml_is_contiguous(x));
     GGML_ASSERT(ggml_n_dims(trellis) == 2);
 
-    // words-per-tile = 16*K (mul1-v1: K fresh bits per value in a 16x16 tile)
+    // words-per-tile = 16*K (mul1-v1: K fresh bits per value in a 16x16 tile);
+    // 56 words is the fractional K = 3.5 (exllamav3 frac trellis, KA 3, MASK 0xAAAA)
     const int64_t words = trellis->ne[0];
     const int64_t k     = words / 16;
-    GGML_ASSERT(words % 16 == 0);
-    GGML_ASSERT(k == 1 || k == 2 || k == 3 || k == 4);   // Plan D rates + K1/K4 sweep
+    GGML_ASSERT(words % 16 == 0 || words == 56);
+    GGML_ASSERT(k == 1 || k == 2 || k == 3 || k == 4);   // Plan D rates + K1/K4 sweep (+ K3.5)
 
     const int64_t n = x->ne[0];
     GGML_ASSERT(suh->ne[0] == n);

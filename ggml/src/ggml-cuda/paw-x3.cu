@@ -310,6 +310,61 @@ void had_fh_r_128_inner(const float* __restrict__ input_ptr, half* __restrict__ 
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// K = 3.5: exllamav3 fractional trellis (quant/frac.cu, KA = 3, MASK 0xAAAA). Weight i takes 3 + (i & 1)
+// fresh bits, so its 16-bit window ends at ring bit S(i) = 7 * (i >> 1) + 3 + 4 * (i & 1) of the 896-bit
+// tile ring (56 uint16 = 28 uint32, MSB-first words: the integer rates' stream convention). Carried
+// through the templates and host dispatch as bits = X3_K35; a tile is x3_tile_u16(bits) uint16.
+
+#define X3_K35 35
+
+__host__ __device__ constexpr int x3_tile_u16(int bits)
+{
+    return bits == X3_K35 ? 56 : 16 * bits;
+}
+
+// uint32 words of an adjacent tile pair (the sq kernel's unit), and of one row of n/16 tiles
+__host__ __device__ constexpr int x3_pair_u32(int bits)
+{
+    return x3_tile_u16(bits);
+}
+
+template <int bits>
+__device__ __forceinline__ int x3_row_u32(int size_n)
+{
+    if constexpr (bits == X3_K35)
+        return size_n / 16 * 28;
+    else
+        return size_n * bits / 2;
+}
+
+// Four consecutive windows whose last one ends at ring bit e (exclusive); they end at e - 11, e - 7, e - 4
+// and e. The four span 27 bits, so the word holding bit e - 1 and the word before it always cover them.
+__device__ __forceinline__ void ext4_frac35(const uint32_t* ptr, int e, uint32_t& x0, uint32_t& x1, uint32_t& x2, uint32_t& x3)
+{
+    const int i2 = (e - 1) >> 5;
+    const int i1 = i2 == 0 ? 27 : i2 - 1;
+    const uint64_t v = ((uint64_t) ptr[i1] << 32) | (uint64_t) ptr[i2];
+    const int s = ((i2 + 1) << 5) - e;
+    x3 = (uint32_t) (v >> s) & 0xffff;
+    x2 = (uint32_t) (v >> (s + 4)) & 0xffff;
+    x1 = (uint32_t) (v >> (s + 7)) & 0xffff;
+    x0 = (uint32_t) (v >> (s + 11)) & 0xffff;
+}
+
+// Windows t0 .. t0 + 7 (t0 = 8 * lane) end at 28 * lane + {3, 7, 10, 14, 17, 21, 24, 28}
+__device__ __forceinline__ void ext8w_frac35
+(
+    const uint32_t* ptr, int t0,
+    uint32_t& w0, uint32_t& w1, uint32_t& w2, uint32_t& w3,
+    uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7
+)
+{
+    const int e = (t0 >> 3) * 28;
+    ext4_frac35(ptr, e + 14, w0, w1, w2, w3);
+    ext4_frac35(ptr, e + 28, w4, w5, w6, w7);
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Window extraction (exl3_dq.cuh / kernel ext8w specializations for K = 2, 3)
 
 template <int bits>
@@ -327,7 +382,11 @@ __device__ __forceinline__ void ext8w
     uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7
 )
 {
-    if constexpr (bits == 1)
+    if constexpr (bits == X3_K35)
+    {
+        ext8w_frac35(ptr, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+    }
+    else if constexpr (bits == 1)
     {
         uint32_t i1 = t0 >> 5;
         uint32_t i0 = (i1 + 7) & 7;
@@ -416,7 +475,7 @@ __device__ __forceinline__ void ext8w
 
 __host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
 {
-    return bits == 3 || bits == 5 || bits == 7;
+    return bits == 3 || bits == 5 || bits == 7 || bits == X3_K35;
 }
 
 __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
@@ -544,8 +603,8 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int nbp = nb256 * 8 + warp;
-    const int row_stride = size_n * bits / 2;
-    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * (bits * 16);
+    const int row_stride = x3_row_u32<bits>(size_n);
+    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * x3_pair_u32(bits);
     int c2 = 2 * (lane & 3);
     int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
     int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
@@ -553,7 +612,7 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
     for (int kb = 0; kb < nrows; ++kb)
     {
         const uint32_t* blockA = bp + (size_t) kb * row_stride;
-        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
+        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + x3_pair_u32(bits) / 2,
             sh_as + (kb << 4), slice_stride, c2, lane << 3,
             ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
     }
@@ -577,12 +636,12 @@ __device__ __forceinline__ void gemv_int8_unit_smem
 )
 {
     constexpr int D = GEMV_STAGE_D;
-    constexpr int pairwords = 16 * bits;
+    constexpr int pairwords = x3_pair_u32(bits);
     constexpr int chunks = pairwords / 4;
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int nbp = nb256 * 8 + warp;
-    const int row_stride = size_n * bits / 2;
+    const int row_stride = x3_row_u32<bits>(size_n);
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
     uint32_t* sb = sh_b + warp * (D * pairwords);
 
@@ -606,7 +665,7 @@ __device__ __forceinline__ void gemv_int8_unit_smem
         stage_row(kb + D - 1);
 
         const uint32_t* blockA = sb + (kb % D) * pairwords;
-        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
+        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + x3_pair_u32(bits) / 2,
             sh_as + (kb << 4), slice_stride, c2, lane << 3,
             ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
     }
@@ -838,7 +897,7 @@ void exl3_gemv_int8_sq_kernel
     rows_per = rows_per > ((rows_total + 7) & ~7) ? ((rows_total + 7) & ~7) : rows_per;
     if constexpr (M > 1) {
         constexpr int smem_budget = 49152;
-        constexpr int stage = bits == 3 ? 8 * GEMV_STAGE_D * 16 * bits * 4 : 0;
+        constexpr int stage = (bits == 3 || bits == X3_K35) ? 8 * GEMV_STAGE_D * x3_pair_u32(bits) * 4 : 0;
         int cap = (smem_budget - 1024 * M - stage) / (32 + 64 * M);
         cap &= ~7;
         if (cap < SQ_MINROWS) cap = SQ_MINROWS;
@@ -856,7 +915,7 @@ void exl3_gemv_int8_sq_kernel
     half* sh_ah = (half*) shmem;
     uint32_t* sh_as = shmem + rows_per * 8;
     uint32_t* sh_b = sh_as + slice_stride * M * (residual ? 2 : 1);
-    float* sh_tmp = (float*) (sh_b + (gemv_int8_stage_smem(bits) ? 8 * GEMV_STAGE_D * 16 * bits : 0));
+    float* sh_tmp = (float*) (sh_b + (gemv_int8_stage_smem(bits) ? 8 * GEMV_STAGE_D * x3_pair_u32(bits) : 0));
     __shared__ float sh_red[33];
     __shared__ int sh_last;
 
@@ -911,7 +970,7 @@ static cudaFunction_t sq_kernel_fn()
 static size_t smem_for(int bits, int rows_per, int M)
 {
     constexpr bool residual = false;
-    size_t stage = gemv_int8_stage_smem(bits) ? (size_t) 8 * GEMV_STAGE_D * 16 * bits * 4 : 0;
+    size_t stage = gemv_int8_stage_smem(bits) ? (size_t) 8 * GEMV_STAGE_D * x3_pair_u32(bits) * 4 : 0;
     return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * M * (residual ? 2 : 1)
            + stage + (size_t) 2 * M * 128 * 4;
 }
@@ -956,7 +1015,7 @@ static const SqPlan & plan_sq(int bits, int size_k, int size_n, int M)
         rows_per = rows_per > ((rows_total + 7) & ~7) ? ((rows_total + 7) & ~7) : rows_per;
         if (M > 1) {
             // clamp to the 48 KB smem budget (M == 1 keeps legacy behavior)
-            size_t stage = gemv_int8_stage_smem(bits) ? (size_t) 8 * GEMV_STAGE_D * 16 * bits * 4 : 0;
+            size_t stage = gemv_int8_stage_smem(bits) ? (size_t) 8 * GEMV_STAGE_D * x3_pair_u32(bits) * 4 : 0;
             int cap = (int)((SQ_SMEM_BUDGET - 1024 * M - stage) / (32 + 64 * M));
             cap &= ~7;
             if (cap < SQ_MINROWS) cap = SQ_MINROWS;
@@ -966,7 +1025,18 @@ static const SqPlan & plan_sq(int bits, int size_k, int size_n, int M)
     };
 
     SqPlan plan;
-    if (bits == 1) {
+    if (bits == X3_K35) {
+        switch (M) {
+            case 1: plan.fn = sq_kernel_fn<X3_K35, 1, true>(); break;
+            case 2: plan.fn = sq_kernel_fn<X3_K35, 2, true>(); break;
+            case 3: plan.fn = sq_kernel_fn<X3_K35, 3, true>(); break;
+            case 4: plan.fn = sq_kernel_fn<X3_K35, 4, true>(); break;
+            case 5: plan.fn = sq_kernel_fn<X3_K35, 5, true>(); break;
+            case 6: plan.fn = sq_kernel_fn<X3_K35, 6, true>(); break;
+            case 7: plan.fn = sq_kernel_fn<X3_K35, 7, true>(); break;
+            default: plan.fn = sq_kernel_fn<X3_K35, 8, true>(); break;
+        }
+    } else if (bits == 1) {
         switch (M) {
             case 1: plan.fn = sq_kernel_fn<1, 1, true>(); break;
             case 2: plan.fn = sq_kernel_fn<1, 2, true>(); break;
@@ -1250,12 +1320,27 @@ __device__ __forceinline__ void dq8_aligned_1bit(const uint32_t* ptr, int t_offs
     frag1[1] = decode_3inst_2<cb>(w6, w7);
 }
 
+template <int cb>
+__device__ __forceinline__ void dq8_frac35(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+{
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    ext8w_frac35(ptr, t_offset, w0, w1, w2, w3, w4, w5, w6, w7);
+    frag0[0] = decode_3inst_2<cb>(w0, w1);
+    frag0[1] = decode_3inst_2<cb>(w2, w3);
+    frag1[0] = decode_3inst_2<cb>(w4, w5);
+    frag1[1] = decode_3inst_2<cb>(w6, w7);
+}
+
 template <int bits, int cb>
 __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB& frag0, FragB& frag1)
 {
-    static_assert((bits == 1 || bits == 2 || bits == 3 || bits == 4) && cb == 2,
-                  "x3 reconstruct supports K=1,2,3,4 mul1 only");
-    if constexpr (bits == 1)
+    static_assert((bits == 1 || bits == 2 || bits == 3 || bits == 4 || bits == X3_K35) && cb == 2,
+                  "x3 reconstruct supports K=1,2,3,3.5,4 mul1 only");
+    if constexpr (bits == X3_K35)
+    {
+        dq8_frac35<cb>(ptr, idx, frag0, frag1);
+    }
+    else if constexpr (bits == 1)
     {
         dq8_aligned_1bit<cb>(ptr, idx, frag0, frag1);
     }
@@ -1302,7 +1387,7 @@ void reconstruct_had_kernel
     int packed_n_offset
 )
 {
-    constexpr int packed_size = 256 * K / 16;
+    constexpr int packed_size = x3_tile_u16(K);
     constexpr float r_scale = 0.08838834764831845f;
 
     int t = threadIdx.x;
@@ -1452,6 +1537,8 @@ static void x3r_reconstruct_ws(half * W, const uint16_t * T,
         reconstruct_had_kernel<2, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
     } else if (bits == 4) {
         reconstruct_had_kernel<4, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
+    } else if (bits == X3_K35) {
+        reconstruct_had_kernel<X3_K35, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
     } else {
         reconstruct_had_kernel<3, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
     }
@@ -3214,8 +3301,11 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(ggml_is_contiguous(trellis) && ggml_is_contiguous(suh) &&
                 ggml_is_contiguous(svh) && ggml_is_contiguous(x) && ggml_is_contiguous(dst));
 
-    const int bits = (int) trellis->ne[0] / 16;   // words-per-tile = 16*K
-    GGML_ASSERT(bits == 1 || bits == 2 || bits == 3 || bits == 4);
+    // words-per-tile = 16*K; 56 words is the fractional K = 3.5 (X3_K35)
+    const int bits = trellis->ne[0] == 56 ? X3_K35 : (int) trellis->ne[0] / 16;
+    GGML_ASSERT(bits == 1 || bits == 2 || bits == 3 || bits == 4 || bits == X3_K35);
+    // K = 3.5 paths so far: the sq GEMV for nt <= SQ_M_MAX, fused reconstruct + cuBLAS above
+    const bool frac = bits == X3_K35;
 
     const int n = (int) x->ne[0];
     const int m = (int) dst->ne[0];
@@ -3277,7 +3367,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // GEMV when size_n % 256 != 0 (exl3_gemv_int8.cu), and without that guard the tail
     // columns are never written (MoE experts: m = 640). Those shapes take the GEMM at any nt.
     const bool sq_ok = m % 256 == 0;
-    const X3gPlan * gplan = (x3_gemm_nt > 0 && (nt >= x3_gemm_nt || !sq_ok) && nt <= x3_gemm_nt_max)
+    const X3gPlan * gplan = (!frac && x3_gemm_nt > 0 && (nt >= x3_gemm_nt || !sq_ok) && nt <= x3_gemm_nt_max)
                           ? plan_x3g(bits, n, m) : nullptr;
 
     // fp16-accumulate for the reconstructed-weight GEMM. GA102 runs fp16 tensor
@@ -3309,7 +3399,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         const char * e = getenv("GGML_PAW_X3_PLAIN_RECON_MAX_NT");
         return e ? atoi(e) : 1023;  // default on: +6.2% geomean whole-model at ub 512 (2G)
     }();
-    const bool plain_recon = !gplan
+    const bool plain_recon = !gplan && !frac
                           && nt > x3_gemm_nt_max
                           && nt <= x3_plain_max_nt
                           && n % 128 == 0 && m % 128 == 0;
@@ -3318,7 +3408,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // successful launch needs no xh and no cast kernel at all. Tried before any
     // pool allocation (besides its own branch workspace, freed on exit).
     bool x3v_done = false;
-    if (x3v_mode() != 0 && nt <= X3V_MAX_M) {
+    if (!frac && x3v_mode() != 0 && nt <= X3V_MAX_M) {
         char shpv[64];
         snprintf(shpv, sizeof(shpv), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
         paw_timed(stream, std::string("x3_gemv") + shpv, [&]() {
@@ -3335,7 +3425,8 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // eager xh only for paths that actually consume fp16 rows (x3g GEMM, x3
     // hgemm, debug dump). Pool LIFO: allocated here, before any branch workspace
     // below; skipped entirely when x3v (or the folded sq path) handles the call.
-    const bool need_xh = !x3v_done && (getenv("GGML_PAW_X3_DUMP") || gplan || nt >= x3_prefill_nt);
+    const bool frac_recon = frac && !(nt <= SQ_M_MAX && sq_ok);
+    const bool need_xh = !x3v_done && (getenv("GGML_PAW_X3_DUMP") || gplan || nt >= x3_prefill_nt || frac_recon);
     if (need_xh) {
         xh.alloc(ctx.pool(), (size_t) n * nt);
         // timed separately so the 2F "complete x3 operation" comparison includes
@@ -3374,7 +3465,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                        (const half *) suh->data, a_had.get(), (const half *) svh->data,
                        locks.get(), stream);
         });
-    } else if (nt >= x3_prefill_nt) {
+    } else if (nt >= x3_prefill_nt || frac_recon) {
         char shp[64];
         snprintf(shp, sizeof(shp), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
         paw_timed(stream, std::string(plain_recon ? "x3_hgemm_plain" : "x3_hgemm") + shp, [&]() {
