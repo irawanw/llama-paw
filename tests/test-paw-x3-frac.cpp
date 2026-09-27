@@ -1,13 +1,13 @@
 // PAW_X3_MM rate gate: ggml_paw_x3_mm against an independent host reference, for the integer
-// rates K = 2, 3, 4 and the half-integer rate K = 3.5 (exllamav3 fractional trellis, KA = 3,
-// MASK 0xAAAA: weight i takes 3 + (i & 1) fresh bits, so a 16x16 tile is 56 uint16).
+// rates K = 2, 3, 4 and the half-integer rates K = 1.5, 2.5, 3.5 (exllamav3 fractional trellis,
+// KA = floor(K), MASK 0xAAAA: weight i takes KA + (i & 1) fresh bits, so a 16x16 tile is 16 * K uint16).
 //
 // The host reference decodes every tile from the bit-stream definition shared by all rates
 // (window i of a tile is the 16 ring bits ending at S(i) = sum_{j <= i} D(j), MSB-first 32-bit
 // words; exllamav3 quant/pack.cu and quant/frac.cu), the mul1 codebook, the tensor-core tile
 // permutation and W = diag(suh) H128 W_hat H128 diag(svh), then computes y = x W in double.
-// The integer rates validate the reference against the existing kernels; K = 3.5 then checks the
-// fractional decoder against the same reference. Random trellis words are valid mul1 codes.
+// The integer rates validate the reference against the existing kernels; the half-integer rates
+// then check the fractional decoder against the same reference. Random trellis words are valid mul1 codes.
 //
 // usage: test-paw-x3-frac [nt ...]    (CUDA device 0)
 
@@ -23,7 +23,7 @@
 #include <random>
 #include <vector>
 
-// rate as 2K (4, 6, 7, 8) -> uint16 words per tile = 8 * 2K
+// rate as 2K (3, 4, 5, 6, 7, 8) -> uint16 words per tile = 8 * 2K
 static int tile_u16(int k2) { return 8 * k2; }
 
 static int bits_of(int k2, int i) {   // D(i): fresh bits of weight i
@@ -158,7 +158,7 @@ int main(int argc, char ** argv) {
     std::mt19937 rng(20260923);
     int fails = 0;
     const int shapes[][2] = { { 512, 512 }, { 1024, 256 }, { 256, 1280 } };
-    for (int k2 : { 4, 6, 8, 7 })
+    for (int k2 : { 4, 6, 8, 7, 5, 3 })
         for (auto & sh : shapes)
             for (int nt : nts)
                 fails += run_case(backend, k2, sh[0], sh[1], nt, rng);

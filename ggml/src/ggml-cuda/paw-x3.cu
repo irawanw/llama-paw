@@ -310,16 +310,24 @@ void had_fh_r_128_inner(const float* __restrict__ input_ptr, half* __restrict__ 
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// K = 3.5: exllamav3 fractional trellis (quant/frac.cu, KA = 3, MASK 0xAAAA). Weight i takes 3 + (i & 1)
-// fresh bits, so its 16-bit window ends at ring bit S(i) = 7 * (i >> 1) + 3 + 4 * (i & 1) of the 896-bit
-// tile ring (56 uint16 = 28 uint32, MSB-first words: the integer rates' stream convention). Carried
-// through the templates and host dispatch as bits = X3_K35; a tile is x3_tile_u16(bits) uint16.
+// K = KA + 0.5: exllamav3 fractional trellis (quant/frac.cu, MASK 0xAAAA). Weight i takes KA + (i & 1) fresh
+// bits, so a weight pair takes P = 2 * KA + 1 bits and window i ends at ring bit S(i) = P * (i >> 1) + KA +
+// (KA + 1) * (i & 1) of the 128 * P bit tile ring (MSB-first uint32 words: the integer rates' stream
+// convention). K = 3.5 (KA 3) is a 56 uint16 tile, 2.5 (KA 2) 40, 1.5 (KA 1) 24. Carried through the
+// templates and host dispatch as bits = X3_K35 / X3_K25 / X3_K15; a tile is x3_tile_u16(bits) uint16.
 
+#define X3_K15 15
+#define X3_K25 25
 #define X3_K35 35
+
+__host__ __device__ constexpr int x3_frac_ka(int bits)
+{
+    return bits == X3_K15 ? 1 : bits == X3_K25 ? 2 : bits == X3_K35 ? 3 : 0;
+}
 
 __host__ __device__ constexpr int x3_tile_u16(int bits)
 {
-    return bits == X3_K35 ? 56 : 16 * bits;
+    return x3_frac_ka(bits) ? 16 * x3_frac_ka(bits) + 8 : 16 * bits;
 }
 
 // uint32 words of an adjacent tile pair (the sq kernel's unit), and of one row of n/16 tiles
@@ -331,37 +339,43 @@ __host__ __device__ constexpr int x3_pair_u32(int bits)
 template <int bits>
 __device__ __forceinline__ int x3_row_u32(int size_n)
 {
-    if constexpr (bits == X3_K35)
-        return size_n / 16 * 28;
+    if constexpr (x3_frac_ka(bits) != 0)
+        return size_n / 16 * (x3_tile_u16(bits) / 2);
     else
         return size_n * bits / 2;
 }
 
-// Four consecutive windows whose last one ends at ring bit e (exclusive); they end at e - 11, e - 7, e - 4
-// and e. The four span 27 bits, so the word holding bit e - 1 and the word before it always cover them.
-__device__ __forceinline__ void ext4_frac35(const uint32_t* ptr, int e, uint32_t& x0, uint32_t& x1, uint32_t& x2, uint32_t& x3)
+// Four consecutive windows whose last one ends at ring bit e (exclusive, e at a pair end); they end at
+// e - P - KA - 1, e - P, e - KA - 1 and e. The four span at most 27 bits, so the word holding bit e - 1 and
+// the word before it always cover them.
+template <int KA>
+__device__ __forceinline__ void ext4_frac(const uint32_t* ptr, int e, uint32_t& x0, uint32_t& x1, uint32_t& x2, uint32_t& x3)
 {
+    constexpr int P = 2 * KA + 1;
+    constexpr int NW = 8 * KA + 4;
     const int i2 = (e - 1) >> 5;
-    const int i1 = i2 == 0 ? 27 : i2 - 1;
+    const int i1 = i2 == 0 ? NW - 1 : i2 - 1;
     const uint64_t v = ((uint64_t) ptr[i1] << 32) | (uint64_t) ptr[i2];
     const int s = ((i2 + 1) << 5) - e;
     x3 = (uint32_t) (v >> s) & 0xffff;
-    x2 = (uint32_t) (v >> (s + 4)) & 0xffff;
-    x1 = (uint32_t) (v >> (s + 7)) & 0xffff;
-    x0 = (uint32_t) (v >> (s + 11)) & 0xffff;
+    x2 = (uint32_t) (v >> (s + KA + 1)) & 0xffff;
+    x1 = (uint32_t) (v >> (s + P)) & 0xffff;
+    x0 = (uint32_t) (v >> (s + P + KA + 1)) & 0xffff;
 }
 
-// Windows t0 .. t0 + 7 (t0 = 8 * lane) end at 28 * lane + {3, 7, 10, 14, 17, 21, 24, 28}
-__device__ __forceinline__ void ext8w_frac35
+// Windows t0 .. t0 + 7 (t0 = 8 * lane) are four pairs; they end at 4 * P * lane + 2 * P and + 4 * P
+template <int KA>
+__device__ __forceinline__ void ext8w_frac
 (
     const uint32_t* ptr, int t0,
     uint32_t& w0, uint32_t& w1, uint32_t& w2, uint32_t& w3,
     uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7
 )
 {
-    const int e = (t0 >> 3) * 28;
-    ext4_frac35(ptr, e + 14, w0, w1, w2, w3);
-    ext4_frac35(ptr, e + 28, w4, w5, w6, w7);
+    constexpr int P = 2 * KA + 1;
+    const int e = (t0 >> 3) * (4 * P);
+    ext4_frac<KA>(ptr, e + 2 * P, w0, w1, w2, w3);
+    ext4_frac<KA>(ptr, e + 4 * P, w4, w5, w6, w7);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -382,9 +396,9 @@ __device__ __forceinline__ void ext8w
     uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7
 )
 {
-    if constexpr (bits == X3_K35)
+    if constexpr (x3_frac_ka(bits) != 0)
     {
-        ext8w_frac35(ptr, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+        ext8w_frac<x3_frac_ka(bits)>(ptr, t0, w0, w1, w2, w3, w4, w5, w6, w7);
     }
     else if constexpr (bits == 1)
     {
@@ -475,7 +489,7 @@ __device__ __forceinline__ void ext8w
 
 __host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
 {
-    return bits == 3 || bits == 5 || bits == 7 || bits == X3_K35;
+    return bits == 3 || bits == 5 || bits == 7 || x3_frac_ka(bits) != 0;
 }
 
 __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
@@ -897,7 +911,7 @@ void exl3_gemv_int8_sq_kernel
     rows_per = rows_per > ((rows_total + 7) & ~7) ? ((rows_total + 7) & ~7) : rows_per;
     if constexpr (M > 1) {
         constexpr int smem_budget = 49152;
-        constexpr int stage = (bits == 3 || bits == X3_K35) ? 8 * GEMV_STAGE_D * x3_pair_u32(bits) * 4 : 0;
+        constexpr int stage = (bits == 3 || x3_frac_ka(bits) != 0) ? 8 * GEMV_STAGE_D * x3_pair_u32(bits) * 4 : 0;
         int cap = (smem_budget - 1024 * M - stage) / (32 + 64 * M);
         cap &= ~7;
         if (cap < SQ_MINROWS) cap = SQ_MINROWS;
@@ -1035,6 +1049,28 @@ static const SqPlan & plan_sq(int bits, int size_k, int size_n, int M)
             case 6: plan.fn = sq_kernel_fn<X3_K35, 6, true>(); break;
             case 7: plan.fn = sq_kernel_fn<X3_K35, 7, true>(); break;
             default: plan.fn = sq_kernel_fn<X3_K35, 8, true>(); break;
+        }
+    } else if (bits == X3_K25) {
+        switch (M) {
+            case 1: plan.fn = sq_kernel_fn<X3_K25, 1, true>(); break;
+            case 2: plan.fn = sq_kernel_fn<X3_K25, 2, true>(); break;
+            case 3: plan.fn = sq_kernel_fn<X3_K25, 3, true>(); break;
+            case 4: plan.fn = sq_kernel_fn<X3_K25, 4, true>(); break;
+            case 5: plan.fn = sq_kernel_fn<X3_K25, 5, true>(); break;
+            case 6: plan.fn = sq_kernel_fn<X3_K25, 6, true>(); break;
+            case 7: plan.fn = sq_kernel_fn<X3_K25, 7, true>(); break;
+            default: plan.fn = sq_kernel_fn<X3_K25, 8, true>(); break;
+        }
+    } else if (bits == X3_K15) {
+        switch (M) {
+            case 1: plan.fn = sq_kernel_fn<X3_K15, 1, true>(); break;
+            case 2: plan.fn = sq_kernel_fn<X3_K15, 2, true>(); break;
+            case 3: plan.fn = sq_kernel_fn<X3_K15, 3, true>(); break;
+            case 4: plan.fn = sq_kernel_fn<X3_K15, 4, true>(); break;
+            case 5: plan.fn = sq_kernel_fn<X3_K15, 5, true>(); break;
+            case 6: plan.fn = sq_kernel_fn<X3_K15, 6, true>(); break;
+            case 7: plan.fn = sq_kernel_fn<X3_K15, 7, true>(); break;
+            default: plan.fn = sq_kernel_fn<X3_K15, 8, true>(); break;
         }
     } else if (bits == 1) {
         switch (M) {
@@ -1320,11 +1356,11 @@ __device__ __forceinline__ void dq8_aligned_1bit(const uint32_t* ptr, int t_offs
     frag1[1] = decode_3inst_2<cb>(w6, w7);
 }
 
-template <int cb>
-__device__ __forceinline__ void dq8_frac35(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+template <int KA, int cb>
+__device__ __forceinline__ void dq8_frac(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
 {
     uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
-    ext8w_frac35(ptr, t_offset, w0, w1, w2, w3, w4, w5, w6, w7);
+    ext8w_frac<KA>(ptr, t_offset, w0, w1, w2, w3, w4, w5, w6, w7);
     frag0[0] = decode_3inst_2<cb>(w0, w1);
     frag0[1] = decode_3inst_2<cb>(w2, w3);
     frag1[0] = decode_3inst_2<cb>(w4, w5);
@@ -1334,11 +1370,11 @@ __device__ __forceinline__ void dq8_frac35(const uint32_t* ptr, int t_offset, Fr
 template <int bits, int cb>
 __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB& frag0, FragB& frag1)
 {
-    static_assert((bits == 1 || bits == 2 || bits == 3 || bits == 4 || bits == X3_K35) && cb == 2,
-                  "x3 reconstruct supports K=1,2,3,3.5,4 mul1 only");
-    if constexpr (bits == X3_K35)
+    static_assert((bits == 1 || bits == 2 || bits == 3 || bits == 4 || x3_frac_ka(bits) != 0) && cb == 2,
+                  "x3 reconstruct supports K=1,1.5,2,2.5,3,3.5,4 mul1 only");
+    if constexpr (x3_frac_ka(bits) != 0)
     {
-        dq8_frac35<cb>(ptr, idx, frag0, frag1);
+        dq8_frac<x3_frac_ka(bits), cb>(ptr, idx, frag0, frag1);
     }
     else if constexpr (bits == 1)
     {
@@ -1539,6 +1575,10 @@ static void x3r_reconstruct_ws(half * W, const uint16_t * T,
         reconstruct_had_kernel<4, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
     } else if (bits == X3_K35) {
         reconstruct_had_kernel<X3_K35, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
+    } else if (bits == X3_K25) {
+        reconstruct_had_kernel<X3_K25, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
+    } else if (bits == X3_K15) {
+        reconstruct_had_kernel<X3_K15, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
     } else {
         reconstruct_had_kernel<3, 2><<<grid, RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
     }
@@ -3301,11 +3341,12 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(ggml_is_contiguous(trellis) && ggml_is_contiguous(suh) &&
                 ggml_is_contiguous(svh) && ggml_is_contiguous(x) && ggml_is_contiguous(dst));
 
-    // words-per-tile = 16*K; 56 words is the fractional K = 3.5 (X3_K35)
-    const int bits = trellis->ne[0] == 56 ? X3_K35 : (int) trellis->ne[0] / 16;
-    GGML_ASSERT(bits == 1 || bits == 2 || bits == 3 || bits == 4 || bits == X3_K35);
+    // words-per-tile = 16*K; 56 / 40 / 24 words are the fractional K = 3.5 / 2.5 / 1.5
+    const int64_t words = trellis->ne[0];
+    const int bits = words == 56 ? X3_K35 : words == 40 ? X3_K25 : words == 24 ? X3_K15 : (int) words / 16;
+    GGML_ASSERT(bits == 1 || bits == 2 || bits == 3 || bits == 4 || x3_frac_ka(bits) != 0);
     // K = 3.5 paths so far: the sq GEMV for nt <= SQ_M_MAX, fused reconstruct + cuBLAS above
-    const bool frac = bits == X3_K35;
+    const bool frac = x3_frac_ka(bits) != 0;
 
     const int n = (int) x->ne[0];
     const int m = (int) dst->ne[0];

@@ -129,9 +129,10 @@ bool ggml_cuda_paw_supported(const ggml_tensor * op) {
                    op->src[3*op->op_params[0]]->type == GGML_TYPE_F16 &&
                    op->src[3*op->op_params[0] + 1]->type == GGML_TYPE_F32;
         case GGML_OP_PAW_X3_MM:
-            // mul1-v1 sq kernel: K in {1,2,3,4} or fractional 3.5 (56 words), fp16 side
-            // scales; nt == 1 runs the fused GEMV directly, nt > 1 loops it per token
-            return (op->src[0]->ne[0] == 16 || op->src[0]->ne[0] == 32 ||
+            // mul1-v1 sq kernel: K in {1,2,3,4} or fractional 1.5 / 2.5 / 3.5 (24 / 40 / 56 words),
+            // fp16 side scales; nt == 1 runs the fused GEMV directly, nt > 1 loops it per token
+            return (op->src[0]->ne[0] == 16 || op->src[0]->ne[0] == 24 ||
+                    op->src[0]->ne[0] == 32 || op->src[0]->ne[0] == 40 ||
                     op->src[0]->ne[0] == 48 || op->src[0]->ne[0] == 56 ||
                     op->src[0]->ne[0] == 64) &&
                    op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16;
