@@ -10,6 +10,9 @@
 // then check the fractional decoder against the same reference. Random trellis words are valid mul1 codes.
 //
 // usage: test-paw-x3-frac [nt ...]    (CUDA device 0)
+//
+// X3FRAC_BENCH_REPS=N: time the op instead, on the PAW-27B dense shapes at nt 1 and 6 (the
+// DFlash2 verify batch), for K = 3, 4 and 3.5. No host reference in this mode.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -20,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <random>
 #include <vector>
 
@@ -149,6 +153,41 @@ static int run_case(ggml_backend_t backend, int k2, int n, int m, int nt, std::m
     return ok ? 0 : 1;
 }
 
+static void bench_case(ggml_backend_t backend, int k2, int n, int m, int nt, int reps, std::mt19937 & rng) {
+    const int tw = tile_u16(k2);
+    const int64_t ntiles = (int64_t) (n / 16) * (m / 16);
+    std::vector<uint16_t> tr((size_t) ntiles * tw);
+    for (auto & w : tr) w = (uint16_t) (rng() & 0xffff);
+    std::vector<ggml_fp16_t> suh(n, ggml_fp32_to_fp16(0.02f)), svh(m, ggml_fp32_to_fp16(1.0f));
+    std::vector<float> x((size_t) n * nt, 0.5f);
+
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), NULL, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * t_tr  = ggml_new_tensor_2d(ctx, GGML_TYPE_I16, tw, ntiles);
+    ggml_tensor * t_suh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, n);
+    ggml_tensor * t_svh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, m);
+    ggml_tensor * t_x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, nt);
+    ggml_tensor * y = ggml_paw_x3_mm(ctx, t_tr, t_suh, t_svh, t_x);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    ggml_backend_tensor_set(t_tr, tr.data(), 0, tr.size() * 2);
+    ggml_backend_tensor_set(t_suh, suh.data(), 0, suh.size() * 2);
+    ggml_backend_tensor_set(t_svh, svh.data(), 0, svh.size() * 2);
+    ggml_backend_tensor_set(t_x, x.data(), 0, x.size() * 4);
+
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_synchronize(backend);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) ggml_backend_graph_compute(backend, gf);
+    ggml_backend_synchronize(backend);
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+    const double gbs = (double) tr.size() * 2 / (us * 1e3);
+    printf("bench K=%-4g n=%-6d m=%-6d nt=%d  %8.1f us  %6.1f GB/s\n", k2 / 2.0, n, m, nt, us, gbs);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+}
+
 int main(int argc, char ** argv) {
     std::vector<int> nts;
     for (int i = 1; i < argc; ++i) nts.push_back(atoi(argv[i]));
@@ -156,6 +195,17 @@ int main(int argc, char ** argv) {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { fprintf(stderr, "no CUDA backend\n"); return 1; }
     std::mt19937 rng(20260923);
+    const char * reps_env = getenv("X3FRAC_BENCH_REPS");
+    if (reps_env && atoi(reps_env) > 0) {
+        // PAW-27B dense layers: ffn gate/up, ffn down, GDN qkv, GDN z / attn q+gate, o proj
+        const int shapes_b[][2] = { { 5120, 17408 }, { 17408, 5120 }, { 5120, 10240 }, { 5120, 6144 }, { 6144, 5120 } };
+        for (int nt : { 1, 6 })
+            for (auto & sh : shapes_b)
+                for (int k2 : { 6, 8, 7 })
+                    bench_case(backend, k2, sh[0], sh[1], nt, atoi(reps_env), rng);
+        ggml_backend_free(backend);
+        return 0;
+    }
     int fails = 0;
     const int shapes[][2] = { { 512, 512 }, { 1024, 256 }, { 256, 1280 } };
     for (int k2 : { 4, 6, 8, 7, 5, 3 })

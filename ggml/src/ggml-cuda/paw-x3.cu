@@ -2641,11 +2641,13 @@ void x3v_gemv_kernel(X3G_ARGS)
                     {
                         const uint32_t awv = __shfl_sync(0xffffffffu, bw[t], f_src_a[g]);
                         const uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], f_src_b[g]);
-                        const uint64_t v = ((uint64_t) awv << 32) | (uint64_t) bwv;
-                        w[4 * g + 3] = (uint32_t) (v >> f_s[g]) & 0xffff;
-                        w[4 * g + 2] = (uint32_t) (v >> (f_s[g] + KA + 1)) & 0xffff;
-                        w[4 * g + 1] = (uint32_t) (v >> (f_s[g] + P)) & 0xffff;
-                        w[4 * g + 0] = (uint32_t) (v >> (f_s[g] + P + KA + 1)) & 0xffff;
+                        // the group's 4 windows span P + KA + 17 <= 27 bits: one funnel shift puts them all
+                        // in one register, then each window is a constant-offset field
+                        const uint32_t v = __funnelshift_r(bwv, awv, f_s[g]);
+                        w[4 * g + 3] = v & 0xffff;
+                        w[4 * g + 2] = (v >> (KA + 1)) & 0xffff;
+                        w[4 * g + 1] = (v >> P) & 0xffff;
+                        w[4 * g + 0] = (v >> (P + KA + 1)) & 0xffff;
                     }
                     x3v_decode8<cb>(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], f0, f1);
                 }
