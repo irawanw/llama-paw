@@ -2462,7 +2462,8 @@ template <int bits, bool c_fp32, int cb, int MMODE, int CFG>
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256)
 void x3v_gemv_kernel(X3G_ARGS)
 {
-    static_assert(bits == 2 || bits == 3 || bits == 4, "x3v_gemv_kernel supports 2, 3 and 4 bpw");
+    static_assert(bits == 2 || bits == 3 || bits == 4 || x3_frac_ka(bits) != 0,
+                  "x3v_gemv_kernel supports 2, 3, 4 bpw and the fractional 1.5, 2.5, 3.5 bpw");
     namespace cg_ = cooperative_groups;
 
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
@@ -2473,9 +2474,10 @@ void x3v_gemv_kernel(X3G_ARGS)
     constexpr int ROWS = MMODE == 0 ? 1 : X3V_MAX_M;
     constexpr int COLS = WNT * 16;
 
-    constexpr int TWORDS  = 8 * bits;                       // uint32 per 16x16 tile
+    constexpr int KA      = x3_frac_ka(bits);               // fractional rates: K = KA + 0.5
+    constexpr int TWORDS  = KA ? x3_tile_u16(bits) / 2 : 8 * bits;   // uint32 per 16x16 tile
     constexpr int LOADS   = bits == 2 ? WNT / 2 : WNT;      // warp loads per k-slice
-    constexpr int LSTRIDE = bits == 3 ? 24 : 32;            // uint32 per load
+    constexpr int LSTRIDE = bits == 3 ? 24 : KA ? TWORDS : 32;       // uint32 per load
     static_assert(bits != 2 || WNT % 2 == 0, "2 bpw packs two tiles per warp load");
 
     auto grid = cg_::this_grid();
@@ -2539,6 +2541,23 @@ void x3v_gemv_kernel(X3G_ARGS)
         x_src_a = i0 % 24;
         x_src_b = i2 % 24;
     }
+    // Fractional rates: the lane's 8 windows are two groups of 4 (ext8w_frac); each group sits in
+    // two adjacent tile words, fetched from the lanes that loaded them.
+    int f_src_a[2] = {}, f_src_b[2] = {}, f_s[2] = {};
+    (void) f_src_a; (void) f_src_b; (void) f_s;
+    if constexpr (KA != 0)
+    {
+        constexpr int P = 2 * KA + 1;
+        #pragma unroll
+        for (int g = 0; g < 2; ++g)
+        {
+            const int e = lane * (4 * P) + (g + 1) * (2 * P);
+            const int i2 = (e - 1) >> 5;
+            f_src_b[g] = i2;
+            f_src_a[g] = i2 == 0 ? TWORDS - 1 : i2 - 1;
+            f_s[g] = ((i2 + 1) << 5) - e;
+        }
+    }
 
     __shared__ float sh_red[WK][ROWS][COLS];
 
@@ -2550,6 +2569,8 @@ void x3v_gemv_kernel(X3G_ARGS)
         {
             if constexpr (bits == 3)
                 return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0u;
+            else if constexpr (KA != 0)
+                return lane < TWORDS ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0u;
             else
                 return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
         };
@@ -2610,6 +2631,23 @@ void x3v_gemv_kernel(X3G_ARGS)
                     uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
                     uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
                     x3v_dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
+                }
+                else if constexpr (KA != 0)
+                {
+                    constexpr int P = 2 * KA + 1;
+                    uint32_t w[8];
+                    #pragma unroll
+                    for (int g = 0; g < 2; ++g)
+                    {
+                        const uint32_t awv = __shfl_sync(0xffffffffu, bw[t], f_src_a[g]);
+                        const uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], f_src_b[g]);
+                        const uint64_t v = ((uint64_t) awv << 32) | (uint64_t) bwv;
+                        w[4 * g + 3] = (uint32_t) (v >> f_s[g]) & 0xffff;
+                        w[4 * g + 2] = (uint32_t) (v >> (f_s[g] + KA + 1)) & 0xffff;
+                        w[4 * g + 1] = (uint32_t) (v >> (f_s[g] + P)) & 0xffff;
+                        w[4 * g + 0] = (uint32_t) (v >> (f_s[g] + P + KA + 1)) & 0xffff;
+                    }
+                    x3v_decode8<cb>(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], f0, f1);
                 }
                 else  // bits == 3
                 {
@@ -2825,6 +2863,9 @@ static fp_x3g_kernel x3v_select_kernel(int bits, int mmode, int cfg)
     X3V_SEL(2, 0, 0) X3V_SEL(2, 0, 1) X3V_SEL(2, 1, 0) X3V_SEL(2, 1, 1)
     X3V_SEL(3, 0, 0) X3V_SEL(3, 0, 1) X3V_SEL(3, 1, 0) X3V_SEL(3, 1, 1)
     X3V_SEL(4, 0, 0) X3V_SEL(4, 0, 1) X3V_SEL(4, 1, 0) X3V_SEL(4, 1, 1)
+    X3V_SEL(X3_K15, 0, 0) X3V_SEL(X3_K15, 0, 1) X3V_SEL(X3_K15, 1, 0) X3V_SEL(X3_K15, 1, 1)
+    X3V_SEL(X3_K25, 0, 0) X3V_SEL(X3_K25, 0, 1) X3V_SEL(X3_K25, 1, 0) X3V_SEL(X3_K25, 1, 1)
+    X3V_SEL(X3_K35, 0, 0) X3V_SEL(X3_K35, 0, 1) X3V_SEL(X3_K35, 1, 0) X3V_SEL(X3_K35, 1, 1)
     #undef X3V_SEL
     return nullptr;
 }
@@ -2856,7 +2897,7 @@ static int x3v_nmax()
 static int x3v_cfg(int size_m, int size_k, int size_n, int bits, int mode, int narrow_coresident)
 {
     if (mode == 0) return -1;
-    if (bits < 2 || bits > 4) return -1;
+    if ((bits < 2 || bits > 4) && x3_frac_ka(bits) == 0) return -1;
     if (size_m > X3V_MAX_M) return -1;
     if (size_k % 128 || size_n % 128) return -1;
     const int nmax = x3v_nmax();
@@ -2871,7 +2912,7 @@ static int x3v_cfg(int size_m, int size_k, int size_n, int bits, int mode, int n
     if (bits == 2) return size_n <= 8192 ? 0 : 1;
     if (size_n / 32 <= narrow_coresident) return 0;
     if (size_k <= 2048 && size_n <= 8192) return 0;
-    if (bits == 3) return -1;
+    if (bits == 3 || x3_frac_ka(bits) != 0) return -1;
     if (size_n >= 8192 && size_k <= 4096) return 1;
     if (size_n >= 8192 && size_n <= 10240 && size_k <= 5120) return 1;
     return -1;
@@ -2885,7 +2926,7 @@ static bool x3v_try_launch(const float * A, const uint16_t * B, float * C,
 {
     const int mode = x3v_mode();
     if (mode == 0) return false;
-    if (bits < 2 || bits > 4) return false;
+    if ((bits < 2 || bits > 4) && x3_frac_ka(bits) == 0) return false;
     if (size_m > X3V_MAX_M) return false;
     if (size_k % 128 || size_n % 128) return false;
 
@@ -3345,7 +3386,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int64_t words = trellis->ne[0];
     const int bits = words == 56 ? X3_K35 : words == 40 ? X3_K25 : words == 24 ? X3_K15 : (int) words / 16;
     GGML_ASSERT(bits == 1 || bits == 2 || bits == 3 || bits == 4 || x3_frac_ka(bits) != 0);
-    // K = 3.5 paths so far: the sq GEMV for nt <= SQ_M_MAX, fused reconstruct + cuBLAS above
+    // fractional K paths: x3v (GGML_PAW_X3_GEMV) or the sq GEMV for small nt, fused reconstruct + cuBLAS above
     const bool frac = x3_frac_ka(bits) != 0;
 
     const int n = (int) x->ne[0];
@@ -3449,7 +3490,7 @@ void ggml_cuda_op_paw_x3_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // successful launch needs no xh and no cast kernel at all. Tried before any
     // pool allocation (besides its own branch workspace, freed on exit).
     bool x3v_done = false;
-    if (!frac && x3v_mode() != 0 && nt <= X3V_MAX_M) {
+    if (x3v_mode() != 0 && nt <= X3V_MAX_M) {
         char shpv[64];
         snprintf(shpv, sizeof(shpv), " m=%d n=%d K=%d nt=%d", m, n, bits, nt);
         paw_timed(stream, std::string("x3_gemv") + shpv, [&]() {
