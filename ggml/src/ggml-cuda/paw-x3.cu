@@ -2458,8 +2458,10 @@ __device__ __forceinline__ void x3v_dq8_regs_3bits(uint32_t a, uint32_t b, int s
                     w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
 }
 
+// Fractional rates: without the 2-block bound ptxas gives the multi-row instances 82 registers, one 512-thread block
+// per SM, and the cooperative grid (capped at co-residency) halves (exllamav3 exl3_gemv_kernel, same finding)
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256)
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, x3_frac_ka(bits) != 0 && (MMODE == 1 || CFG == 1) ? 2 : 0)
 void x3v_gemv_kernel(X3G_ARGS)
 {
     static_assert(bits == 2 || bits == 3 || bits == 4 || x3_frac_ka(bits) != 0,
@@ -2543,8 +2545,12 @@ void x3v_gemv_kernel(X3G_ARGS)
     }
     // Fractional rates: the lane's 8 windows are two groups of 4 (ext8w_frac); each group sits in
     // two adjacent tile words, fetched from the lanes that loaded them.
+    // The bounded instances (see __launch_bounds__) pack the six 5-bit constants into one register; the
+    // single-row 512-thread instance fits 64 registers unpacked and packing costs it 15 more.
+    constexpr bool FPACK = MMODE == 1 || CFG == 1;
     int f_src_a[2] = {}, f_src_b[2] = {}, f_s[2] = {};
-    (void) f_src_a; (void) f_src_b; (void) f_s;
+    uint32_t f_pack = 0;
+    (void) f_src_a; (void) f_src_b; (void) f_s; (void) f_pack;
     if constexpr (KA != 0)
     {
         constexpr int P = 2 * KA + 1;
@@ -2553,11 +2559,23 @@ void x3v_gemv_kernel(X3G_ARGS)
         {
             const int e = lane * (4 * P) + (g + 1) * (2 * P);
             const int i2 = (e - 1) >> 5;
-            f_src_b[g] = i2;
-            f_src_a[g] = i2 == 0 ? TWORDS - 1 : i2 - 1;
-            f_s[g] = ((i2 + 1) << 5) - e;
+            if constexpr (FPACK)
+            {
+                const uint32_t sa = i2 == 0 ? TWORDS - 1 : i2 - 1;
+                const uint32_t s  = ((i2 + 1) << 5) - e;
+                f_pack |= (sa | ((uint32_t) i2 << 5) | (s << 10)) << (15 * g);
+            }
+            else
+            {
+                f_src_b[g] = i2;
+                f_src_a[g] = i2 == 0 ? TWORDS - 1 : i2 - 1;
+                f_s[g] = ((i2 + 1) << 5) - e;
+            }
         }
     }
+    // i: 0 word a, 1 word b, 2 shift
+    #define X3V_FP(g, i) (FPACK ? (int) ((f_pack >> (15 * (g) + 5 * (i))) & 31u) \
+                                : ((i) == 0 ? f_src_a[g] : (i) == 1 ? f_src_b[g] : f_s[g]))
 
     __shared__ float sh_red[WK][ROWS][COLS];
 
@@ -2639,11 +2657,11 @@ void x3v_gemv_kernel(X3G_ARGS)
                     #pragma unroll
                     for (int g = 0; g < 2; ++g)
                     {
-                        const uint32_t awv = __shfl_sync(0xffffffffu, bw[t], f_src_a[g]);
-                        const uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], f_src_b[g]);
+                        const uint32_t awv = __shfl_sync(0xffffffffu, bw[t], X3V_FP(g, 0));
+                        const uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], X3V_FP(g, 1));
                         // the group's 4 windows span P + KA + 17 <= 27 bits: one funnel shift puts them all
                         // in one register, then each window is a constant-offset field
-                        const uint32_t v = __funnelshift_r(bwv, awv, f_s[g]);
+                        const uint32_t v = __funnelshift_r(bwv, awv, X3V_FP(g, 2));
                         w[4 * g + 3] = v & 0xffff;
                         w[4 * g + 2] = (v >> (KA + 1)) & 0xffff;
                         w[4 * g + 1] = (v >> P) & 0xffff;
