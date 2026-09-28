@@ -4,6 +4,8 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <cstdlib>
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -15,6 +17,16 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
 
     ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,       hparams.dflash_block_size,       false);
+    // opt-in: run a wider block than the checkpoint advertises (the conv and selector are local)
+    if (const char * env = std::getenv("GGML_DFLASH2_BLOCK_SIZE_OVERRIDE")) {
+        const int override_bs = std::atoi(env);
+        if (override_bs < 3 || override_bs > 64) {
+            throw std::runtime_error("GGML_DFLASH2_BLOCK_SIZE_OVERRIDE must be between 3 and 64");
+        }
+        LLAMA_LOG_WARN("%s: overriding DFlash2 block size %u -> %d (experimental)\n",
+                __func__, hparams.dflash_block_size, override_bs);
+        hparams.dflash_block_size = (uint32_t) override_bs;
+    }
     ml.get_key(LLM_KV_DFLASH_CONV_KERNEL_SIZE, hparams.dflash_conv_kernel_size, false);
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);

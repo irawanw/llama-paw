@@ -13,7 +13,9 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <chrono>
 #include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -941,6 +943,36 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    // GGML_PAW_SPEC_TIME=1: per-phase wall clock for the drafter lane, reported every 10 drafts
+    struct phase_time {
+        double sync_us   = 0;   // llama_get_embeddings_layer_inp() -> target sync
+        double gather_us = 0;   // copy the tap rows into batch_inject
+        double inject_us = 0;   // llama_decode(ctx_dft, batch_inject) -- fused encode + KV write
+        double noise_us  = 0;   // llama_decode(ctx_dft, batch) -- the actual draft
+        double sel_us    = 0;   // selector lattice read + walk
+        int64_t n_process = 0;
+        int64_t n_draft   = 0;
+    } tm;
+
+    static bool spec_time_on() {
+        static const bool on = [] { const char * e = getenv("GGML_PAW_SPEC_TIME"); return e && atoi(e); }();
+        return on;
+    }
+    static double now_us() {
+        return (double) std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void report_time() {
+        if (!spec_time_on() || tm.n_draft == 0) return;
+        const double tot = tm.sync_us + tm.gather_us + tm.inject_us + tm.noise_us + tm.sel_us;
+        const int64_t np = tm.n_process > 0 ? tm.n_process : 1;
+        LOG_INF("dflash-time: %lld process / %lld draft calls, total %.1f ms | ms/round: sync %.3f gather %.3f inject %.3f noise %.3f select %.3f\n",
+                (long long) tm.n_process, (long long) tm.n_draft, tot / 1e3,
+                tm.sync_us / 1e3 / np, tm.gather_us / 1e3 / np, tm.inject_us / 1e3 / np,
+                tm.noise_us / 1e3 / tm.n_draft, tm.sel_us / 1e3 / tm.n_draft);
+        tm = {};
+    }
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -968,6 +1000,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
                 block_size = std::atoi(buf);
+            }
+            // must mirror the override in llama_model_dflash::load_arch_hparams, else n_max stays clamped
+            if (const char * env = std::getenv("GGML_DFLASH2_BLOCK_SIZE_OVERRIDE")) {
+                const int override_bs = std::atoi(env);
+                if (override_bs >= 3 && override_bs <= 64) {
+                    block_size = override_bs;
+                }
             }
             if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
                 sample_from_anchor = std::strcmp(buf, "true") == 0;
@@ -1143,8 +1182,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
                 batch_inject.n_tokens = n_chunk;
+                const double t_gather0 = spec_time_on() ? now_us() : 0.0;
+                double t_sync_acc = 0.0;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    const double t_s0 = spec_time_on() ? now_us() : 0.0;
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    if (spec_time_on()) { t_sync_acc += now_us() - t_s0; }
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
@@ -1167,12 +1210,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                if (spec_time_on()) { tm.sync_us += t_sync_acc; tm.gather_us += now_us() - t_gather0 - t_sync_acc; }
+                const double t_inj0 = spec_time_on() ? now_us() : 0.0;
                 const int32_t rc = llama_decode(ctx_dft, batch_inject);
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
+                if (spec_time_on()) { tm.inject_us += now_us() - t_inj0; tm.n_process++; }
             }
         }
 
@@ -1214,7 +1260,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        const double t_noise0 = spec_time_on() ? now_us() : 0.0;
         int ret = llama_decode(ctx_dft, batch);
+        if (spec_time_on()) {
+            tm.noise_us += now_us() - t_noise0;
+            tm.n_draft++;
+            if (tm.n_draft >= 10) { report_time(); }
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
@@ -1234,7 +1286,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto & result = *dp.result;
 
             if (is_dflash2) {
+                const double t_sel0 = spec_time_on() ? now_us() : 0.0;
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                if (spec_time_on()) { tm.sel_us += now_us() - t_sel0; }
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 int32_t predecessor = 0;
@@ -2515,6 +2569,17 @@ common_params common_base_params_to_speculative(const common_params & params) {
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
         }
+    }
+
+    // Batch sizes are inherited from the target unless overridden (-bd / -ubd).
+    if (params_spec.n_batch > 0) {
+        result.n_batch = params_spec.n_batch;
+    }
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
+    if (result.n_ubatch > result.n_batch) {
+        result.n_ubatch = result.n_batch;
     }
 
     return result;

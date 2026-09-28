@@ -4591,6 +4591,296 @@ struct test_rwkv_wkv6 : public test_case {
     }
 };
 
+// GGML_OP_PAW_* codec ops. Any random bitstream is a valid trellis code, so
+// packed tensors are filled with random bytes; the CPU kernels (bit-exact vs
+// the reference decoder) are the comparison baseline.
+#define PAW_TEST_DEM_FLAG (1 << 30)
+
+static void init_paw_random_bytes(ggml_tensor * t) {
+    std::vector<uint8_t> data(ggml_nbytes(t));
+    for (size_t i = 0; i < data.size(); i++) {
+        data[i] = rand() & 0xFF;
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, data.size());
+}
+
+struct test_paw_ne_mm : public test_case {
+    const int64_t B, T, k, n_chunks, n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR5(B, T, k, n_chunks, n_tokens);
+    }
+
+    test_paw_ne_mm(int64_t B = 64, int64_t T = 512, int64_t k = 4, int64_t n_chunks = 1, int64_t n_tokens = 3)
+        : B(B), T(T), k(k), n_chunks(n_chunks), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * packed = ggml_new_tensor_2d(ctx, GGML_TYPE_I8,  T*k/8, B);
+        ggml_tensor * gscale = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, T/128, B);
+        ggml_tensor * lut    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 4096, n_chunks);
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, n_tokens);
+        ggml_set_name(packed, "packed");
+        return ggml_paw_ne_mm(ctx, packed, gscale, lut, x);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I8) {
+                init_paw_random_bytes(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_paw_embed_rows : public test_case {
+    const int64_t n_vocab, n_embd, ng, n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_vocab, n_embd, ng, n_tokens);
+    }
+
+    test_paw_embed_rows(int64_t n_vocab = 128, int64_t n_embd = 256, int64_t ng = 4, int64_t n_tokens = 5)
+        : n_vocab(n_vocab), n_embd(n_embd), ng(ng), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q   = ggml_new_tensor_2d(ctx, GGML_TYPE_I8,  n_embd*3/8, n_vocab);
+        ggml_tensor * mn  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ng, n_vocab);
+        ggml_tensor * mx  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ng, n_vocab);
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+        return ggml_paw_embed_rows(ctx, q, mn, mx, ids);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I8) {
+                init_paw_random_bytes(t);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(n_tokens);
+                for (int64_t i = 0; i < n_tokens; i++) {
+                    data[i] = rand() % n_vocab;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, n_tokens*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_paw_exp_common : public test_case {
+    const int64_t m, n, n_kept, n_dem, n_used, n_tok;
+    const bool per_slot_x;
+
+    test_paw_exp_common(bool per_slot_x,
+            int64_t m = 64, int64_t n = 128, int64_t n_kept = 3, int64_t n_dem = 2,
+            int64_t n_used = 2, int64_t n_tok = 3)
+        : m(m), n(n), n_kept(n_kept), n_dem(n_dem), n_used(n_used), n_tok(n_tok),
+          per_slot_x(per_slot_x) {}
+
+    std::string vars() override {
+        return VARS_TO_STR7(m, n, n_kept, n_dem, n_used, n_tok, per_slot_x);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I16 || t->type == GGML_TYPE_I8) {
+                init_paw_random_bytes(t);
+            } else if (t->type == GGML_TYPE_I32 && t->ne[0] == n_kept + n_dem) {
+                // remap: kept slots then demoted slots (valid bijection)
+                std::vector<int32_t> data;
+                for (int64_t i = 0; i < n_kept; i++) {
+                    data.push_back((int32_t) i);
+                }
+                for (int64_t i = 0; i < n_dem; i++) {
+                    data.push_back((int32_t) i | PAW_TEST_DEM_FLAG);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(n_used*n_tok);
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % (n_kept + n_dem);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_paw_exp_mm : public test_paw_exp_common {
+    const bool v8;   // payload v3: V=8/K=1.5 walk, tlut [8,32768], wave_gamma, no dem
+
+    test_paw_exp_mm(bool per_slot_x = false, bool v8 = false,
+            int64_t m = 64, int64_t n = 128, int64_t n_kept = 3, int64_t n_dem = 2,
+            int64_t n_used = 2, int64_t n_tok = 3)
+        : test_paw_exp_common(per_slot_x, m, n, n_kept, n_dem, n_used, n_tok), v8(v8) {}
+
+    std::string vars() override {
+        return VARS_TO_STR8(m, n, n_kept, n_dem, n_used, n_tok, per_slot_x, v8);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t ntiles = (m/16)*(n/16);
+        const int64_t n_exp  = v8 ? n_kept : n_kept + n_dem;
+        ggml_tensor * kept  = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, v8 ? 24 : 32, ntiles, n_exp);
+        ggml_tensor * dem   = v8 ? nullptr : ggml_new_tensor_3d(ctx, GGML_TYPE_I16, 16, ntiles, n_dem);
+        ggml_tensor * su    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, n_exp);
+        ggml_tensor * sv    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, m, n_exp);
+        // v3 ships the tlut pre-rounded to fp16 (bit-exact; see ggml_paw_exp_mm)
+        ggml_tensor * tlut  = v8 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 8, 32768)
+                                 : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 512);
+        ggml_tensor * remap = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_exp);
+        ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, per_slot_x ? n_used : 1, n_tok);
+        ggml_tensor * gamma = v8 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, m/16 + n/16, n_exp) : nullptr;
+        return ggml_paw_exp_mm(ctx, kept, dem, su, sv, tlut, remap, ids, x, gamma);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        if (!v8) {
+            test_paw_exp_common::initialize_tensors(ctx);
+            return;
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I16) {
+                init_paw_random_bytes(t);
+            } else if (t->type == GGML_TYPE_I32 && t->ne[0] == n_kept && t->ne[1] == 1) {
+                std::vector<int32_t> data;   // identity remap (no demotion in v3)
+                for (int64_t i = 0; i < n_kept; i++) {
+                    data.push_back((int32_t) i);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(n_used*n_tok);
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % n_kept;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_paw_rt_mm : public test_case {
+    const int64_t m, n, words, n_tok;
+    const int     rht_blk;   // 0 = one Hadamard per dimension (legacy payloads)
+
+    // words = 16*K: 64 -> K=4 (shipped), 32 -> K=2, 16 -> K=1
+    test_paw_rt_mm(int64_t m = 64, int64_t n = 128, int64_t n_tok = 3, int rht_blk = 0,
+                   int64_t words = 64)
+        : m(m), n(n), words(words), n_tok(n_tok), rht_blk(rht_blk) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(m, n, words, n_tok, rht_blk);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * trellis = ggml_new_tensor_2d(ctx, GGML_TYPE_I16, words, (m/16)*(n/16));
+        ggml_tensor * su   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_tensor * sv   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_tensor * tlut = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 2, 512);
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tok);
+        return ggml_paw_rt_mm(ctx, trellis, su, sv, tlut, x, rht_blk);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I16) {
+                init_paw_random_bytes(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_paw_head_mm : public test_case {
+    const int64_t n, vocab, n_tok;
+
+    test_paw_head_mm(int64_t n = 128, int64_t vocab = 96, int64_t n_tok = 3)
+        : n(n), vocab(vocab), n_tok(n_tok) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, vocab, n_tok);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * qp = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, n/8*5, vocab);
+        ggml_tensor * gs = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n/64, vocab);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tok);
+        return ggml_paw_head_mm(ctx, qp, gs, x);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I8) {
+                init_paw_random_bytes(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_paw_embed_gather : public test_case {
+    const int64_t n_embd = 128, vocab = 32, n_tok = 5;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, vocab, n_tok);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * codes = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, n_embd/2, vocab);
+        ggml_tensor * lut   = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 16, vocab*(n_embd/64));
+        ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
+        return ggml_paw_embed_gather(ctx, codes, lut, ids);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I8) {
+                init_paw_random_bytes(t);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(n_tok);
+                for (int64_t i = 0; i < n_tok; i++) {
+                    data[i] = rand() % vocab;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, n_tok*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_paw_exp_basis : public test_paw_exp_common {
+    const int64_t r = 16;
+    const bool with_acc;
+
+    test_paw_exp_basis(bool per_slot_x = false, bool with_acc = false)
+        : test_paw_exp_common(per_slot_x), with_acc(with_acc) {}
+
+    std::string vars() override {
+        return VARS_TO_STR8(m, n, n_kept, n_dem, n_used, n_tok, per_slot_x, with_acc);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a     = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, r);
+        ggml_tensor * b     = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, r, m);
+        ggml_tensor * c     = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, r, n_dem);
+        ggml_tensor * remap = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kept + n_dem);
+        ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, per_slot_x ? n_used : 1, n_tok);
+        ggml_tensor * acc   = with_acc ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n_used, n_tok) : nullptr;
+        return ggml_paw_exp_basis(ctx, a, b, c, remap, ids, x, acc);
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
@@ -10458,6 +10748,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // wide rows with the small k values a DFlash2-style selector actually uses;
+    // these are the shapes the CUDA small-k top-k kernel handles (k in {8,16,32},
+    // ncols > 4096), including a ties case and the real 248320-wide vocab row.
+    for (int k : {8, 16, 32}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4097, 2, 1, 3}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 1, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {65536, 2, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 6, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 2, 1, 1}, k, true));
+    }
+
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {60, 10, 10, 10}, k));
@@ -10795,6 +11096,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 1024,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // GQA head batching in the CUDA FA vector kernel (ncols2 > 1).  The stock cases above never
+    // combine a 256-wide head with a quantized KV cache, and never use an odd-multiple GQA ratio,
+    // so they miss the shape that PAW-27B actually decodes with: 24 Q heads over 4 KV heads
+    // (gqa_ratio 6) at hsk == hsv == 256.  kv is a multiple of FATTN_KQ_STRIDE here because that
+    // is a precondition of the optimization; the fallbacks below are the cases that must not take
+    // it (ALiBi has a per-head slope, and no mask / unpadded kv break the shared-KV assumption).
+    for (ggml_type kvt : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int64_t kv : {256, 512, 1024}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        }
+        // more than one sequence: exercises the sequence/K-V-head/Q-head-tile split of blockIdx.z
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 3}, 512, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        // attention sinks are read per Q head, so they must follow the batched heads
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 1, true, true,  0, 0, GGML_PREC_F32, kvt, kvt));
+        // other GQA ratios and head sizes on the same path
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {6, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        // nb > 1 keeps the token-tiling path (ncols2 == 1) -- regression guard, must be unchanged
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 2, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        // must fall back: ALiBi slope varies per head
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 1, true, false, 8, 0, GGML_PREC_F32, kvt, kvt));
+        // must fall back: no mask, and kv not padded to FATTN_KQ_STRIDE
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 1, false, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 384, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+        // logit softcap shares the instantiation set
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 1, true, false, 0, 10, GGML_PREC_F32, kvt, kvt));
+        // past GGML_CUDA_FATTN_VEC_GQA_MIN_KV, i.e. the length at which the batching turns itself
+        // on by default -- everything above is reached only with GGML_PAW_FA_GQA=1
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -10894,6 +11227,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 16, 32, false, true));
+
+    test_cases.emplace_back(new test_paw_ne_mm(64, 512, 4, 1, 1));
+    test_cases.emplace_back(new test_paw_ne_mm(64, 512, 3, 2, 5));
+    test_cases.emplace_back(new test_paw_embed_rows());
+    test_cases.emplace_back(new test_paw_exp_mm(false));
+    test_cases.emplace_back(new test_paw_exp_mm(true));
+    test_cases.emplace_back(new test_paw_exp_mm(false, true));
+    test_cases.emplace_back(new test_paw_exp_mm(true,  true));
+    test_cases.emplace_back(new test_paw_rt_mm());
+    // Block-diagonal rotation (rht_blk != 0). blk == the dimension must
+    // reproduce the unblocked path exactly; the rest are the dense lane's
+    // shapes, none of which are powers of two and which exceed the old
+    // single-block staging bounds on both sides.
+    test_cases.emplace_back(new test_paw_rt_mm(  128,  128, 3,  128));
+    test_cases.emplace_back(new test_paw_rt_mm( 2048, 2048, 3, 2048));
+    test_cases.emplace_back(new test_paw_rt_mm( 2048, 5120, 3, 1024));
+    test_cases.emplace_back(new test_paw_rt_mm( 5120, 2048, 3, 1024));
+    test_cases.emplace_back(new test_paw_rt_mm( 5120, 5120, 1, 1024));
+    test_cases.emplace_back(new test_paw_rt_mm(17408, 5120, 1, 1024));   // mlp gate/up
+    test_cases.emplace_back(new test_paw_rt_mm( 5120,17408, 1, 1024));   // mlp down
+    test_cases.emplace_back(new test_paw_rt_mm(12288, 5120, 1, 1024));   // q proj + gate
+    test_cases.emplace_back(new test_paw_rt_mm(10240, 5120, 1, 1024));   // gdn qkv
+    // Sub-4-bit trellis rates. words = 16*K, so the state window stops being
+    // byte-aligned below K=4 -- these cover the generalised walk.
+    for (int64_t words : {(int64_t) 48, (int64_t) 32, (int64_t) 24, (int64_t) 16}) {  // K=3, 2, 1.5, 1
+        test_cases.emplace_back(new test_paw_rt_mm(  64,  128, 3,    0, words));
+        test_cases.emplace_back(new test_paw_rt_mm(2048, 2048, 3,    0, words));
+        test_cases.emplace_back(new test_paw_rt_mm(5120, 2048, 3, 1024, words));
+        test_cases.emplace_back(new test_paw_rt_mm(17408, 5120, 1, 1024, words));
+        test_cases.emplace_back(new test_paw_rt_mm(5120, 17408, 1, 1024, words));
+    }
+    test_cases.emplace_back(new test_paw_head_mm());
+    test_cases.emplace_back(new test_paw_embed_gather());
+    test_cases.emplace_back(new test_paw_exp_basis(false));
+    test_cases.emplace_back(new test_paw_exp_basis(true));
+    test_cases.emplace_back(new test_paw_exp_basis(false, true));
+    test_cases.emplace_back(new test_paw_exp_basis(true,  true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
@@ -11298,6 +11668,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, {256, 256, 3, 1}));
 
+
+    // PAW real PAW-Small-Additive shapes (n_embd 2048, 256 experts v8,
+    // n_ff_exp 512, n_used 8; ubatch 512 = prefill, n_tok 1 = decode)
+    for (int64_t n_tok : {(int64_t) 512, (int64_t) 1}) {
+        test_cases.emplace_back(new test_paw_exp_mm(false, true,  512, 2048, 256, 0, 8, n_tok)); // gate/up
+        test_cases.emplace_back(new test_paw_exp_mm(false, true, 2048,  512, 256, 0, 8, n_tok)); // down
+        test_cases.emplace_back(new test_paw_rt_mm(8192, 2048, n_tok));   // qkvz proj
+        test_cases.emplace_back(new test_paw_rt_mm(2048, 4096, n_tok));   // out proj (assumed)
+        test_cases.emplace_back(new test_paw_rt_mm(2048, 2048, n_tok));   // square proj (assumed)
+        // Block-diagonal rotation: the dense lane's shapes, none of which are
+        // powers of two and both of which exceed the old single-block bounds.
+        test_cases.emplace_back(new test_paw_rt_mm(17408, 5120, n_tok, 1024));   // mlp gate/up
+        test_cases.emplace_back(new test_paw_rt_mm(5120, 17408, n_tok, 1024));   // mlp down
+        test_cases.emplace_back(new test_paw_rt_mm(12288, 5120, n_tok, 1024));   // q proj + gate
+        test_cases.emplace_back(new test_paw_rt_mm(5120,  6144, n_tok, 1024));   // o proj
+        test_cases.emplace_back(new test_paw_rt_mm(10240, 5120, n_tok, 1024));   // gdn qkv
+        // blk == dimension must reproduce the unblocked path exactly
+        test_cases.emplace_back(new test_paw_rt_mm(2048, 2048, n_tok, 2048));
+    }
+    test_cases.emplace_back(new test_paw_head_mm(2048, 151936, 1));
+    test_cases.emplace_back(new test_paw_head_mm(2048, 151936, 8));
 
     for (int n_token : {1, 512}) {
         test_cases.emplace_back(new test_add_id(GGML_TYPE_F32, GGML_TYPE_F32, 2880, 128, 4, n_token));

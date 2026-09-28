@@ -3709,6 +3709,8 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                     (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
                 case 40: paw_rt_walk_qtip_frag_dispatch<40>((const uint16_t *) trellis->data,
                     (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
+                case 48: paw_rt_walk_qtip_frag_dispatch<48>((const uint16_t *) trellis->data,
+                    (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
                 case 56: paw_rt_walk_qtip_frag_dispatch<56>((const uint16_t *) trellis->data,
                     (const half *) tlut->data, (const float *) scr_u, scr_v, q_u, q_s, q_z, m, n, nt, stream); break;
                 case 64: paw_rt_walk_qtip_frag_dispatch<64>((const uint16_t *) trellis->data,
@@ -3773,7 +3775,7 @@ void ggml_cuda_op_paw_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             // float4+shared variant: measured ~3.5 t/s gen gain on RTX 3060
             static const bool rt_gemv3 = paw_env_int("GGML_PAW_RT_GEMV3", 1) != 0;
             paw_timed(stream, std::string("rt_bank_gemv") + shp, [&]() {
-            if (rt_gemv3 && n % 2 == 0) {
+            if (rt_gemv3 && n <= 4096 && n % 2 == 0) {   // u_sh holds 4096 floats
                 paw_launch(paw_rt_bank_gemv_v3,
                     ggml_cuda_kernel_launch_params(dim3((m + 15)/16, 1, nt), dim3(256, 1, 1), 0, stream),
                     dense_bank, (const float *) scr_u, scr_v, m, n, nt);

@@ -1,3 +1,4 @@
+#include <chrono>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -34,7 +35,37 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+
 #endif
+
+// GGML_PAW_SPEC_TIME=1: where the speculative round's host time goes. The
+// drafter lane accounts for ~1 ms/round (measured with the same env var in
+// common/speculative.cpp), so anything large here is the real overhead.
+namespace paw_spec_time {
+    static bool on() {
+        static const bool v = [] { const char * e = getenv("GGML_PAW_SPEC_TIME"); return e && atoi(e); }();
+        return v;
+    }
+    static double us() {
+        return (double) std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    struct acc {
+        double ckpt_save = 0, ckpt_load = 0, seq_rm = 0, sample = 0, dft_ckpt = 0, decode_tgt = 0;
+        double emit = 0;   // post-sample bookkeeping: detokenize + emit accepted tokens
+        double t_round_prev = 0, round_wall = 0;
+        int64_t n = 0;
+        void report() {
+            const double tot = ckpt_save + ckpt_load + seq_rm + sample + dft_ckpt + decode_tgt + emit;
+            LOG_INF("spec-host: %lld rounds | round %.3f | ckpt_save %.3f  ckpt_load %.3f  dft_ckpt %.3f  seq_rm %.3f  sample %.3f  decode_tgt %.3f  emit %.3f  ms/round (sum %.3f)\n",
+                    (long long) n, round_wall / 1e3 / n, ckpt_save / 1e3 / n, ckpt_load / 1e3 / n,
+                    dft_ckpt / 1e3 / n, seq_rm / 1e3 / n, sample / 1e3 / n, decode_tgt / 1e3 / n, emit / 1e3 / n, tot / 1e3 / n);
+            (void) tot;
+            *this = {};
+        }
+    };
+    static acc g;
+}
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -94,6 +125,17 @@ static std::vector<llama_token> server_sample_and_accept_synth(
     result.push_back(id);
 
     return result;
+}
+
+// GGML_PAW_GREEDY_PARITY=1: compare every device-greedy verify row against the
+// CPU argmax of the copied logits (needs the raw-logits copy, so it disables
+// the per-decode skip below)
+static bool paw_greedy_parity_on() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_PAW_GREEDY_PARITY");
+        return e && e[0] == '1';
+    }();
+    return v;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -3059,12 +3101,16 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
+                    const double t_d0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (paw_spec_time::on()) paw_spec_time::g.dft_ckpt += paw_spec_time::us() - t_d0;
                 }
 
+                const double t_r0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
+                if (paw_spec_time::on()) paw_spec_time::g.seq_rm += paw_spec_time::us() - t_r0;
             }
 
             if (!draft.empty()) {
@@ -3078,7 +3124,9 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
+                    const double t_c0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (paw_spec_time::on()) paw_spec_time::g.ckpt_save += paw_spec_time::us() - t_c0;
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3090,7 +3138,9 @@ private:
                 }
 
                 if (use_ckpt_dft) {
+                    const double t_d1 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (paw_spec_time::on()) paw_spec_time::g.dft_ckpt += paw_spec_time::us() - t_d1;
                 }
             }
         });
@@ -3677,6 +3727,38 @@ private:
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
+        // Skip the raw-logits host copy only when EVERY output row of this decode
+        // is a verify row of a device-greedy slot (and parity is off, which needs
+        // the logits). Prefill rows, single-sample rows, embeddings/rerank, logprob
+        // or non-greedy slots fall back to the copy. One-shot per decode.
+        {
+            bool all_verify_greedy = !paw_greedy_parity_on();
+            for (int32_t j = 0; all_verify_greedy && j < batch_view.n_tokens; ++j) {
+                if (!batch_view.logits[j]) {
+                    continue;
+                }
+                const int32_t abs_idx = off + j;
+                bool covered = false;
+                for (auto & slot : slots) {
+                    if (!slot.smpl || !common_sampler_use_device_greedy(slot.smpl.get())) {
+                        continue;
+                    }
+                    for (const auto & r : slot.spec_i_batch) {
+                        if (r == abs_idx) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                    if (covered) {
+                        break;
+                    }
+                }
+                all_verify_greedy = covered;
+            }
+            llama_skip_raw_logits_next(ctx_tgt, all_verify_greedy);
+        }
+
+        const double t_dec0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
@@ -3684,6 +3766,7 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (paw_spec_time::on()) paw_spec_time::g.decode_tgt += paw_spec_time::us() - t_dec0;
 
         if (ret != 0) {
             {
@@ -3895,6 +3978,24 @@ private:
         });
 
         // speculative decoding - main model sample and accept
+        // narrow model-graph greedy verify (GGML_PAW_GREEDY_IDS=1): one int32 id per
+        // row instead of full-logits CPU sampling. CPU fallback for everything else.
+        // GGML_PAW_GREEDY_PARITY=1 additionally compares every row against the CPU
+        // argmax of the copied logits and logs the match rate.
+        auto paw_spec_verify_accept = [&](server_slot & slot) {
+            if (common_sampler_use_device_greedy(slot.smpl.get())) {
+                static uint64_t n_rounds = 0;
+                static common_greedy_parity par;
+                const bool parity = paw_greedy_parity_on();
+                auto accepted = common_sampler_sample_and_accept_n_device(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, parity ? &par : nullptr);
+                if (parity && (++n_rounds % 50 == 0)) {
+                    SLT_INF(slot, "greedy-ids parity: %llu/%llu rows match\n",
+                            (unsigned long long) (par.rows - par.mism), (unsigned long long) par.rows);
+                }
+                return accepted;
+            }
+            return common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+        };
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
@@ -3912,11 +4013,22 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                const double t_s0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                 auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                    ? paw_spec_verify_accept(slot)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                if (paw_spec_time::on()) {
+                    paw_spec_time::g.sample += paw_spec_time::us() - t_s0;
+                    const double t_now_r = paw_spec_time::us();
+                    if (paw_spec_time::g.t_round_prev > 0) {
+                        paw_spec_time::g.round_wall += t_now_r - paw_spec_time::g.t_round_prev;
+                    }
+                    paw_spec_time::g.t_round_prev = t_now_r;
+                    paw_spec_time::g.n++;
+                    if (paw_spec_time::g.n >= 10) paw_spec_time::g.report();
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3942,7 +4054,9 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
+                        const double t_l0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
                         ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        if (paw_spec_time::on()) paw_spec_time::g.ckpt_load += paw_spec_time::us() - t_l0;
 
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3965,6 +4079,8 @@ private:
 
                 slot.spec_draft = std::move(accepted);
             }
+
+            const double t_e0 = paw_spec_time::on() ? paw_spec_time::us() : 0.0;
 
             const auto ids = std::move(slot.spec_draft);
 
@@ -4016,6 +4132,8 @@ private:
                     return;
                 }
             }
+
+            if (paw_spec_time::on()) paw_spec_time::g.emit += paw_spec_time::us() - t_e0;
 
             slot.print_timings_tg();
 
